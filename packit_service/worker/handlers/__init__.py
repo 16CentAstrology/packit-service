@@ -14,13 +14,13 @@ from packit_service.worker.handlers.abstract import (
     JobHandler,
 )
 from packit_service.worker.handlers.copr import (
-    CoprBuildHandler,
     CoprBuildEndHandler,
+    CoprBuildHandler,
     CoprBuildStartHandler,
 )
 from packit_service.worker.handlers.distgit import (
-    SyncFromDownstream,
     ProposeDownstreamHandler,
+    SyncFromDownstream,
 )
 from packit_service.worker.handlers.forges import (
     GithubAppInstallationHandler,
@@ -29,6 +29,10 @@ from packit_service.worker.handlers.forges import (
 from packit_service.worker.handlers.koji import (
     KojiBuildHandler,
     KojiTaskReportHandler,
+)
+from packit_service.worker.handlers.open_scan_hub import (
+    OpenScanHubTaskFinishedHandler,
+    OpenScanHubTaskStartedHandler,
 )
 from packit_service.worker.handlers.testing_farm import (
     TestingFarmHandler,
@@ -55,4 +59,6 @@ __all__ = [
     GithubFasVerificationHandler.__name__,
     VMImageBuildHandler.__name__,
     VMImageBuildResultHandler.__name__,
+    OpenScanHubTaskFinishedHandler.__name__,
+    OpenScanHubTaskStartedHandler.__name__,
 ]

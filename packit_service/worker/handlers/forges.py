@@ -5,21 +5,21 @@
 This file defines classes for job handlers specific for Github hooks
 TODO: The build and test handlers are independent and should be moved away.
 """
+
 import logging
-from typing import Tuple, Type
 
 from packit.config import (
-    JobConfig,
     Deployment,
+    JobConfig,
 )
 from packit.config.package_config import PackageConfig
+
 from packit_service.config import PackageConfigGetter
-from packit_service.worker.mixin import ConfigFromEventMixin
 from packit_service.constants import CONTACTS_URL, DOCS_APPROVAL_URL, NOTIFICATION_REPO
 from packit_service.models import (
-    GithubInstallationModel,
     AllowlistModel,
     AllowlistStatus,
+    GithubInstallationModel,
 )
 from packit_service.utils import get_packit_commands_from_comment
 from packit_service.worker.allowlist import Allowlist
@@ -34,7 +34,11 @@ from packit_service.worker.handlers.abstract import (
     TaskName,
     reacts_to,
 )
-from packit_service.worker.mixin import GetIssueMixin, PackitAPIWithDownstreamMixin
+from packit_service.worker.mixin import (
+    ConfigFromEventMixin,
+    GetIssueMixin,
+    PackitAPIWithDownstreamMixin,
+)
 from packit_service.worker.result import TaskResults
 
 logger = logging.getLogger(__name__)
@@ -42,7 +46,9 @@ logger = logging.getLogger(__name__)
 
 @reacts_to(event=InstallationEvent)
 class GithubAppInstallationHandler(
-    JobHandler, ConfigFromEventMixin, PackitAPIWithDownstreamMixin
+    JobHandler,
+    ConfigFromEventMixin,
+    PackitAPIWithDownstreamMixin,
 ):
     task_name = TaskName.installation
 
@@ -76,7 +82,7 @@ class GithubAppInstallationHandler(
             Result of the run task.
         """
         previous_installation = GithubInstallationModel.get_by_account_login(
-            self.installation_event.account_login
+            self.installation_event.account_login,
         )
         previous_sender_login = (
             previous_installation.sender_login if previous_installation else None
@@ -96,7 +102,8 @@ class GithubAppInstallationHandler(
             and previous_sender_login != self.sender_login
         ):
             if allowlist.is_github_username_from_fas_account_matching(
-                fas_account=self.sender_login, sender_login=self.sender_login
+                fas_account=self.sender_login,
+                sender_login=self.sender_login,
             ):
                 AllowlistModel.add_namespace(
                     namespace,
@@ -117,11 +124,14 @@ class GithubAppInstallationHandler(
                     f"{'-stg' if self.service_config.deployment == Deployment.stg else ''}. "
                     "We are now onboarding Fedora contributors who have a valid "
                     "[Fedora Account System](https://fedoraproject.org/wiki/Account_System) "
-                    "account. \n\nIf you have such an account, please set the `GitHub Username`"
+                    "account. \n\nHowever, your GitHub username does not match the FAS account "
+                    "username or you currently don't have the `GitHub Username` field set in your "
+                    "FAS account or your profile is private. "
+                    "Please, set the `GitHub Username`"
                     " field in the settings of the FAS account (if you don't have it set already)"
-                    f" and provide it in a comment in this issue as "
-                    f"`{self.service_config.comment_command_prefix} verify-fas "
-                    "<my-fas-username>` (make sure your profile [is not private]"
+                    f" and provide it in a **comment in this issue** as \n\n"
+                    f"```\n{self.service_config.comment_command_prefix} verify-fas "
+                    "<my-fas-username>\n``` \n\n(and make sure your profile [is not private]"
                     f"(https://accounts.fedoraproject.org/user/{self.sender_login}/"
                     "settings/profile/#is_private)). "
                     "We automatically check for the match between the `GitHub"
@@ -130,7 +140,7 @@ class GithubAppInstallationHandler(
                     "match.\n\n"
                     "Here is a link to the settings page:\n"
                     f"https://accounts.fedoraproject.org/user/{self.sender_login}"
-                    "/settings/profile/#github (update the FAS account in the URL if needed)"
+                    "/settings/profile/#github (update the FAS account in the URL if needed)."
                     "\n\n"
                     "For more info, please check out the documentation: "
                     f"{DOCS_APPROVAL_URL}"
@@ -140,9 +150,7 @@ class GithubAppInstallationHandler(
             msg = f"{self.account_type} {self.account_login} needs to be approved manually!"
             AllowlistModel.add_namespace(namespace, AllowlistStatus.waiting.value)
         else:
-            msg = (
-                f"{self.account_type} {self.account_login} is already on our allowlist."
-            )
+            msg = f"{self.account_type} {self.account_login} is already on our allowlist."
 
         logger.info(msg)
         return TaskResults(success=True, details={"msg": msg})
@@ -150,7 +158,9 @@ class GithubAppInstallationHandler(
 
 @reacts_to(event=IssueCommentEvent)
 class GithubFasVerificationHandler(
-    JobHandler, PackitAPIWithDownstreamMixin, GetIssueMixin
+    JobHandler,
+    PackitAPIWithDownstreamMixin,
+    GetIssueMixin,
 ):
     task_name = TaskName.github_fas_verification
 
@@ -169,7 +179,7 @@ class GithubFasVerificationHandler(
         self.comment = self.data.event_dict.get("comment")
 
     @staticmethod
-    def get_checkers() -> Tuple[Type[Checker], ...]:
+    def get_checkers() -> tuple[type[Checker], ...]:
         return (IsIssueInNotificationRepoChecker,)
 
     def run(self) -> TaskResults:
@@ -181,25 +191,25 @@ class GithubFasVerificationHandler(
             TaskResults
         """
         logger.debug(
-            f"Going to run verification of FAS account triggered by comment:"
-            f" {self.comment}"
+            f"Going to run verification of FAS account triggered by comment:" f" {self.comment}",
         )
         # e.g. User Bebaabeni needs to be approved.
         _, account_login, _ = self.issue.title.split(maxsplit=2)
         original_sender_login = GithubInstallationModel.get_by_account_login(
-            account_login
+            account_login,
         ).sender_login
         logger.debug(f"Original sender login: {original_sender_login}")
         namespace = f"github.com/{account_login}"
         command_parts = get_packit_commands_from_comment(
-            self.comment, self.service_config.comment_command_prefix
+            self.comment,
+            self.service_config.comment_command_prefix,
         )
         # we expect ["verify-fas", "fas-account"]
         if len(command_parts) != 2:
             msg = "Incorrect format of the Packit verification comment command."
             logger.debug(msg)
             self.issue.comment(
-                f"{msg} The expected format: `/packit verify-fas my-fas-account`"
+                f"{msg} The expected format: `/packit verify-fas my-fas-account`",
             )
             return TaskResults(success=False, details={"msg": msg})
 
@@ -233,7 +243,8 @@ class GithubFasVerificationHandler(
             return TaskResults(success=True, details={"msg": msg})
 
         if allowlist.is_github_username_from_fas_account_matching(
-            fas_account=fas_account, sender_login=self.sender_login
+            fas_account=fas_account,
+            sender_login=self.sender_login,
         ):
             msg = (
                 f"Namespace `{namespace}` approved successfully "
@@ -245,13 +256,15 @@ class GithubFasVerificationHandler(
 
             # store the fas account in the DB for the namespace
             AllowlistModel.add_namespace(
-                namespace, AllowlistStatus.approved_automatically.value, fas_account
+                namespace,
+                AllowlistStatus.approved_automatically.value,
+                fas_account,
             )
 
         else:
             logger.debug(
                 f"No match between FAS account `{fas_account}` "
-                f"and GitHub user `{self.sender_login}` found."
+                f"and GitHub user `{self.sender_login}` found.",
             )
             msg = (
                 f"We were not able to find a match between the GitHub Username field "

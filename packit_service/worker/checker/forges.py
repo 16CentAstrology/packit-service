@@ -14,11 +14,10 @@ class IsIssueInNotificationRepoChecker(Checker, GetIssueMixin):
         """Checks whether the Packit verification command is placed in
         packit/notifications repository in the issue our service created.
         """
-        if not (
-            self.project.namespace == "packit" and self.project.repo == "notifications"
-        ):
+        if not (self.project.namespace == "packit" and self.project.repo == "notifications"):
             logger.debug(
-                "Packit verification comment command not placed in packit/notifications repository."
+                "Packit verification comment command not placed"
+                "in packit/notifications repository.",
             )
             return False
 
@@ -26,7 +25,7 @@ class IsIssueInNotificationRepoChecker(Checker, GetIssueMixin):
         if issue_author != self.service_config.get_github_account_name():
             logger.debug(
                 f"Packit verification comment command placed on issue with author "
-                f"other than our app: {issue_author}"
+                f"other than our app: {issue_author}",
             )
             return False
 

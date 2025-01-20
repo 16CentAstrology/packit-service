@@ -3,21 +3,45 @@
 # pre-commit install -t pre-commit -t pre-push
 
 repos:
-  - repo: https://github.com/psf/black
-    rev: 23.9.1
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.4
     hooks:
-      - id: black
-  - repo: https://github.com/asottile/pyupgrade
-    rev: v3.14.0
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+      - id: ruff-format
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.14.0
     hooks:
-      - id: pyupgrade
+      - id: mypy
+        args: [
+            --no-strict-optional,
+            --ignore-missing-imports,
+            # the alembic directory in packit-service repo is considered to be a namespace package,
+            # which means `import alembic` works even though alembic is not actually installed
+            # without disabling namespace packages, mypy throws a bunch of errors like:
+            #   error: Module "alembic" has no attribute "context"  [attr-defined]
+            --no-namespace-packages,
+            --python-version,
+            "3.9",
+          ]
+        additional_dependencies:
+          [
+            types-jwt,
+            types-setuptools,
+            types-redis,
+            types-requests,
+            types-Flask,
+            types-PyYAML,
+            types-cachetools,
+          ]
+        exclude: files/scripts/
   - repo: https://github.com/pre-commit/mirrors-prettier
-    rev: v3.0.3
+    rev: v4.0.0-alpha.8
     hooks:
       - id: prettier
         exclude: tests_openshift/openshift_integration/test_data/
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v4.4.0
+    rev: v5.0.0
     hooks:
       - id: check-added-large-files
       - id: check-ast
@@ -35,41 +59,8 @@ repos:
       - id: end-of-file-fixer
       - id: mixed-line-ending
       - id: trailing-whitespace
-  - repo: https://github.com/PyCQA/flake8
-    rev: 6.1.0
-    hooks:
-      - id: flake8
-        args:
-          - --max-line-length=100
-          - --per-file-ignores=files/packit.wsgi:F401,E402
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.5.1
-    hooks:
-      - id: mypy
-        args: [
-            --no-strict-optional,
-            --ignore-missing-imports,
-            # the alembic directory in packit-service repo is considered to be a namespace package,
-            # which means `import alembic` works even though alembic is not actually installed
-            # without disabling namespace packages, mypy throws a bunch of errors like:
-            #   error: Module "alembic" has no attribute "context"  [attr-defined]
-            --no-namespace-packages,
-            --python-version,
-            "3.9",
-          ]
-        additional_dependencies:
-          [
-            types-jwt,
-            types-pkg_resources,
-            types-redis,
-            types-requests,
-            types-Flask,
-            types-PyYAML,
-            types-cachetools,
-          ]
-        exclude: files/scripts/
   - repo: https://github.com/shellcheck-py/shellcheck-py
-    rev: v0.9.0.6
+    rev: v0.10.0.1
     hooks:
       - id: shellcheck
   - repo: https://github.com/packit/pre-commit-hooks
@@ -78,9 +69,9 @@ repos:
       - id: check-rebase
         args:
           - https://github.com/packit/packit-service.git
-        stages: [manual, push]
+        stages: [manual, pre-push]
   - repo: https://github.com/packit/requre
-    rev: 0.8.2
+    rev: 0.8.4
     hooks:
       - id: requre-purge
         name: Requre response files cleanup
@@ -103,11 +94,27 @@ repos:
         language: python
         types: [yaml]
         files: /tests_openshift.*\.yaml$
-        stages: [manual, push]
+        stages: [manual, pre-push]
   - repo: https://github.com/gitleaks/gitleaks
-    rev: v8.18.0
+    rev: v8.22.1
     hooks:
       - id: gitleaks
         # The hook runs 'gitleaks protect --staged' which parses output of
         # 'git diff --staged', i.e. always passes in pre-push/manual stage.
-        stages: [commit]
+        stages: [pre-commit]
+  - repo: https://github.com/python-jsonschema/check-jsonschema
+    rev: 0.30.0
+    hooks:
+      - id: check-github-workflows
+        args: ["--verbose"]
+  - repo: https://github.com/Lucas-C/pre-commit-hooks
+    rev: v1.5.5
+    hooks:
+      - id: insert-license
+        files: \.py$
+        exclude: alembic/
+        args:
+          - --license-filepath
+          - LICENSE_HEADER.txt
+          - --comment-style
+          - "#"

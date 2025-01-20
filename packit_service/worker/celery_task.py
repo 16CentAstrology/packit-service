@@ -1,8 +1,10 @@
+# Copyright Contributors to the Packit project.
+# SPDX-License-Identifier: MIT
+
 import logging
-from typing import Optional, Any, Dict
+from typing import Any, Optional
 
 from celery import Task
-
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +44,7 @@ class CeleryTask:
         ex: Optional[Exception] = None,
         delay: Optional[int] = None,
         max_retries: Optional[int] = None,
-        kargs: Optional[Dict[str, Any]] = None,
+        kargs: Optional[dict[str, Any]] = None,
     ) -> None:
         """
         Retries the celery task.

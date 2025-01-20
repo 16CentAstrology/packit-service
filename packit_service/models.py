@@ -7,46 +7,47 @@ Data layer on top of PSQL using sqlalch
 
 import enum
 import logging
+import re
 from collections import Counter
+from collections.abc import Generator, Iterable
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from os import getenv
 from typing import (
-    Dict,
-    Iterable,
-    List,
-    Optional,
     TYPE_CHECKING,
-    Tuple,
-    Type,
+    Optional,
     Union,
-    Set,
     overload,
 )
 from urllib.parse import urlparse
 
+from cachetools import TTLCache, cached
 from cachetools.func import ttl_cache
+from packit.config import JobConfigTriggerType
 from sqlalchemy import (
+    JSON,
     Boolean,
     Column,
     DateTime,
     Enum,
     ForeignKey,
     Integer,
-    JSON,
     String,
+    Table,
     Text,
+    asc,
+    case,
     create_engine,
     desc,
     func,
     null,
-    case,
-    Table,
 )
 from sqlalchemy.dialects.postgresql import array as psql_array
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import (
     Session as SQLASession,
+)
+from sqlalchemy.orm import (
     relationship,
     scoped_session,
     sessionmaker,
@@ -54,13 +55,12 @@ from sqlalchemy.orm import (
 from sqlalchemy.sql.functions import count
 from sqlalchemy.types import ARRAY
 
-from packit.config import JobConfigTriggerType
 from packit_service.constants import ALLOWLIST_CONSTANTS
 
 logger = logging.getLogger(__name__)
 
 _CACHE_MAXSIZE = 100
-_CACHE_TTL = timedelta(hours=1).seconds
+_CACHE_TTL = timedelta(hours=1).total_seconds()
 
 
 def get_pg_url() -> str:
@@ -86,10 +86,7 @@ Session = sessionmaker(bind=engine)
 
 def is_multi_threaded() -> bool:
     # See run_worker.sh
-    return (
-        getenv("POOL", "solo") in ("gevent", "eventlet")
-        and int(getenv("CONCURRENCY", 1)) > 1
-    )
+    return getenv("POOL", "solo") in ("gevent", "eventlet") and int(getenv("CONCURRENCY", 1)) > 1
 
 
 if is_multi_threaded():
@@ -103,25 +100,25 @@ else:  # service/httpd
     singleton_session = None
 
 
-def sa_session() -> SQLASession:
-    """If we use single session, return it, otherwise return a new session from registry."""
-    return singleton_session or Session()
-
-
 @contextmanager
-def sa_session_transaction() -> SQLASession:
+def sa_session_transaction(commit: bool = False) -> SQLASession:
     """
     Context manager for 'framing' of a transaction for cases where we
-    commit data to the database. If all operations succeed
-    the transaction is committed, otherwise rolled back.
+    query or commit data to the database. If an error occurs the transaction is rolled back.
     https://docs.sqlalchemy.org/en/14/orm/session_basics.html#framing-out-a-begin-commit-rollback-block
     TODO: Replace usages of this function with the sessionmaker.begin[_nested]() as described in
     https://docs.sqlalchemy.org/en/14/orm/session_basics.html#using-a-sessionmaker
+
+    Args:
+        commit: Whether to call `Session.commit()` upon exiting the context. Should be set to True
+            if any changes are made within the context. Defaults to False.
     """
-    session = sa_session()
+    # if we use single session, use it, otherwise get a new session from registry
+    session = singleton_session or Session()
     try:
         yield session
-        session.commit()
+        if commit:
+            session.commit()
     except Exception as ex:
         logger.warning(f"Exception while working with database: {ex!r}")
         session.rollback()
@@ -129,7 +126,8 @@ def sa_session_transaction() -> SQLASession:
 
 
 def optional_time(
-    datetime_object: Union[datetime, None], fmt: str = "%d/%m/%Y %H:%M:%S"
+    datetime_object: Union[datetime, None],
+    fmt: str = "%d/%m/%Y %H:%M:%S",
 ) -> Union[str, None]:
     """
     Returns a formatted date-time string if argument is a datetime object.
@@ -160,27 +158,27 @@ def optional_timestamp(datetime_object: Optional[datetime]) -> Optional[int]:
 
 
 def get_submitted_time_from_model(
-    model: Union["CoprBuildTargetModel", "TFTTestRunTargetModel"]
+    model: Union["CoprBuildTargetModel", "TFTTestRunTargetModel"],
 ) -> datetime:
     # TODO: unify `submitted_name` (or better -> create for both models `task_accepted_time`)
     # to delete this mess plz
-    if isinstance(model, CoprBuildTargetModel):
-        return model.build_submitted_time
-
-    return model.submitted_time
+    try:
+        return model.build_submitted_time  # type: ignore[union-attr]
+    except AttributeError:
+        return model.submitted_time  # type: ignore[union-attr]
 
 
 @overload
 def get_most_recent_targets(
     models: Iterable["CoprBuildTargetModel"],
-) -> List["CoprBuildTargetModel"]:
+) -> list["CoprBuildTargetModel"]:
     """Overload for type-checking"""
 
 
 @overload
 def get_most_recent_targets(
     models: Iterable["TFTTestRunTargetModel"],
-) -> List["TFTTestRunTargetModel"]:
+) -> list["TFTTestRunTargetModel"]:
     """Overload for type-checking"""
 
 
@@ -189,7 +187,7 @@ def get_most_recent_targets(
         Iterable["CoprBuildTargetModel"],
         Iterable["TFTTestRunTargetModel"],
     ],
-) -> Union[List["CoprBuildTargetModel"], List["TFTTestRunTargetModel"]]:
+) -> Union[list["CoprBuildTargetModel"], list["TFTTestRunTargetModel"]]:
     """
     Gets most recent models from an iterable (regarding submission time).
 
@@ -204,11 +202,11 @@ def get_most_recent_targets(
     for model in models:
         submitted_time_of_current_model = get_submitted_time_from_model(model)
         if (
-            most_recent_models.get(model.target) is None
-            or get_submitted_time_from_model(most_recent_models[model.target])
+            most_recent_models.get((model.target, model.identifier)) is None
+            or get_submitted_time_from_model(most_recent_models[(model.target, model.identifier)])
             < submitted_time_of_current_model
         ):
-            most_recent_models[model.target] = model
+            most_recent_models[(model.target, model.identifier)] = model
 
     return list(most_recent_models.values())
 
@@ -216,16 +214,16 @@ def get_most_recent_targets(
 @overload
 def filter_most_recent_target_models_by_status(
     models: Iterable["CoprBuildTargetModel"],
-    statuses_to_filter_with: List[str],
-) -> Set["CoprBuildTargetModel"]:
+    statuses_to_filter_with: list[str],
+) -> set["CoprBuildTargetModel"]:
     """Overload for type-checking"""
 
 
 @overload
 def filter_most_recent_target_models_by_status(
     models: Iterable["TFTTestRunTargetModel"],
-    statuses_to_filter_with: List[str],
-) -> Set["TFTTestRunTargetModel"]:
+    statuses_to_filter_with: list[str],
+) -> set["TFTTestRunTargetModel"]:
     """Overload for type-checking"""
 
 
@@ -234,10 +232,10 @@ def filter_most_recent_target_models_by_status(
         Iterable["CoprBuildTargetModel"],
         Iterable["TFTTestRunTargetModel"],
     ],
-    statuses_to_filter_with: List[str],
-) -> Union[Set["CoprBuildTargetModel"], Set["TFTTestRunTargetModel"]]:
+    statuses_to_filter_with: list[str],
+) -> Union[set["CoprBuildTargetModel"], set["TFTTestRunTargetModel"]]:
     logger.info(
-        f"Trying to filter targets with possible status: {statuses_to_filter_with} in {models}"
+        f"Trying to filter targets with possible status: {statuses_to_filter_with} in {models}",
     )
 
     filtered_target_models = {
@@ -255,12 +253,15 @@ def filter_most_recent_target_names_by_status(
         Iterable["CoprBuildTargetModel"],
         Iterable["TFTTestRunTargetModel"],
     ],
-    statuses_to_filter_with: List[str],
-) -> Optional[Set[str]]:
+    statuses_to_filter_with: list[str],
+) -> Optional[set[tuple[str, str]]]:
     filtered_models = filter_most_recent_target_models_by_status(
-        models, statuses_to_filter_with
+        models,
+        statuses_to_filter_with,
     )
-    return {model.target for model in filtered_models} if filtered_models else None
+    return (
+        {(model.target, model.identifier) for model in filtered_models} if filtered_models else None
+    )
 
 
 # https://github.com/python/mypy/issues/2477#issuecomment-313984522 ^_^
@@ -275,6 +276,9 @@ class ProjectEventModelType(str, enum.Enum):
     branch_push = "branch_push"
     release = "release"
     issue = "issue"
+    koji_build_tag = "koji_build_tag"
+    anitya_version = "anitya_version"
+    anitya_multiple_versions = "anitya_multiple_versions"
 
 
 class BuildsAndTestsConnector:
@@ -287,19 +291,20 @@ class BuildsAndTestsConnector:
     project_event_model_type: ProjectEventModelType
 
     def get_project_event_models(self) -> Iterable["ProjectEventModel"]:
-        return (
-            sa_session()
-            .query(ProjectEventModel)
-            .filter_by(type=self.project_event_model_type, event_id=self.id)
-        )
+        with sa_session_transaction() as session:
+            return session.query(ProjectEventModel).filter_by(
+                type=self.project_event_model_type,
+                event_id=self.id,
+            )
 
-    def get_runs(self) -> List["PipelineModel"]:
+    def get_runs(self) -> list["PipelineModel"]:
         project_events = self.get_project_event_models()
         return [run for project_event in project_events for run in project_event.runs]
 
     def _get_run_item(
-        self, model_type: Type["AbstractBuildTestDbType"]
-    ) -> List["AbstractBuildTestDbType"]:
+        self,
+        model_type: type["AbstractBuildTestDbType"],
+    ) -> list["AbstractBuildTestDbType"]:
         runs = self.get_runs()
         models = []
 
@@ -343,7 +348,7 @@ class ProjectAndEventsConnector:
     to share methods for accessing project and project events models.
     """
 
-    runs: Optional[List["PipelineModel"]]
+    runs: Optional[list["PipelineModel"]]
 
     def get_project_event_model(self) -> Optional["ProjectEventModel"]:
         return self.runs[0].project_event if self.runs else None
@@ -355,7 +360,7 @@ class ProjectAndEventsConnector:
         project_event = self.get_project_event_model()
         return project_event.get_project_event_object() if project_event else None
 
-    def get_project(self) -> Optional["GitProjectModel"]:
+    def get_project(self) -> Optional[Union["AnityaProjectModel", "GitProjectModel"]]:
         project_event_object = self.get_project_event_object()
         return project_event_object.project if project_event_object else None
 
@@ -386,12 +391,20 @@ class ProjectAndEventsConnector:
         project_event_object = self.get_project_event_object()
         if isinstance(project_event_object, GitBranchModel):
             return project_event_object.name
+        if isinstance(project_event_object, KojiBuildTagModel):
+            return project_event_object.target
         return None
 
     def get_release_tag(self) -> Optional[str]:
         project_event_object = self.get_project_event_object()
         if isinstance(project_event_object, ProjectReleaseModel):
             return project_event_object.tag_name
+        return None
+
+    def get_anitya_version(self) -> Optional[str]:
+        project_event_object = self.get_project_event_object()
+        if isinstance(project_event_object, AnityaVersionModel):
+            return project_event_object.version
         return None
 
 
@@ -409,7 +422,7 @@ class GroupAndTargetModelConnector:
     def get_project_event_object(self) -> Optional["AbstractProjectObjectDbType"]:
         return self.group_of_targets.get_project_event_object()
 
-    def get_project(self) -> Optional["GitProjectModel"]:
+    def get_project(self) -> Optional[Union["AnityaProjectModel", "GitProjectModel"]]:
         return self.group_of_targets.get_project()
 
     def get_pr_id(self) -> Optional[int]:
@@ -423,6 +436,9 @@ class GroupAndTargetModelConnector:
 
     def get_release_tag(self) -> Optional[str]:
         return self.group_of_targets.get_release_tag()
+
+    def get_anitya_version(self) -> Optional[str]:
+        return self.group_of_targets.get_anitya_version()
 
     def get_package_name(self) -> Optional[str]:
         return self.group_of_targets.get_package_name()
@@ -445,6 +461,141 @@ class GroupModel:
         raise NotImplementedError
 
 
+class AnityaProjectModel(Base):
+    __tablename__ = "anitya_projects"
+    id = Column(Integer, primary_key=True)
+    project_id = Column(Integer, index=True)
+    project_name = Column(String)
+    package = Column(String)
+    versions = relationship("AnityaVersionModel", back_populates="project")
+    multiple_versions = relationship(
+        "AnityaMultipleVersionsModel",
+        back_populates="project",
+    )
+
+    @classmethod
+    def get_by_id(cls, id_: int) -> Optional["AnityaProjectModel"]:
+        with sa_session_transaction() as session:
+            return session.query(AnityaProjectModel).filter_by(id=id_).first()
+
+    @classmethod
+    def get_or_create(
+        cls,
+        project_name: str,
+        project_id: int,
+        package: str,
+    ) -> "AnityaProjectModel":
+        with sa_session_transaction(commit=True) as session:
+            project = (
+                session.query(AnityaProjectModel)
+                .filter_by(
+                    project_name=project_name,
+                    project_id=project_id,
+                    package=package,
+                )
+                .first()
+            )
+            if not project:
+                project = AnityaProjectModel()
+                project.project_id = project_id
+                project.project_name = project_name
+                project.package = package
+                session.add(project)
+            return project
+
+
+class AnityaMultipleVersionsModel(BuildsAndTestsConnector, Base):
+    __tablename__ = "anitya_multiple_versions"
+    id = Column(Integer, primary_key=True)  # our database PK
+    versions = Column(ARRAY(String), nullable=False)
+    project_id = Column(Integer, ForeignKey("anitya_projects.id"), index=True)
+    project = relationship("AnityaProjectModel", back_populates="multiple_versions")
+
+    job_config_trigger_type = JobConfigTriggerType.release
+    project_event_model_type = ProjectEventModelType.anitya_multiple_versions
+
+    @classmethod
+    def get_or_create(
+        cls,
+        versions: list[str],
+        project_id: int,
+        project_name: str,
+        package: str,
+    ) -> "AnityaMultipleVersionsModel":
+        with sa_session_transaction(commit=True) as session:
+            project = AnityaProjectModel.get_or_create(
+                project_id=project_id,
+                project_name=project_name,
+                package=package,
+            )
+            project_version = (
+                session.query(AnityaMultipleVersionsModel)
+                .filter_by(versions=versions, project_id=project.id)
+                .first()
+            )
+            if not project_version:
+                project_version = AnityaMultipleVersionsModel()
+                project_version.versions = versions
+                project_version.project = project
+                session.add(project_version)
+            return project_version
+
+    @classmethod
+    def get_by_id(cls, id_: int) -> Optional["AnityaMultipleVersionsModel"]:
+        with sa_session_transaction() as session:
+            return session.query(AnityaVersionModel).filter_by(id=id_).first()
+
+    def __repr__(self):
+        return (
+            f"AnityaMultipleVersionsModel(" f"versions={self.versions}, " f"project={self.project})"
+        )
+
+
+class AnityaVersionModel(BuildsAndTestsConnector, Base):
+    __tablename__ = "anitya_versions"
+    id = Column(Integer, primary_key=True)  # our database PK
+    version = Column(String)
+    project_id = Column(Integer, ForeignKey("anitya_projects.id"), index=True)
+    project = relationship("AnityaProjectModel", back_populates="versions")
+
+    job_config_trigger_type = JobConfigTriggerType.release
+    project_event_model_type = ProjectEventModelType.anitya_version
+
+    @classmethod
+    def get_or_create(
+        cls,
+        version: str,
+        project_id: int,
+        project_name: str,
+        package: str,
+    ) -> "AnityaVersionModel":
+        with sa_session_transaction(commit=True) as session:
+            project = AnityaProjectModel.get_or_create(
+                project_id=project_id,
+                project_name=project_name,
+                package=package,
+            )
+            project_version = (
+                session.query(AnityaVersionModel)
+                .filter_by(version=version, project_id=project.id)
+                .first()
+            )
+            if not project_version:
+                project_version = AnityaVersionModel()
+                project_version.version = version
+                project_version.project = project
+                session.add(project_version)
+            return project_version
+
+    @classmethod
+    def get_by_id(cls, id_: int) -> Optional["AnityaVersionModel"]:
+        with sa_session_transaction() as session:
+            return session.query(AnityaVersionModel).filter_by(id=id_).first()
+
+    def __repr__(self):
+        return f"AnityaVersionModel(" f"version={self.version}, " f"project={self.project})"
+
+
 class GitProjectModel(Base):
     __tablename__ = "git_projects"
     id = Column(Integer, primary_key=True)
@@ -455,153 +606,220 @@ class GitProjectModel(Base):
     branches = relationship("GitBranchModel", back_populates="project")
     releases = relationship("ProjectReleaseModel", back_populates="project")
     issues = relationship("IssueModel", back_populates="project")
+    koji_build_tags = relationship("KojiBuildTagModel", back_populates="project")
+    sync_release_pull_requests = relationship(
+        "SyncReleasePullRequestModel",
+        back_populates="project",
+    )
     project_authentication_issue = relationship(
-        "ProjectAuthenticationIssueModel", back_populates="project"
+        "ProjectAuthenticationIssueModel",
+        back_populates="project",
     )
 
     project_url = Column(String)
     instance_url = Column(String, nullable=False)
 
+    # we checked that exists at least a bodhi update or a koji build
+    # or a merged packit downstream pull request for it.
+    onboarded_downstream = Column(Boolean, default=False)
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.instance_url = urlparse(self.project_url).hostname
 
+    def set_onboarded_downstream(self, onboarded: bool):
+        with sa_session_transaction(commit=True) as session:
+            self.onboarded_downstream = onboarded
+            session.add(self)
+
     @classmethod
     def get_or_create(
-        cls, namespace: str, repo_name: str, project_url: str
+        cls,
+        namespace: str,
+        repo_name: str,
+        project_url: str,
     ) -> "GitProjectModel":
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             project = (
                 session.query(GitProjectModel)
                 .filter_by(
-                    namespace=namespace, repo_name=repo_name, project_url=project_url
+                    namespace=namespace,
+                    repo_name=repo_name,
+                    project_url=project_url,
                 )
                 .first()
             )
             if not project:
                 project = cls(
-                    repo_name=repo_name, namespace=namespace, project_url=project_url
+                    repo_name=repo_name,
+                    namespace=namespace,
+                    project_url=project_url,
                 )
                 session.add(project)
             return project
 
     @classmethod
+    def get_all(cls) -> Iterable["GitProjectModel"]:
+        """Return projects of given forge"""
+        with sa_session_transaction() as session:
+            query = session.query(GitProjectModel).order_by(GitProjectModel.namespace)
+            return query.all()
+
+    @classmethod
     def get_by_id(cls, id_: int) -> Optional["GitProjectModel"]:
-        return sa_session().query(GitProjectModel).filter_by(id=id_).first()
+        with sa_session_transaction() as session:
+            return session.query(GitProjectModel).filter_by(id=id_).first()
 
     @classmethod
     def get_range(cls, first: int, last: int) -> Iterable["GitProjectModel"]:
-        return (
-            sa_session()
-            .query(GitProjectModel)
-            .order_by(GitProjectModel.namespace)
-            .slice(first, last)
-        )
+        with sa_session_transaction() as session:
+            return (
+                session.query(GitProjectModel)
+                .order_by(GitProjectModel.namespace)
+                .slice(first, last)
+            )
 
     @classmethod
     def get_by_forge(
-        cls, first: int, last: int, forge: str
+        cls,
+        first: int,
+        last: int,
+        forge: str,
     ) -> Iterable["GitProjectModel"]:
         """Return projects of given forge"""
-        return (
-            sa_session()
-            .query(GitProjectModel)
-            .filter_by(instance_url=forge)
-            .order_by(GitProjectModel.namespace)
-            .slice(first, last)
-        )
+        with sa_session_transaction() as session:
+            return (
+                session.query(GitProjectModel)
+                .filter_by(instance_url=forge)
+                .order_by(GitProjectModel.namespace)
+                .slice(first, last)
+            )
 
     @classmethod
     def get_by_forge_namespace(
-        cls, forge: str, namespace: str
+        cls,
+        first: int,
+        last: int,
+        forge: str,
+        namespace: str,
     ) -> Iterable["GitProjectModel"]:
         """Return projects of given forge and namespace"""
-        return (
-            sa_session()
-            .query(GitProjectModel)
-            .filter_by(instance_url=forge, namespace=namespace)
-        )
+        with sa_session_transaction() as session:
+            return (
+                session.query(GitProjectModel)
+                .filter_by(instance_url=forge, namespace=namespace)
+                .slice(first, last)
+            )
 
     @classmethod
     def get_project(
-        cls, forge: str, namespace: str, repo_name: str
+        cls,
+        forge: str,
+        namespace: str,
+        repo_name: str,
     ) -> Optional["GitProjectModel"]:
         """Return one project which matches said criteria"""
-        return (
-            sa_session()
-            .query(cls)
-            .filter_by(instance_url=forge, namespace=namespace, repo_name=repo_name)
-            .one_or_none()
-        )
+        with sa_session_transaction() as session:
+            return (
+                session.query(cls)
+                .filter_by(instance_url=forge, namespace=namespace, repo_name=repo_name)
+                .one_or_none()
+            )
 
     @classmethod
     def get_project_prs(
-        cls, first: int, last: int, forge: str, namespace: str, repo_name: str
+        cls,
+        first: int,
+        last: int,
+        forge: str,
+        namespace: str,
+        repo_name: str,
     ) -> Iterable["PullRequestModel"]:
-        return (
-            sa_session()
-            .query(PullRequestModel)
-            .join(PullRequestModel.project)
-            .filter(
-                GitProjectModel.instance_url == forge,
-                GitProjectModel.namespace == namespace,
-                GitProjectModel.repo_name == repo_name,
+        with sa_session_transaction() as session:
+            return (
+                session.query(PullRequestModel)
+                .join(PullRequestModel.project)
+                .filter(
+                    GitProjectModel.instance_url == forge,
+                    GitProjectModel.namespace == namespace,
+                    GitProjectModel.repo_name == repo_name,
+                )
+                .order_by(desc(PullRequestModel.pr_id))
+                .slice(first, last)
             )
-            .order_by(desc(PullRequestModel.pr_id))
-            .slice(first, last)
-        )
 
     @classmethod
     def get_project_issues(
-        cls, forge: str, namespace: str, repo_name: str
+        cls,
+        first: int,
+        last: int,
+        forge: str,
+        namespace: str,
+        repo_name: str,
     ) -> Iterable["IssueModel"]:
-        return (
-            sa_session()
-            .query(IssueModel)
-            .join(IssueModel.project)
-            .filter(
-                GitProjectModel.instance_url == forge,
-                GitProjectModel.namespace == namespace,
-                GitProjectModel.repo_name == repo_name,
+        with sa_session_transaction() as session:
+            return (
+                session.query(IssueModel)
+                .join(IssueModel.project)
+                .filter(
+                    GitProjectModel.instance_url == forge,
+                    GitProjectModel.namespace == namespace,
+                    GitProjectModel.repo_name == repo_name,
+                )
+                .slice(first, last)
             )
-        )
 
     @classmethod
     def get_project_branches(
-        cls, forge: str, namespace: str, repo_name: str
+        cls,
+        first: int,
+        last: int,
+        forge: str,
+        namespace: str,
+        repo_name: str,
     ) -> Iterable["GitBranchModel"]:
-        return (
-            sa_session()
-            .query(GitBranchModel)
-            .join(GitBranchModel.project)
-            .filter(
-                GitProjectModel.instance_url == forge,
-                GitProjectModel.namespace == namespace,
-                GitProjectModel.repo_name == repo_name,
+        with sa_session_transaction() as session:
+            return (
+                session.query(GitBranchModel)
+                .join(GitBranchModel.project)
+                .filter(
+                    GitProjectModel.instance_url == forge,
+                    GitProjectModel.namespace == namespace,
+                    GitProjectModel.repo_name == repo_name,
+                )
+                .slice(first, last)
             )
-        )
 
     @classmethod
     def get_project_releases(
-        cls, forge: str, namespace: str, repo_name: str
+        cls,
+        first: int,
+        last: int,
+        forge: str,
+        namespace: str,
+        repo_name: str,
     ) -> Iterable["ProjectReleaseModel"]:
-        return (
-            sa_session()
-            .query(ProjectReleaseModel)
-            .join(ProjectReleaseModel.project)
-            .filter(
-                GitProjectModel.instance_url == forge,
-                GitProjectModel.namespace == namespace,
-                GitProjectModel.repo_name == repo_name,
+        with sa_session_transaction() as session:
+            return (
+                session.query(ProjectReleaseModel)
+                .join(ProjectReleaseModel.project)
+                .filter(
+                    GitProjectModel.instance_url == forge,
+                    GitProjectModel.namespace == namespace,
+                    GitProjectModel.repo_name == repo_name,
+                )
+                .slice(first, last)
             )
-        )
 
     # ACTIVE PROJECTS
 
     @classmethod
     @ttl_cache(maxsize=_CACHE_MAXSIZE, ttl=_CACHE_TTL)
     def get_active_projects(
-        cls, top: Optional[int] = None, datetime_from=None, datetime_to=None
+        cls,
+        top: Optional[int] = None,
+        datetime_from=None,
+        datetime_to=None,
     ) -> list[str]:
         """
         Active project is the one with at least one activity (=one pipeline)
@@ -609,8 +827,10 @@ class GitProjectModel(Base):
         """
         return list(
             cls.get_active_projects_usage_numbers(
-                top=top, datetime_from=datetime_from, datetime_to=datetime_to
-            ).keys()
+                top=top,
+                datetime_from=datetime_from,
+                datetime_to=datetime_to,
+            ).keys(),
         )
 
     @classmethod
@@ -622,14 +842,19 @@ class GitProjectModel(Base):
         """
         return len(
             cls.get_active_projects_usage_numbers(
-                top=None, datetime_from=datetime_from, datetime_to=datetime_to
-            )
+                top=None,
+                datetime_from=datetime_from,
+                datetime_to=datetime_to,
+            ),
         )
 
     @classmethod
     @ttl_cache(maxsize=_CACHE_MAXSIZE, ttl=_CACHE_TTL)
     def get_active_projects_usage_numbers(
-        cls, top: Optional[int] = 10, datetime_from=None, datetime_to=None
+        cls,
+        top: Optional[int] = 10,
+        datetime_from=None,
+        datetime_to=None,
     ) -> dict[str, int]:
         """
         Get the most active projects sorted by the number of related pipelines.
@@ -642,10 +867,10 @@ class GitProjectModel(Base):
                     datetime_to=datetime_to,
                     top=None,
                     project_event_type=project_event_type,
-                )
+                ),
             )
         return dict(
-            sorted(all_usage_numbers.items(), key=lambda x: x[1], reverse=True)[:top]
+            sorted(all_usage_numbers.items(), key=lambda x: x[1], reverse=True)[:top],
         )
 
     # ALL PROJECTS
@@ -658,73 +883,74 @@ class GitProjectModel(Base):
         """
         Number of project models in the database.
         """
-        return sa_session().query(GitProjectModel).count()
+        with sa_session_transaction() as session:
+            return session.query(GitProjectModel).count()
 
     @classmethod
     @ttl_cache(maxsize=_CACHE_MAXSIZE, ttl=_CACHE_TTL)
-    def get_instance_numbers(cls) -> Dict[str, int]:
+    def get_instance_numbers(cls) -> dict[str, int]:
         """
         Get the number of projects per each GIT instances.
         """
-        return dict(
-            sa_session()
-            .query(
-                GitProjectModel.instance_url,
-                func.count(GitProjectModel.instance_url),
+        with sa_session_transaction() as session:
+            return dict(
+                session.query(
+                    GitProjectModel.instance_url,
+                    func.count(GitProjectModel.instance_url),
+                )
+                .group_by(GitProjectModel.instance_url)
+                .all(),
             )
-            .group_by(GitProjectModel.instance_url)
-            .all()
-        )
 
     @classmethod
     @ttl_cache(maxsize=_CACHE_MAXSIZE, ttl=_CACHE_TTL)
     def get_instance_numbers_for_active_projects(
-        cls, datetime_from=None, datetime_to=None
-    ) -> Dict[str, int]:
+        cls,
+        datetime_from=None,
+        datetime_to=None,
+    ) -> dict[str, int]:
         """
         Get the number of projects (at least one pipeline during the time period)
         per each GIT instances.
         """
         projects_per_instance: dict[str, set[str]] = {}
 
-        for project_event_type in ProjectEventModelType:
-            project_event_model = MODEL_FOR_PROJECT_EVENT[project_event_type]
-            query = (
-                sa_session()
-                .query(
-                    GitProjectModel.instance_url,
+        with sa_session_transaction() as session:
+            for project_event_type in ProjectEventModelType:
+                project_event_model = MODEL_FOR_PROJECT_EVENT[project_event_type]
+                query = (
+                    session.query(
+                        GitProjectModel.instance_url,
+                        GitProjectModel.project_url,
+                    )
+                    .join(
+                        project_event_model,
+                        GitProjectModel.id == project_event_model.project_id,
+                    )
+                    .join(
+                        ProjectEventModel,
+                        ProjectEventModel.event_id == project_event_model.id,
+                    )
+                    .join(
+                        PipelineModel,
+                        PipelineModel.project_event_id == ProjectEventModel.id,
+                    )
+                    .filter(ProjectEventModel.type == project_event_type)
+                )
+                if datetime_from:
+                    query = query.filter(PipelineModel.datetime >= datetime_from)
+                if datetime_to:
+                    query = query.filter(PipelineModel.datetime <= datetime_to)
+
+                query = query.group_by(
                     GitProjectModel.project_url,
+                    GitProjectModel.instance_url,
                 )
-                .join(
-                    project_event_model,
-                    GitProjectModel.id == project_event_model.project_id,
-                )
-                .join(
-                    ProjectEventModel,
-                    ProjectEventModel.event_id == project_event_model.id,
-                )
-                .join(
-                    PipelineModel,
-                    PipelineModel.project_event_id == ProjectEventModel.id,
-                )
-                .filter(ProjectEventModel.type == project_event_type)
-            )
-            if datetime_from:
-                query = query.filter(PipelineModel.datetime >= datetime_from)
-            if datetime_to:
-                query = query.filter(PipelineModel.datetime <= datetime_to)
+                for instance, project in query.all():
+                    projects_per_instance.setdefault(instance, set())
+                    projects_per_instance[instance].add(project)
 
-            query = query.group_by(
-                GitProjectModel.project_url, GitProjectModel.instance_url
-            )
-            for instance, project in query.all():
-                projects_per_instance.setdefault(instance, set())
-                projects_per_instance[instance].add(project)
-
-        return {
-            instance: len(projects)
-            for instance, projects in projects_per_instance.items()
-        }
+        return {instance: len(projects) for instance, projects in projects_per_instance.items()}
 
     @classmethod
     @ttl_cache(maxsize=_CACHE_MAXSIZE, ttl=_CACHE_TTL)
@@ -745,13 +971,17 @@ class GitProjectModel(Base):
                 datetime_to=datetime_to,
                 project_event_type=project_event_type,
                 top=None,
-            ).values()
+            ).values(),
         )
 
     @classmethod
     @ttl_cache(maxsize=_CACHE_MAXSIZE, ttl=_CACHE_TTL)
     def get_project_event_usage_numbers(
-        cls, project_event_type, datetime_from=None, datetime_to=None, top=None
+        cls,
+        project_event_type,
+        datetime_from=None,
+        datetime_to=None,
+        top=None,
     ) -> dict[str, int]:
         """
         For each project, get the number of triggers of a given type with at least one pipeline
@@ -761,49 +991,49 @@ class GitProjectModel(Base):
         All if `top` not set, the first `top` projects returned otherwise.
         """
         project_event_model = MODEL_FOR_PROJECT_EVENT[project_event_type]
-        query = (
-            sa_session()
-            .query(
-                GitProjectModel.project_url,
-                count(project_event_model.id).over(
-                    partition_by=GitProjectModel.project_url
-                ),
-            )
-            .join(
-                project_event_model,
-                GitProjectModel.id == project_event_model.project_id,
-            )
-            .join(
-                ProjectEventModel, ProjectEventModel.event_id == project_event_model.id
-            )
-            .join(
-                PipelineModel,
-                PipelineModel.project_event_id == ProjectEventModel.id,
-            )
-            .filter(ProjectEventModel.type == project_event_type)
-            .filter(GitProjectModel.instance_url != "src.fedoraproject.org")
-        )
-        if datetime_from:
-            query = query.filter(PipelineModel.datetime >= datetime_from)
-        if datetime_to:
-            query = query.filter(PipelineModel.datetime <= datetime_to)
-
-        query = (
-            query.group_by(GitProjectModel.project_url, project_event_model.id)
-            .distinct()
-            .order_by(
-                desc(
+        with sa_session_transaction() as session:
+            query = (
+                session.query(
+                    GitProjectModel.project_url,
                     count(project_event_model.id).over(
-                        partition_by=GitProjectModel.project_url
-                    )
+                        partition_by=GitProjectModel.project_url,
+                    ),
+                )
+                .join(
+                    project_event_model,
+                    GitProjectModel.id == project_event_model.project_id,
+                )
+                .join(
+                    ProjectEventModel,
+                    ProjectEventModel.event_id == project_event_model.id,
+                )
+                .join(
+                    PipelineModel,
+                    PipelineModel.project_event_id == ProjectEventModel.id,
+                )
+                .filter(ProjectEventModel.type == project_event_type)
+            )
+            if datetime_from:
+                query = query.filter(PipelineModel.datetime >= datetime_from)
+            if datetime_to:
+                query = query.filter(PipelineModel.datetime <= datetime_to)
+
+            query = (
+                query.group_by(GitProjectModel.project_url, project_event_model.id)
+                .distinct()
+                .order_by(
+                    desc(
+                        count(project_event_model.id).over(
+                            partition_by=GitProjectModel.project_url,
+                        ),
+                    ),
                 )
             )
-        )
 
-        if top:
-            query = query.limit(top)
+            if top:
+                query = query.limit(top)
 
-        return dict(query.all())
+            return dict(query.all())
 
     @classmethod
     @ttl_cache(maxsize=_CACHE_MAXSIZE, ttl=_CACHE_TTL)
@@ -825,7 +1055,7 @@ class GitProjectModel(Base):
                 job_result_model=job_result_model,
                 top=None,
                 project_event_type=project_event_type,
-            ).values()
+            ).values(),
         )
 
     @classmethod
@@ -846,7 +1076,7 @@ class GitProjectModel(Base):
                 datetime_to=datetime_to,
                 job_result_model=job_result_model,
                 top=None,
-            ).values()
+            ).values(),
         )
 
     @classmethod
@@ -876,47 +1106,46 @@ class GitProjectModel(Base):
             SyncReleaseModel: PipelineModel.sync_release_run_id,
         }[job_result_model]
 
-        query = (
-            sa_session()
-            .query(
-                GitProjectModel.project_url,
-                count(job_result_model.id).over(
-                    partition_by=GitProjectModel.project_url
-                ),
-            )
-            .join(
-                project_event_model,
-                GitProjectModel.id == project_event_model.project_id,
-            )
-            .join(
-                ProjectEventModel, ProjectEventModel.event_id == project_event_model.id
-            )
-            .join(
-                PipelineModel,
-                PipelineModel.project_event_id == ProjectEventModel.id,
-            )
-            .join(job_result_model, job_result_model.id == pipeline_attribute)
-            .filter(ProjectEventModel.type == project_event_type)
-            # We have all the dist git projects in because of how we parse the events.
-            .filter(GitProjectModel.instance_url != "src.fedoraproject.org")
-        )
-        if datetime_from:
-            query = query.filter(PipelineModel.datetime >= datetime_from)
-        if datetime_to:
-            query = query.filter(PipelineModel.datetime <= datetime_to)
-        return dict(
-            query.group_by(GitProjectModel.project_url, job_result_model.id)
-            .distinct()
-            .order_by(
-                desc(
+        with sa_session_transaction() as session:
+            query = (
+                session.query(
+                    GitProjectModel.project_url,
                     count(job_result_model.id).over(
-                        partition_by=GitProjectModel.project_url
-                    )
+                        partition_by=GitProjectModel.project_url,
+                    ),
                 )
+                .join(
+                    project_event_model,
+                    GitProjectModel.id == project_event_model.project_id,
+                )
+                .join(
+                    ProjectEventModel,
+                    ProjectEventModel.event_id == project_event_model.id,
+                )
+                .join(
+                    PipelineModel,
+                    PipelineModel.project_event_id == ProjectEventModel.id,
+                )
+                .join(job_result_model, job_result_model.id == pipeline_attribute)
+                .filter(ProjectEventModel.type == project_event_type)
             )
-            .limit(top)
-            .all()
-        )
+            if datetime_from:
+                query = query.filter(PipelineModel.datetime >= datetime_from)
+            if datetime_to:
+                query = query.filter(PipelineModel.datetime <= datetime_to)
+            return dict(
+                query.group_by(GitProjectModel.project_url, job_result_model.id)
+                .distinct()
+                .order_by(
+                    desc(
+                        count(job_result_model.id).over(
+                            partition_by=GitProjectModel.project_url,
+                        ),
+                    ),
+                )
+                .limit(top)
+                .all(),
+            )
 
     @classmethod
     @ttl_cache(maxsize=_CACHE_MAXSIZE, ttl=_CACHE_TTL)
@@ -939,17 +1168,118 @@ class GitProjectModel(Base):
                     top=None,
                     job_result_model=job_result_model,
                     project_event_type=project_event_type,
-                )
+                ),
             )
         return dict(
-            sorted(all_usage_numbers.items(), key=lambda x: x[1], reverse=True)[:top]
+            sorted(all_usage_numbers.items(), key=lambda x: x[1], reverse=True)[:top],
         )
+
+    @classmethod
+    def get_known_onboarded_downstream_projects(
+        cls,
+    ) -> set["GitProjectModel"]:
+        """
+        List already known onboarded projects.
+        An onboarded project is a project with a bodhi update or a koji build
+        or a merged downstream packit pull request.
+
+        We already checked them.
+        """
+        with sa_session_transaction() as session:
+            query = session.query(GitProjectModel).filter(
+                GitProjectModel.onboarded_downstream == True  # noqa
+            )
+            return set(query.all())
 
     def __repr__(self):
         return (
             f"GitProjectModel(name={self.namespace}/{self.repo_name}, "
             f"project_url='{self.project_url}')"
         )
+
+
+class SyncReleasePullRequestModel(Base):
+    __tablename__ = "sync_release_pull_request"
+
+    # Here are collected references to the downstream pull requests
+    # created by Packit during the sync_release process.
+    # This is not a subtype of ProjectEventModel,
+    # this is not a pull request event!
+    # sync_release_pull_request and pull_request table may have the
+    # same data when for example a retriggering-command comment is
+    # written inside a Packit created PR...
+    # @todo properly handle the duplication!
+
+    id = Column(Integer, primary_key=True)  # our database PK
+    # GitHub PR ID
+    # this is not our PK b/c:
+    #   1) we don't control it
+    #   2) we want sensible auto-incremented ID, not random numbers
+    #   3) it's not unique across projects obviously, so why am I even writing this?
+    pr_id = Column(Integer, index=True)
+    project_id = Column(Integer, ForeignKey("git_projects.id"), index=True)
+    project = relationship(
+        "GitProjectModel",
+        back_populates="sync_release_pull_requests",
+    )
+    sync_release_targets = relationship(
+        "SyncReleaseTargetModel",
+        back_populates="pull_request",
+    )
+
+    @classmethod
+    def get_or_create(
+        cls,
+        pr_id: int,
+        namespace: str,
+        repo_name: str,
+        project_url: str,
+    ) -> "SyncReleasePullRequestModel":
+        with sa_session_transaction(commit=True) as session:
+            project = GitProjectModel.get_or_create(
+                namespace=namespace,
+                repo_name=repo_name,
+                project_url=project_url,
+            )
+            pr = (
+                session.query(SyncReleasePullRequestModel)
+                .filter_by(pr_id=pr_id, project_id=project.id)
+                .first()
+            )
+            if not pr:
+                pr = SyncReleasePullRequestModel()
+                pr.pr_id = pr_id
+                pr.project_id = project.id
+                session.add(pr)
+            return pr
+
+    @classmethod
+    def get(
+        cls,
+        pr_id: int,
+        namespace: str,
+        repo_name: str,
+        project_url: str,
+    ) -> Optional["SyncReleasePullRequestModel"]:
+        with sa_session_transaction(commit=True) as session:
+            project = GitProjectModel.get_or_create(
+                namespace=namespace,
+                repo_name=repo_name,
+                project_url=project_url,
+            )
+            return (
+                session.query(SyncReleasePullRequestModel)
+                .filter_by(pr_id=pr_id, project_id=project.id)
+                .first()
+            )
+
+    @classmethod
+    def get_by_id(cls, id_: int) -> Optional["SyncReleasePullRequestModel"]:
+        with sa_session_transaction() as session:
+            return session.query(SyncReleasePullRequestModel).filter_by(id=id_).first()
+
+    def __repr__(self):
+        return f"SyncReleasePullRequestModel(pr_id={self.pr_id}, project={self.project})"
 
 
 class PullRequestModel(BuildsAndTestsConnector, Base):
@@ -969,11 +1299,17 @@ class PullRequestModel(BuildsAndTestsConnector, Base):
 
     @classmethod
     def get_or_create(
-        cls, pr_id: int, namespace: str, repo_name: str, project_url: str
+        cls,
+        pr_id: int,
+        namespace: str,
+        repo_name: str,
+        project_url: str,
     ) -> "PullRequestModel":
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             project = GitProjectModel.get_or_create(
-                namespace=namespace, repo_name=repo_name, project_url=project_url
+                namespace=namespace,
+                repo_name=repo_name,
+                project_url=project_url,
             )
             pr = (
                 session.query(PullRequestModel)
@@ -989,11 +1325,17 @@ class PullRequestModel(BuildsAndTestsConnector, Base):
 
     @classmethod
     def get(
-        cls, pr_id: int, namespace: str, repo_name: str, project_url: str
+        cls,
+        pr_id: int,
+        namespace: str,
+        repo_name: str,
+        project_url: str,
     ) -> Optional["PullRequestModel"]:
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             project = GitProjectModel.get_or_create(
-                namespace=namespace, repo_name=repo_name, project_url=project_url
+                namespace=namespace,
+                repo_name=repo_name,
+                project_url=project_url,
             )
             return (
                 session.query(PullRequestModel)
@@ -1003,7 +1345,8 @@ class PullRequestModel(BuildsAndTestsConnector, Base):
 
     @classmethod
     def get_by_id(cls, id_: int) -> Optional["PullRequestModel"]:
-        return sa_session().query(PullRequestModel).filter_by(id=id_).first()
+        with sa_session_transaction() as session:
+            return session.query(PullRequestModel).filter_by(id=id_).first()
 
     def __repr__(self):
         return f"PullRequestModel(pr_id={self.pr_id}, project={self.project})"
@@ -1021,11 +1364,17 @@ class IssueModel(BuildsAndTestsConnector, Base):
 
     @classmethod
     def get_or_create(
-        cls, issue_id: int, namespace: str, repo_name: str, project_url: str
+        cls,
+        issue_id: int,
+        namespace: str,
+        repo_name: str,
+        project_url: str,
     ) -> "IssueModel":
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             project = GitProjectModel.get_or_create(
-                namespace=namespace, repo_name=repo_name, project_url=project_url
+                namespace=namespace,
+                repo_name=repo_name,
+                project_url=project_url,
             )
             issue = (
                 session.query(IssueModel)
@@ -1041,7 +1390,8 @@ class IssueModel(BuildsAndTestsConnector, Base):
 
     @classmethod
     def get_by_id(cls, id_: int) -> Optional["IssueModel"]:
-        return sa_session().query(IssueModel).filter_by(id=id_).first()
+        with sa_session_transaction() as session:
+            return session.query(IssueModel).filter_by(id=id_).first()
 
     def __repr__(self):
         return f"IssueModel(id={self.issue_id}, project={self.project})"
@@ -1059,11 +1409,17 @@ class GitBranchModel(BuildsAndTestsConnector, Base):
 
     @classmethod
     def get_or_create(
-        cls, branch_name: str, namespace: str, repo_name: str, project_url: str
+        cls,
+        branch_name: str,
+        namespace: str,
+        repo_name: str,
+        project_url: str,
     ) -> "GitBranchModel":
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             project = GitProjectModel.get_or_create(
-                namespace=namespace, repo_name=repo_name, project_url=project_url
+                namespace=namespace,
+                repo_name=repo_name,
+                project_url=project_url,
             )
             git_branch = (
                 session.query(GitBranchModel)
@@ -1079,7 +1435,8 @@ class GitBranchModel(BuildsAndTestsConnector, Base):
 
     @classmethod
     def get_by_id(cls, id_: int) -> Optional["GitBranchModel"]:
-        return sa_session().query(GitBranchModel).filter_by(id=id_).first()
+        with sa_session_transaction() as session:
+            return session.query(GitBranchModel).filter_by(id=id_).first()
 
     def __repr__(self):
         return f"GitBranchModel(name={self.name},  project={self.project})"
@@ -1105,9 +1462,11 @@ class ProjectReleaseModel(BuildsAndTestsConnector, Base):
         project_url: str,
         commit_hash: Optional[str] = None,
     ) -> "ProjectReleaseModel":
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             project = GitProjectModel.get_or_create(
-                namespace=namespace, repo_name=repo_name, project_url=project_url
+                namespace=namespace,
+                repo_name=repo_name,
+                project_url=project_url,
             )
             project_release = (
                 session.query(ProjectReleaseModel)
@@ -1124,13 +1483,68 @@ class ProjectReleaseModel(BuildsAndTestsConnector, Base):
 
     @classmethod
     def get_by_id(cls, id_: int) -> Optional["ProjectReleaseModel"]:
-        return sa_session().query(ProjectReleaseModel).filter_by(id=id_).first()
+        with sa_session_transaction() as session:
+            return session.query(ProjectReleaseModel).filter_by(id=id_).first()
+
+    def __repr__(self):
+        return f"ProjectReleaseModel(" f"tag_name={self.tag_name}, " f"project={self.project})"
+
+
+class KojiBuildTagModel(BuildsAndTestsConnector, Base):
+    __tablename__ = "koji_build_tags"
+    id = Column(Integer, primary_key=True)  # our database PK
+    task_id = Column(String, index=True)
+    koji_tag_name = Column(String, index=True)
+    target = Column(String)
+    project_id = Column(Integer, ForeignKey("git_projects.id"), index=True)
+    project = relationship("GitProjectModel", back_populates="koji_build_tags")
+
+    job_config_trigger_type = JobConfigTriggerType.koji_build
+    project_event_model_type = ProjectEventModelType.koji_build_tag
+
+    @classmethod
+    def get_or_create(
+        cls,
+        task_id: str,
+        koji_tag_name: str,
+        target: Optional[str],
+        namespace: str,
+        repo_name: str,
+        project_url: str,
+    ) -> "KojiBuildTagModel":
+        with sa_session_transaction(commit=True) as session:
+            project = GitProjectModel.get_or_create(
+                namespace=namespace,
+                repo_name=repo_name,
+                project_url=project_url,
+            )
+            koji_build_tag = (
+                session.query(KojiBuildTagModel)
+                .filter_by(
+                    task_id=task_id,
+                    koji_tag_name=koji_tag_name,
+                    project_id=project.id,
+                )
+                .first()
+            )
+            if not koji_build_tag:
+                koji_build_tag = KojiBuildTagModel()
+                koji_build_tag.task_id = task_id
+                koji_build_tag.koji_tag_name = koji_tag_name
+                koji_build_tag.target = target
+                koji_build_tag.project_id = project.id
+                session.add(koji_build_tag)
+            return koji_build_tag
+
+    @classmethod
+    def get_by_id(cls, id_: int) -> Optional["KojiBuildTagModel"]:
+        with sa_session_transaction() as session:
+            return session.query(KojiBuildTagModel).filter_by(id=id_).first()
 
     def __repr__(self):
         return (
-            f"ProjectReleaseModel("
-            f"tag_name={self.tag_name}, "
-            f"project={self.project})"
+            f"KojiBuildTagModel(task_id={self.task_id}, koji_tag_name={self.koji_tag_name}, "
+            f"target={self.target}, project={self.project})"
         )
 
 
@@ -1139,15 +1553,22 @@ AbstractProjectObjectDbType = Union[
     ProjectReleaseModel,
     GitBranchModel,
     IssueModel,
+    KojiBuildTagModel,
+    AnityaVersionModel,
+    AnityaMultipleVersionsModel,
 ]
 
-MODEL_FOR_PROJECT_EVENT: Dict[
-    ProjectEventModelType, Type[AbstractProjectObjectDbType]
+MODEL_FOR_PROJECT_EVENT: dict[
+    ProjectEventModelType,
+    type[AbstractProjectObjectDbType],
 ] = {
     ProjectEventModelType.pull_request: PullRequestModel,
     ProjectEventModelType.branch_push: GitBranchModel,
     ProjectEventModelType.release: ProjectReleaseModel,
     ProjectEventModelType.issue: IssueModel,
+    ProjectEventModelType.koji_build_tag: KojiBuildTagModel,
+    ProjectEventModelType.anitya_version: AnityaVersionModel,
+    ProjectEventModelType.anitya_multiple_versions: AnityaMultipleVersionsModel,
 }
 
 
@@ -1173,6 +1594,7 @@ class ProjectEventModel(Base):
     type = Column(Enum(ProjectEventModelType))
     event_id = Column(Integer, index=True)
     commit_sha = Column(String, index=True)
+    packages_config = Column(JSON)
 
     runs = relationship("PipelineModel", back_populates="project_event")
 
@@ -1184,7 +1606,7 @@ class ProjectEventModel(Base):
         repo_name: str,
         project_url: str,
         commit_sha: str,
-    ) -> Tuple[PullRequestModel, "ProjectEventModel"]:
+    ) -> tuple[PullRequestModel, "ProjectEventModel"]:
         pull_request = PullRequestModel.get_or_create(
             pr_id=pr_id,
             namespace=namespace,
@@ -1206,7 +1628,7 @@ class ProjectEventModel(Base):
         repo_name: str,
         project_url: str,
         commit_sha: str,
-    ) -> Tuple[GitBranchModel, "ProjectEventModel"]:
+    ) -> tuple[GitBranchModel, "ProjectEventModel"]:
         branch_push = GitBranchModel.get_or_create(
             branch_name=branch_name,
             namespace=namespace,
@@ -1228,7 +1650,7 @@ class ProjectEventModel(Base):
         repo_name: str,
         project_url: str,
         commit_hash: str,
-    ) -> Tuple[ProjectReleaseModel, "ProjectEventModel"]:
+    ) -> tuple[ProjectReleaseModel, "ProjectEventModel"]:
         release = ProjectReleaseModel.get_or_create(
             tag_name=tag_name,
             namespace=namespace,
@@ -1244,13 +1666,55 @@ class ProjectEventModel(Base):
         return (release, event)
 
     @classmethod
+    def add_anitya_version_event(
+        cls,
+        version: str,
+        project_name: str,
+        project_id: int,
+        package: str,
+    ) -> tuple[AnityaVersionModel, "ProjectEventModel"]:
+        project_version = AnityaVersionModel.get_or_create(
+            version=version,
+            project_name=project_name,
+            project_id=project_id,
+            package=package,
+        )
+        event = ProjectEventModel.get_or_create(
+            type=project_version.project_event_model_type,
+            event_id=project_version.id,
+            commit_sha=None,
+        )
+        return (project_version, event)
+
+    @classmethod
+    def add_anitya_multiple_versions_event(
+        cls,
+        versions: list[str],
+        project_name: str,
+        project_id: int,
+        package: str,
+    ) -> tuple[AnityaMultipleVersionsModel, "ProjectEventModel"]:
+        project_version = AnityaMultipleVersionsModel.get_or_create(
+            versions=versions,
+            project_name=project_name,
+            project_id=project_id,
+            package=package,
+        )
+        event = ProjectEventModel.get_or_create(
+            type=project_version.project_event_model_type,
+            event_id=project_version.id,
+            commit_sha=None,
+        )
+        return (project_version, event)
+
+    @classmethod
     def add_issue_event(
         cls,
         issue_id: int,
         namespace: str,
         repo_name: str,
         project_url: str,
-    ) -> Tuple[IssueModel, "ProjectEventModel"]:
+    ) -> tuple[IssueModel, "ProjectEventModel"]:
         issue = IssueModel.get_or_create(
             issue_id=issue_id,
             namespace=namespace,
@@ -1265,10 +1729,40 @@ class ProjectEventModel(Base):
         return (issue, event)
 
     @classmethod
+    def add_koji_build_tag_event(
+        cls,
+        task_id: str,
+        koji_tag_name: str,
+        namespace: str,
+        repo_name: str,
+        project_url: str,
+    ) -> tuple[KojiBuildTagModel, "ProjectEventModel"]:
+        target = None
+        if sidetag := SidetagModel.get_by_koji_name(koji_tag_name):
+            target = sidetag.target
+        koji_build_tag = KojiBuildTagModel.get_or_create(
+            task_id=task_id,
+            koji_tag_name=koji_tag_name,
+            target=target,
+            namespace=namespace,
+            repo_name=repo_name,
+            project_url=project_url,
+        )
+        event = ProjectEventModel.get_or_create(
+            type=koji_build_tag.project_event_model_type,
+            event_id=koji_build_tag.id,
+            commit_sha=None,
+        )
+        return (koji_build_tag, event)
+
+    @classmethod
     def get_or_create(
-        cls, type: ProjectEventModelType, event_id: int, commit_sha: str
+        cls,
+        type: ProjectEventModelType,
+        event_id: int,
+        commit_sha: str,
     ) -> "ProjectEventModel":
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             project_event = (
                 session.query(ProjectEventModel)
                 .filter_by(type=type, event_id=event_id, commit_sha=commit_sha)
@@ -1284,15 +1778,47 @@ class ProjectEventModel(Base):
 
     @classmethod
     def get_by_id(cls, id_: int) -> Optional["ProjectEventModel"]:
-        return sa_session().query(ProjectEventModel).filter_by(id=id_).first()
+        with sa_session_transaction() as session:
+            return session.query(ProjectEventModel).filter_by(id=id_).first()
+
+    @classmethod
+    def get_and_reset_older_than_with_packages_config(
+        cls,
+        delta: timedelta,
+    ) -> Iterable["ProjectEventModel"]:
+        """Return project events with all runs older than delta
+        and set to null their stored packages config.
+        Cleanup project events here to speed up the process."""
+        delta_ago = datetime.now(timezone.utc) - delta
+        with sa_session_transaction(commit=True) as session:
+            events = (
+                session.query(ProjectEventModel)
+                .filter(ProjectEventModel.packages_config.isnot(null()))
+                .filter(
+                    ~ProjectEventModel.runs.any(PipelineModel.datetime >= delta_ago),
+                )
+            )
+            # After we reset the packages config
+            # the query will be empty.
+            # Store the query result in a new list
+            events_list = list(events)
+            for event in events:
+                event.packages_config = null()
+                session.add(event)
+            return events_list
+
+    def set_packages_config(self, packages_config: dict):
+        with sa_session_transaction(commit=True) as session:
+            self.packages_config = packages_config
+            session.add(self)
 
     def get_project_event_object(self) -> Optional[AbstractProjectObjectDbType]:
-        return (
-            sa_session()
-            .query(MODEL_FOR_PROJECT_EVENT[self.type])
-            .filter_by(id=self.event_id)
-            .first()
-        )
+        with sa_session_transaction() as session:
+            return (
+                session.query(MODEL_FOR_PROJECT_EVENT[self.type])
+                .filter_by(id=self.event_id)
+                .first()
+            )
 
     def __repr__(self):
         return (
@@ -1330,36 +1856,60 @@ class PipelineModel(Base):
     srpm_build_id = Column(Integer, ForeignKey("srpm_builds.id"), index=True)
     srpm_build = relationship("SRPMBuildModel", back_populates="runs")
     copr_build_group_id = Column(
-        Integer, ForeignKey("copr_build_groups.id"), index=True
+        Integer,
+        ForeignKey("copr_build_groups.id"),
+        index=True,
     )
     copr_build_group = relationship("CoprBuildGroupModel", back_populates="runs")
     koji_build_group_id = Column(
-        Integer, ForeignKey("koji_build_groups.id"), index=True
+        Integer,
+        ForeignKey("koji_build_groups.id"),
+        index=True,
     )
     koji_build_group = relationship("KojiBuildGroupModel", back_populates="runs")
+    koji_tag_request_group_id = Column(
+        Integer,
+        ForeignKey("koji_tag_request_groups.id"),
+        index=True,
+    )
+    koji_tag_request_group = relationship("KojiTagRequestGroupModel", back_populates="runs")
     vm_image_build_id = Column(
-        Integer, ForeignKey("vm_image_build_targets.id"), index=True
+        Integer,
+        ForeignKey("vm_image_build_targets.id"),
+        index=True,
     )
     vm_image_build = relationship("VMImageBuildTargetModel", back_populates="runs")
     test_run_group_id = Column(
-        Integer, ForeignKey("tft_test_run_groups.id"), index=True
+        Integer,
+        ForeignKey("tft_test_run_groups.id"),
+        index=True,
     )
     test_run_group = relationship("TFTTestRunGroupModel", back_populates="runs")
     sync_release_run_id = Column(
-        Integer, ForeignKey("sync_release_runs.id"), index=True
+        Integer,
+        ForeignKey("sync_release_runs.id"),
+        index=True,
     )
     sync_release_run = relationship("SyncReleaseModel", back_populates="runs")
+    bodhi_update_group_id = Column(
+        Integer,
+        ForeignKey("bodhi_update_groups.id"),
+        index=True,
+    )
+    bodhi_update_group = relationship("BodhiUpdateGroupModel", back_populates="runs")
 
     @classmethod
     def create(
-        cls, project_event: ProjectEventModel, package_name: str = None
+        cls,
+        project_event: ProjectEventModel,
+        package_name: Optional[str] = None,
     ) -> "PipelineModel":
         """Create a pipeline triggered by the given project_event.
         If project is a monorepo, then specify for which
         package the pipeline is run. Otherwise the package name
         can be None.
         """
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             run_model = PipelineModel()
             run_model.project_event = project_event
             run_model.package_name = package_name
@@ -1377,22 +1927,29 @@ class PipelineModel(Base):
 
     @classmethod
     def __query_merged_runs(cls):
-        return sa_session().query(
-            func.min(PipelineModel.id).label("merged_id"),
-            PipelineModel.srpm_build_id,
-            func.array_agg(psql_array([PipelineModel.copr_build_group_id])).label(
-                "copr_build_group_id"
-            ),
-            func.array_agg(psql_array([PipelineModel.koji_build_group_id])).label(
-                "koji_build_group_id"
-            ),
-            func.array_agg(psql_array([PipelineModel.test_run_group_id])).label(
-                "test_run_group_id"
-            ),
-            func.array_agg(psql_array([PipelineModel.sync_release_run_id])).label(
-                "sync_release_run_id",
-            ),
-        )
+        with sa_session_transaction() as session:
+            return session.query(
+                func.min(PipelineModel.id).label("merged_id"),
+                PipelineModel.srpm_build_id,
+                func.array_agg(psql_array([PipelineModel.copr_build_group_id])).label(
+                    "copr_build_group_id",
+                ),
+                func.array_agg(psql_array([PipelineModel.koji_build_group_id])).label(
+                    "koji_build_group_id",
+                ),
+                func.array_agg(psql_array([PipelineModel.test_run_group_id])).label(
+                    "test_run_group_id",
+                ),
+                func.array_agg(psql_array([PipelineModel.sync_release_run_id])).label(
+                    "sync_release_run_id",
+                ),
+                func.array_agg(psql_array([PipelineModel.bodhi_update_group_id])).label(
+                    "bodhi_update_group_id",
+                ),
+                func.array_agg(psql_array([PipelineModel.vm_image_build_id])).label(
+                    "vm_image_build_id",
+                ),
+            )
 
     @classmethod
     def get_merged_chroots(cls, first: int, last: int) -> Iterable["PipelineModel"]:
@@ -1421,12 +1978,14 @@ class PipelineModel(Base):
                     else_=PipelineModel.id,
                 ),
             )
+            .order_by(asc("merged_id"))
             .first()
         )
 
     @classmethod
     def get_run(cls, id_: int) -> Optional["PipelineModel"]:
-        return sa_session().query(PipelineModel).filter_by(id=id_).first()
+        with sa_session_transaction() as session:
+            return session.query(PipelineModel).filter_by(id=id_).first()
 
 
 class CoprBuildGroupModel(ProjectAndEventsConnector, GroupModel, Base):
@@ -1436,21 +1995,20 @@ class CoprBuildGroupModel(ProjectAndEventsConnector, GroupModel, Base):
 
     runs = relationship("PipelineModel", back_populates="copr_build_group")
     copr_build_targets = relationship(
-        "CoprBuildTargetModel", back_populates="group_of_targets"
+        "CoprBuildTargetModel",
+        back_populates="group_of_targets",
     )
 
     def __repr__(self) -> str:
-        return (
-            f"CoprBuildGroupModel(id={self.id}, submitted_time={self.submitted_time})"
-        )
+        return f"CoprBuildGroupModel(id={self.id}, submitted_time={self.submitted_time})"
 
     @property
-    def grouped_targets(self) -> List["CoprBuildTargetModel"]:
+    def grouped_targets(self) -> list["CoprBuildTargetModel"]:
         return self.copr_build_targets
 
     @classmethod
     def create(cls, run_model: "PipelineModel") -> "CoprBuildGroupModel":
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             build_group = cls()
             session.add(build_group)
             if run_model.copr_build_group:
@@ -1470,7 +2028,8 @@ class CoprBuildGroupModel(ProjectAndEventsConnector, GroupModel, Base):
 
     @classmethod
     def get_by_id(cls, group_id: int) -> Optional["CoprBuildGroupModel"]:
-        return sa_session().query(CoprBuildGroupModel).filter_by(id=group_id).first()
+        with sa_session_transaction() as session:
+            return session.query(CoprBuildGroupModel).filter_by(id=group_id).first()
 
 
 class BuildStatus(str, enum.Enum):
@@ -1482,6 +2041,10 @@ class BuildStatus(str, enum.Enum):
     error = "error"
     waiting_for_srpm = "waiting_for_srpm"
     retry = "retry"
+
+    @staticmethod
+    def is_final_state(status: "BuildStatus"):
+        return status in {BuildStatus.success, BuildStatus.failure, BuildStatus.error}
 
 
 class CoprBuildTargetModel(GroupAndTargetModelConnector, Base):
@@ -1529,119 +2092,131 @@ class CoprBuildTargetModel(GroupAndTargetModelConnector, Base):
     # ]
     built_packages = Column(JSON)
     copr_build_group_id = Column(
-        Integer, ForeignKey("copr_build_groups.id"), index=True
+        Integer,
+        ForeignKey("copr_build_groups.id"),
+        index=True,
     )
 
     group_of_targets = relationship(
-        "CoprBuildGroupModel", back_populates="copr_build_targets"
+        "CoprBuildGroupModel",
+        back_populates="copr_build_targets",
     )
 
+    scan = relationship("OSHScanModel", back_populates="copr_build_target")
+
+    identifier = Column(String)
+
     def set_built_packages(self, built_packages):
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             self.built_packages = built_packages
             session.add(self)
 
     def set_start_time(self, start_time: datetime):
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             self.build_start_time = start_time
             session.add(self)
 
     def set_end_time(self, end_time: datetime):
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             self.build_finished_time = end_time
             session.add(self)
 
     def set_status(self, status: BuildStatus):
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             self.status = status
             session.add(self)
 
     def set_build_logs_url(self, build_logs: str):
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             self.build_logs_url = build_logs
             session.add(self)
 
     def set_web_url(self, web_url: str):
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             self.web_url = web_url
             session.add(self)
 
     def set_build_id(self, build_id: str):
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             self.build_id = build_id
             session.add(self)
 
     def get_srpm_build(self) -> Optional["SRPMBuildModel"]:
         # All SRPMBuild models for all the runs have to be same.
-        return (
-            self.group_of_targets.runs[0].srpm_build
-            if self.group_of_targets.runs
-            else None
-        )
+        return self.group_of_targets.runs[0].srpm_build if self.group_of_targets.runs else None
 
     @classmethod
     def get_by_id(cls, id_: int) -> Optional["CoprBuildTargetModel"]:
-        return sa_session().query(CoprBuildTargetModel).filter_by(id=id_).first()
+        with sa_session_transaction() as session:
+            return session.query(CoprBuildTargetModel).filter_by(id=id_).first()
 
     @classmethod
     def get_all(cls) -> Iterable["CoprBuildTargetModel"]:
-        return (
-            sa_session()
-            .query(CoprBuildTargetModel)
-            .order_by(desc(CoprBuildTargetModel.id))
-        )
+        with sa_session_transaction() as session:
+            return session.query(CoprBuildTargetModel).order_by(
+                desc(CoprBuildTargetModel.id),
+            )
 
     @classmethod
     def get_merged_chroots(
-        cls, first: int, last: int
+        cls,
+        first: int,
+        last: int,
     ) -> Iterable["CoprBuildTargetModel"]:
         """Returns a list of unique build ids with merged status, chroots
         Details:
         https://github.com/packit/packit-service/pull/674#discussion_r439819852
         """
-        return (
-            sa_session()
-            .query(
-                # We need something to order our merged builds by,
-                # so set new_id to be min(ids of to-be-merged rows)
-                func.min(CoprBuildTargetModel.id).label("new_id"),
-                # Select identical element(s)
-                CoprBuildTargetModel.build_id,
-                # Merge chroots and statuses from different rows into one
-                func.array_agg(psql_array([CoprBuildTargetModel.target])).label(
-                    "target"
-                ),
-                func.json_agg(psql_array([CoprBuildTargetModel.status])).label(
-                    "status"
-                ),
-                func.array_agg(psql_array([CoprBuildTargetModel.id])).label(
-                    "packit_id_per_chroot"
-                ),
+        with sa_session_transaction() as session:
+            return (
+                session.query(
+                    # We need something to order our merged builds by,
+                    # so set new_id to be min(ids of to-be-merged rows)
+                    func.min(CoprBuildTargetModel.id).label("new_id"),
+                    # Select identical element(s)
+                    CoprBuildTargetModel.build_id,
+                    # Merge chroots and statuses from different rows into one
+                    func.array_agg(psql_array([CoprBuildTargetModel.target])).label(
+                        "target",
+                    ),
+                    func.json_agg(psql_array([CoprBuildTargetModel.status])).label(
+                        "status",
+                    ),
+                    func.array_agg(psql_array([CoprBuildTargetModel.id])).label(
+                        "packit_id_per_chroot",
+                    ),
+                )
+                .group_by(
+                    CoprBuildTargetModel.build_id,
+                )  # Group by identical element(s)
+                .order_by(desc("new_id"))
+                .slice(first, last)
             )
-            .group_by(CoprBuildTargetModel.build_id)  # Group by identical element(s)
-            .order_by(desc("new_id"))
-            .slice(first, last)
-        )
 
     # Returns all builds with that build_id, irrespective of target
     @classmethod
     def get_all_by_build_id(
-        cls, build_id: Union[str, int]
+        cls,
+        build_id: Union[str, int],
     ) -> Iterable["CoprBuildTargetModel"]:
         if isinstance(build_id, int):
             # See the comment in get_by_task_id()
             build_id = str(build_id)
-        return sa_session().query(CoprBuildTargetModel).filter_by(build_id=build_id)
+        with sa_session_transaction() as session:
+            return session.query(CoprBuildTargetModel).filter_by(build_id=build_id)
 
     @classmethod
     def get_all_by_status(cls, status: BuildStatus) -> Iterable["CoprBuildTargetModel"]:
         """Returns all builds which currently have the given status."""
-        return sa_session().query(CoprBuildTargetModel).filter_by(status=status)
+        with sa_session_transaction() as session:
+            return session.query(CoprBuildTargetModel).filter_by(status=status)
 
     # returns the build matching the build_id and the target
     @classmethod
     def get_by_build_id(
-        cls, build_id: Union[str, int], target: str = None
+        cls,
+        build_id: Union[str, int],
+        target: Optional[str] = None,
     ) -> Optional["CoprBuildTargetModel"]:
         if isinstance(build_id, int):
             # PG is pesky about this:
@@ -1649,70 +2224,71 @@ class CoprBuildTargetModel(GroupAndTargetModelConnector, Base):
             #   HINT:  No operator matches the given name and argument type(s).
             #   You might need to add explicit type casts.
             build_id = str(build_id)
-        query = sa_session().query(CoprBuildTargetModel).filter_by(build_id=build_id)
-        if target:
-            query = query.filter_by(target=target)
-        return query.first()
+        with sa_session_transaction() as session:
+            query = session.query(CoprBuildTargetModel).filter_by(build_id=build_id)
+            if target:
+                query = query.filter_by(target=target)
+            return query.first()
 
     @staticmethod
     def get_all_by(
         commit_sha: str,
-        project_name: str = None,
-        owner: str = None,
-        target: str = None,
+        project_name: Optional[str] = None,
+        owner: Optional[str] = None,
+        target: Optional[str] = None,
         status: BuildStatus = None,
     ) -> Iterable["CoprBuildTargetModel"]:
         """
         All owner/project_name builds sorted from latest to oldest
         with the given commit_sha and optional target.
         """
-        query = (
-            sa_session()
-            .query(CoprBuildTargetModel)
-            .join(
-                CoprBuildTargetModel.group_of_targets,
+        with sa_session_transaction() as session:
+            query = (
+                session.query(CoprBuildTargetModel)
+                .join(
+                    CoprBuildTargetModel.group_of_targets,
+                )
+                .join(
+                    PipelineModel,
+                    PipelineModel.copr_build_group_id == CoprBuildGroupModel.id,
+                )
+                .join(
+                    ProjectEventModel,
+                    PipelineModel.project_event_id == ProjectEventModel.id,
+                )
+                .filter(CoprBuildTargetModel.project_name == project_name)
+                .filter(ProjectEventModel.commit_sha == commit_sha)
+                .order_by(CoprBuildTargetModel.build_id.desc())
             )
-            .join(
-                PipelineModel,
-                PipelineModel.copr_build_group_id == CoprBuildGroupModel.id,
-            )
-            .join(
-                ProjectEventModel,
-                PipelineModel.project_event_id == ProjectEventModel.id,
-            )
-            .filter(CoprBuildTargetModel.project_name == project_name)
-            .filter(ProjectEventModel.commit_sha == commit_sha)
-            .order_by(CoprBuildTargetModel.build_id.desc())
-        )
 
-        if owner:
-            query = query.filter(CoprBuildTargetModel.owner == owner)
-        if target:
-            query = query.filter(CoprBuildTargetModel.target == target)
-        if status:
-            query = query.filter(CoprBuildTargetModel.status == status)
+            if owner:
+                query = query.filter(CoprBuildTargetModel.owner == owner)
+            if target:
+                query = query.filter(CoprBuildTargetModel.target == target)
+            if status:
+                query = query.filter(CoprBuildTargetModel.status == status)
 
-        return query
+            return query
 
     @classmethod
     def get_all_by_commit(cls, commit_sha: str) -> Iterable["CoprBuildTargetModel"]:
         """Returns all builds that match a given commit sha"""
-        return (
-            sa_session()
-            .query(CoprBuildTargetModel)
-            .join(
-                CoprBuildTargetModel.group_of_targets,
+        with sa_session_transaction() as session:
+            return (
+                session.query(CoprBuildTargetModel)
+                .join(
+                    CoprBuildTargetModel.group_of_targets,
+                )
+                .join(
+                    PipelineModel,
+                    PipelineModel.copr_build_group_id == CoprBuildGroupModel.id,
+                )
+                .join(
+                    ProjectEventModel,
+                    PipelineModel.project_event_id == ProjectEventModel.id,
+                )
+                .filter(ProjectEventModel.commit_sha == commit_sha)
             )
-            .join(
-                PipelineModel,
-                PipelineModel.copr_build_group_id == CoprBuildGroupModel.id,
-            )
-            .join(
-                ProjectEventModel,
-                PipelineModel.project_event_id == ProjectEventModel.id,
-            )
-            .filter(ProjectEventModel.commit_sha == commit_sha)
-        )
 
     @classmethod
     def create(
@@ -1725,8 +2301,9 @@ class CoprBuildTargetModel(GroupAndTargetModelConnector, Base):
         status: BuildStatus,
         copr_build_group: "CoprBuildGroupModel",
         task_accepted_time: Optional[datetime] = None,
+        identifier: Optional[str] = None,
     ) -> "CoprBuildTargetModel":
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             build = cls()
             build.build_id = build_id
             build.status = status
@@ -1735,6 +2312,7 @@ class CoprBuildTargetModel(GroupAndTargetModelConnector, Base):
             build.web_url = web_url
             build.target = target
             build.task_accepted_time = task_accepted_time
+            build.identifier = identifier
             session.add(build)
 
             copr_build_group.copr_build_targets.append(build)
@@ -1756,6 +2334,51 @@ class CoprBuildTargetModel(GroupAndTargetModelConnector, Base):
             f"build_submitted_time={self.build_submitted_time})"
         )
 
+    def add_scan(self, task_id: int) -> "OSHScanModel":
+        with sa_session_transaction(commit=True) as session:
+            scan = OSHScanModel.get_or_create(task_id)
+            scan.copr_build_target = self
+            session.add(scan)
+            return scan
+
+    @contextmanager
+    def add_scan_transaction(self) -> Generator["OSHScanModel"]:
+        """
+        Context manager that creates a ScanModel upon entering the context,
+        provides a corresponding instance of `ScanModel` to be updated within the context
+        and commits the changes upon exiting the context, all within a single transaction.
+
+        This locking mechanism is working on the assumption that just a single scan model
+        for build can exist.
+
+        raise: IntegrityError if the scan model already exists
+        """
+        session = singleton_session or Session()
+        try:
+            scan = OSHScanModel()
+            scan.copr_build_target = self
+            session.add(scan)
+            session.commit()
+        except Exception as ex:
+            logger.warning(f"Exception while working with database: {ex!r}")
+            session.rollback()
+            raise
+
+        try:
+            yield scan
+        except Exception as ex:
+            logger.warning(f"{ex!r}")
+            session.rollback()
+            raise
+
+        try:
+            session.add(scan)
+            session.commit()
+        except Exception as ex:
+            logger.warning(f"Exception while working with database: {ex!r}")
+            session.rollback()
+            raise
+
 
 class KojiBuildGroupModel(ProjectAndEventsConnector, GroupModel, Base):
     __tablename__ = "koji_build_groups"
@@ -1764,7 +2387,8 @@ class KojiBuildGroupModel(ProjectAndEventsConnector, GroupModel, Base):
 
     runs = relationship("PipelineModel", back_populates="koji_build_group")
     koji_build_targets = relationship(
-        "KojiBuildTargetModel", back_populates="group_of_targets"
+        "KojiBuildTargetModel",
+        back_populates="group_of_targets",
     )
 
     @property
@@ -1772,17 +2396,16 @@ class KojiBuildGroupModel(ProjectAndEventsConnector, GroupModel, Base):
         return self.koji_build_targets
 
     def __repr__(self) -> str:
-        return (
-            f"KojiBuildGroupModel(id={self.id}, submitted_time={self.submitted_time})"
-        )
+        return f"KojiBuildGroupModel(id={self.id}, submitted_time={self.submitted_time})"
 
     @classmethod
     def get_by_id(cls, id_: int) -> Optional["KojiBuildGroupModel"]:
-        return sa_session().query(KojiBuildGroupModel).filter_by(id=id_).first()
+        with sa_session_transaction() as session:
+            return session.query(KojiBuildGroupModel).filter_by(id=id_).first()
 
     @classmethod
     def create(cls, run_model: "PipelineModel") -> "KojiBuildGroupModel":
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             build_group = cls()
             session.add(build_group)
             if run_model.koji_build_group:
@@ -1798,6 +2421,192 @@ class KojiBuildGroupModel(ProjectAndEventsConnector, GroupModel, Base):
                 run_model.koji_build_group = build_group
                 session.add(run_model)
             return build_group
+
+
+class BodhiUpdateTargetModel(GroupAndTargetModelConnector, Base):
+    __tablename__ = "bodhi_update_targets"
+    id = Column(Integer, primary_key=True)
+    status = Column(String)
+    target = Column(String)
+    web_url = Column(String)
+    koji_nvrs = Column(String)
+    sidetag = Column(String)
+    alias = Column(String)
+    submitted_time = Column(DateTime, default=datetime.utcnow)
+    update_creation_time = Column(DateTime)
+    data = Column(JSON)
+    bodhi_update_group_id = Column(Integer, ForeignKey("bodhi_update_groups.id"))
+
+    group_of_targets = relationship(
+        "BodhiUpdateGroupModel",
+        back_populates="bodhi_update_targets",
+    )
+
+    def set_status(self, status: str):
+        with sa_session_transaction(commit=True) as session:
+            self.status = status
+            session.add(self)
+
+    def set_web_url(self, web_url: str):
+        with sa_session_transaction(commit=True) as session:
+            self.web_url = web_url
+            session.add(self)
+
+    def set_alias(self, alias: str):
+        with sa_session_transaction(commit=True) as session:
+            self.alias = alias
+            session.add(self)
+
+    def set_data(self, data: dict):
+        with sa_session_transaction(commit=True) as session:
+            self.data = data
+            session.add(self)
+
+    def set_update_creation_time(self, time: datetime):
+        with sa_session_transaction(commit=True) as session:
+            self.update_creation_time = time
+            session.add(self)
+
+    @classmethod
+    def create(
+        cls,
+        target: str,
+        status: str,
+        koji_nvrs: str,
+        bodhi_update_group: "BodhiUpdateGroupModel",
+        sidetag: Optional[str] = None,
+    ) -> "BodhiUpdateTargetModel":
+        with sa_session_transaction(commit=True) as session:
+            update = cls()
+            update.status = status
+            update.target = target
+            update.koji_nvrs = koji_nvrs
+            update.sidetag = sidetag
+            session.add(update)
+
+            bodhi_update_group.bodhi_update_targets.append(update)
+            session.add(bodhi_update_group)
+
+            return update
+
+    @classmethod
+    def get_by_id(cls, id_: int) -> Optional["BodhiUpdateTargetModel"]:
+        with sa_session_transaction() as session:
+            return session.query(BodhiUpdateTargetModel).filter_by(id=id_).first()
+
+    @classmethod
+    def get_all(cls) -> Iterable["BodhiUpdateTargetModel"]:
+        with sa_session_transaction() as session:
+            return session.query(BodhiUpdateTargetModel)
+
+    @classmethod
+    def get_range(cls, first: int, last: int) -> Iterable["BodhiUpdateTargetModel"]:
+        with sa_session_transaction() as session:
+            return (
+                session.query(BodhiUpdateTargetModel)
+                .order_by(desc(BodhiUpdateTargetModel.id))
+                .slice(first, last)
+            )
+
+    @classmethod
+    def get_all_projects(cls) -> set["GitProjectModel"]:
+        """Get all git projects with a saved successfull bodhi update."""
+        with sa_session_transaction() as session:
+            query = (
+                session.query(ProjectEventModel)
+                .join(
+                    PipelineModel,
+                    PipelineModel.project_event_id == ProjectEventModel.id,
+                )
+                .join(
+                    BodhiUpdateGroupModel,
+                    PipelineModel.bodhi_update_group_id == BodhiUpdateGroupModel.id,
+                )
+                .join(
+                    BodhiUpdateTargetModel,
+                    BodhiUpdateGroupModel.id == BodhiUpdateTargetModel.bodhi_update_group_id,
+                )
+            ).filter(BodhiUpdateTargetModel.status == "success")
+
+            project_event_branches = [
+                project_event.get_project_event_object() for project_event in query
+            ]
+            projects = [branch.project for branch in project_event_branches]
+            return set(projects)
+
+    @classmethod
+    def get_last_successful_by_sidetag(
+        cls,
+        sidetag: str,
+    ) -> Optional["BodhiUpdateTargetModel"]:
+        with sa_session_transaction() as session:
+            return (
+                session.query(BodhiUpdateTargetModel)
+                .filter(
+                    BodhiUpdateTargetModel.status == "success",
+                    BodhiUpdateTargetModel.sidetag == sidetag,
+                )
+                .order_by(BodhiUpdateTargetModel.update_creation_time.desc())
+                .first()
+            )
+
+    @classmethod
+    def get_all_successful_or_in_progress_by_nvrs(
+        cls,
+        koji_nvrs: str,
+    ) -> set["BodhiUpdateTargetModel"]:
+        regexp = "|".join(re.escape(nvr) for nvr in set(koji_nvrs.split()))
+        with sa_session_transaction() as session:
+            return set(
+                session.query(BodhiUpdateTargetModel)
+                .filter(
+                    BodhiUpdateTargetModel.status.in_(("queued", "retry", "success")),
+                    BodhiUpdateTargetModel.koji_nvrs.regexp_match(regexp),
+                )
+                .all(),
+            )
+
+
+class BodhiUpdateGroupModel(ProjectAndEventsConnector, GroupModel, Base):
+    __tablename__ = "bodhi_update_groups"
+    id = Column(Integer, primary_key=True)
+    submitted_time = Column(DateTime, default=datetime.utcnow)
+
+    runs = relationship("PipelineModel", back_populates="bodhi_update_group")
+    bodhi_update_targets = relationship(
+        "BodhiUpdateTargetModel",
+        back_populates="group_of_targets",
+    )
+
+    @property
+    def grouped_targets(self):
+        return self.bodhi_update_targets
+
+    def __repr__(self) -> str:
+        return f"BodhiUpdateGroupModel(id={self.id}, submitted_time={self.submitted_time})"
+
+    @classmethod
+    def get_by_id(cls, id_: int) -> Optional["BodhiUpdateGroupModel"]:
+        with sa_session_transaction() as session:
+            return session.query(BodhiUpdateGroupModel).filter_by(id=id_).first()
+
+    @classmethod
+    def create(cls, run_model: "PipelineModel") -> "BodhiUpdateGroupModel":
+        with sa_session_transaction(commit=True) as session:
+            update_group = cls()
+            session.add(update_group)
+            if run_model.bodhi_update_group:
+                # Clone run model
+                new_run_model = PipelineModel.create(
+                    project_event=run_model.project_event,
+                    package_name=run_model.package_name,
+                )
+                new_run_model.bodhi_update_group = update_group
+                session.add(new_run_model)
+            else:
+                run_model.bodhi_update_group = update_group
+                session.add(run_model)
+            return update_group
 
 
 class KojiBuildTargetModel(GroupAndTargetModelConnector, Base):
@@ -1821,98 +2630,111 @@ class KojiBuildTargetModel(GroupAndTargetModelConnector, Base):
     build_submitted_time = Column(DateTime, default=datetime.utcnow)
     build_start_time = Column(DateTime)
     build_finished_time = Column(DateTime)
+    # stdout from the Koji build submission command
+    build_submission_stdout = Column(Text)
 
     # metadata for the build which didn't make it to schema yet
     # metadata is reserved to sqlalch
     data = Column(JSON)
+
+    sidetag = Column(String)
+    nvr = Column(String)
 
     # it is a scratch build?
     scratch = Column(Boolean)
     koji_build_group_id = Column(Integer, ForeignKey("koji_build_groups.id"))
 
     group_of_targets = relationship(
-        "KojiBuildGroupModel", back_populates="koji_build_targets"
+        "KojiBuildGroupModel",
+        back_populates="koji_build_targets",
     )
 
     def set_status(self, status: str):
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             self.status = status
             session.add(self)
 
     def set_build_logs_urls(self, build_logs: dict):
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             self.build_logs_urls = build_logs
             session.add(self)
 
     def set_web_url(self, web_url: str):
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             self.web_url = web_url
             session.add(self)
 
     def set_task_id(self, task_id: str):
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             self.task_id = task_id
             session.add(self)
 
     def set_build_start_time(self, build_start_time: Optional[DateTime]):
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             self.build_start_time = build_start_time
             session.add(self)
 
     def set_build_finished_time(self, build_finished_time: Optional[DateTime]):
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             self.build_finished_time = build_finished_time
             session.add(self)
 
     def set_build_submitted_time(self, build_submitted_time: Optional[DateTime]):
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             self.build_submitted_time = build_submitted_time
             session.add(self)
 
     def set_scratch(self, value: bool):
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             self.scratch = value
             session.add(self)
 
     def set_data(self, data: dict):
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             self.data = data
+            session.add(self)
+
+    def set_build_submission_stdout(self, build_submission_stdout: str):
+        with sa_session_transaction(commit=True) as session:
+            self.build_submission_stdout = build_submission_stdout
             session.add(self)
 
     def get_srpm_build(self) -> Optional["SRPMBuildModel"]:
         # All SRPMBuild models for all the runs have to be same.
-        return (
-            self.group_of_targets.runs[0].srpm_build
-            if self.group_of_targets.runs
-            else None
-        )
+        return self.group_of_targets.runs[0].srpm_build if self.group_of_targets.runs else None
 
     @classmethod
     def get_by_id(cls, id_: int) -> Optional["KojiBuildTargetModel"]:
-        return sa_session().query(KojiBuildTargetModel).filter_by(id=id_).first()
+        with sa_session_transaction() as session:
+            return session.query(KojiBuildTargetModel).filter_by(id=id_).first()
 
     @classmethod
     def get_all(cls) -> Iterable["KojiBuildTargetModel"]:
-        return sa_session().query(KojiBuildTargetModel)
+        with sa_session_transaction() as session:
+            return session.query(KojiBuildTargetModel)
 
     @classmethod
     def get_range(
-        cls, first: int, last: int, scratch: bool = None
+        cls,
+        first: int,
+        last: int,
+        scratch: Optional[bool] = None,
     ) -> Iterable["KojiBuildTargetModel"]:
-        query = (
-            sa_session()
-            .query(KojiBuildTargetModel)
-            .order_by(desc(KojiBuildTargetModel.id))
-        )
+        with sa_session_transaction() as session:
+            query = session.query(KojiBuildTargetModel).order_by(
+                desc(KojiBuildTargetModel.id),
+            )
 
-        if scratch is not None:
-            query = query.filter_by(scratch=scratch)
+            if scratch is not None:
+                query = query.filter_by(scratch=scratch)
 
-        return query.slice(first, last)
+            return query.slice(first, last)
 
     @classmethod
     def get_by_task_id(
-        cls, task_id: Union[str, int], target: Optional[str] = None
+        cls,
+        task_id: Union[str, int],
+        target: Optional[str] = None,
     ) -> Optional["KojiBuildTargetModel"]:
         """
         Returns the first build matching the build_id and optionally the target.
@@ -1923,10 +2745,11 @@ class KojiBuildTargetModel(GroupAndTargetModelConnector, Base):
             #   HINT:  No operator matches the given name and argument type(s).
             #   You might need to add explicit type casts.
             task_id = str(task_id)
-        query = sa_session().query(KojiBuildTargetModel).filter_by(task_id=task_id)
-        if target:
-            query = query.filter_by(target=target)
-        return query.first()
+        with sa_session_transaction() as session:
+            query = session.query(KojiBuildTargetModel).filter_by(task_id=task_id)
+            if target:
+                query = query.filter_by(target=target)
+            return query.first()
 
     @classmethod
     def create(
@@ -1937,14 +2760,18 @@ class KojiBuildTargetModel(GroupAndTargetModelConnector, Base):
         status: str,
         scratch: bool,
         koji_build_group: "KojiBuildGroupModel",
+        sidetag: Optional[str] = None,
+        nvr: Optional[str] = None,
     ) -> "KojiBuildTargetModel":
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             build = cls()
             build.task_id = task_id
             build.status = status
             build.web_url = web_url
             build.target = target
             build.scratch = scratch
+            build.sidetag = sidetag
+            build.nvr = nvr
             session.add(build)
 
             koji_build_group.koji_build_targets.append(build)
@@ -1964,6 +2791,190 @@ class KojiBuildTargetModel(GroupAndTargetModelConnector, Base):
         return (
             f"KojiBuildTargetModel(id={self.id}, "
             f"build_submitted_time={self.build_submitted_time})"
+        )
+
+    @classmethod
+    def get_all_successful_or_in_progress_by_nvr(
+        cls,
+        nvr: str,
+    ) -> set["KojiBuildTargetModel"]:
+        with sa_session_transaction() as session:
+            return set(
+                session.query(KojiBuildTargetModel)
+                .filter(
+                    KojiBuildTargetModel.nvr == nvr,
+                    KojiBuildTargetModel.scratch == False,  # noqa
+                    KojiBuildTargetModel.status.in_(
+                        ("queued", "pending", "retry", "running", "success"),
+                    ),
+                )
+                .all(),
+            )
+
+    @classmethod
+    def get_all_projects(cls) -> set["GitProjectModel"]:
+        """Get all git projects with a successful downstream koji build."""
+        with sa_session_transaction() as session:
+            query = (
+                session.query(ProjectEventModel)
+                .join(
+                    PipelineModel,
+                    PipelineModel.project_event_id == ProjectEventModel.id,
+                )
+                .join(
+                    KojiBuildGroupModel,
+                    PipelineModel.koji_build_group_id == KojiBuildGroupModel.id,
+                )
+                .join(
+                    KojiBuildTargetModel,
+                    KojiBuildGroupModel.id == KojiBuildTargetModel.koji_build_group_id,
+                )
+                .filter(
+                    KojiBuildTargetModel.scratch == False,  # noqa
+                    KojiBuildTargetModel.status == "success",
+                )
+            )
+            project_event_branches = [
+                project_event.get_project_event_object() for project_event in query
+            ]
+            projects = [branch.project for branch in project_event_branches]
+            return set(projects)
+
+
+class KojiTagRequestGroupModel(ProjectAndEventsConnector, GroupModel, Base):
+    __tablename__ = "koji_tag_request_groups"
+    id = Column(Integer, primary_key=True)
+    submitted_time = Column(DateTime, default=datetime.utcnow)
+
+    runs = relationship("PipelineModel", back_populates="koji_tag_request_group")
+    koji_tag_request_targets = relationship(
+        "KojiTagRequestTargetModel",
+        back_populates="group_of_targets",
+    )
+
+    @property
+    def grouped_targets(self):
+        return self.koji_tag_request_targets
+
+    def __repr__(self) -> str:
+        return f"KojiTagRequestGroupModel(id={self.id}, submitted_time={self.submitted_time})"
+
+    @classmethod
+    def get_by_id(cls, id_: int) -> Optional["KojiTagRequestGroupModel"]:
+        with sa_session_transaction() as session:
+            return session.query(KojiTagRequestGroupModel).filter_by(id=id_).first()
+
+    @classmethod
+    def create(cls, run_model: "PipelineModel") -> "KojiTagRequestGroupModel":
+        with sa_session_transaction(commit=True) as session:
+            tag_request_group = cls()
+            session.add(tag_request_group)
+            if run_model.koji_tag_request_group:
+                # Clone run model
+                new_run_model = PipelineModel.create(
+                    project_event=run_model.project_event,
+                    package_name=run_model.package_name,
+                )
+                new_run_model.srpm_build = run_model.srpm_build
+                new_run_model.koji_tag_request_group = tag_request_group
+                session.add(new_run_model)
+            else:
+                run_model.koji_tag_request_group = tag_request_group
+                session.add(run_model)
+            return tag_request_group
+
+
+class KojiTagRequestTargetModel(GroupAndTargetModelConnector, Base):
+    """we create an entry for every target"""
+
+    __tablename__ = "koji_tag_request_targets"
+    id = Column(Integer, primary_key=True)
+    task_id = Column(String, index=True)  # ID of the Koji tag task
+
+    # chroot, but we use the word target in our docs
+    target = Column(String)
+    # URL to koji web ui for the particular build
+    web_url = Column(String)
+    # datetime.utcnow instead of datetime.utcnow() because its an argument to the function
+    # so it will run when the koji build is initiated, not when the table is made
+    tag_request_submitted_time = Column(DateTime, default=datetime.utcnow)
+
+    sidetag = Column(String)
+    nvr = Column(String)
+
+    koji_tag_request_group_id = Column(Integer, ForeignKey("koji_tag_request_groups.id"))
+
+    group_of_targets = relationship(
+        "KojiTagRequestGroupModel",
+        back_populates="koji_tag_request_targets",
+    )
+
+    def set_web_url(self, web_url: str):
+        with sa_session_transaction(commit=True) as session:
+            self.web_url = web_url
+            session.add(self)
+
+    def set_task_id(self, task_id: str):
+        with sa_session_transaction(commit=True) as session:
+            self.task_id = task_id
+            session.add(self)
+
+    def set_tag_request_submitted_time(self, tag_request_submitted_time: Optional[DateTime]):
+        with sa_session_transaction(commit=True) as session:
+            self.tag_request_submitted_time = tag_request_submitted_time
+            session.add(self)
+
+    @classmethod
+    def get_by_id(cls, id_: int) -> Optional["KojiTagRequestTargetModel"]:
+        with sa_session_transaction() as session:
+            return session.query(KojiTagRequestTargetModel).filter_by(id=id_).first()
+
+    @classmethod
+    def get_all(cls) -> Iterable["KojiTagRequestTargetModel"]:
+        with sa_session_transaction() as session:
+            return session.query(KojiTagRequestTargetModel)
+
+    @classmethod
+    def get_range(
+        cls,
+        first: int,
+        last: int,
+    ) -> Iterable["KojiTagRequestTargetModel"]:
+        with sa_session_transaction() as session:
+            query = session.query(KojiTagRequestTargetModel).order_by(
+                desc(KojiTagRequestTargetModel.id),
+            )
+
+            return query.slice(first, last)
+
+    @classmethod
+    def create(
+        cls,
+        task_id: Optional[str],
+        web_url: Optional[str],
+        target: str,
+        koji_tag_request_group: "KojiTagRequestGroupModel",
+        sidetag: Optional[str] = None,
+        nvr: Optional[str] = None,
+    ) -> "KojiTagRequestTargetModel":
+        with sa_session_transaction(commit=True) as session:
+            tag_request = cls()
+            tag_request.task_id = task_id
+            tag_request.web_url = web_url
+            tag_request.target = target
+            tag_request.sidetag = sidetag
+            tag_request.nvr = nvr
+            session.add(tag_request)
+
+            koji_tag_request_group.koji_tag_request_targets.append(tag_request)
+            session.add(koji_tag_request_group)
+
+            return tag_request
+
+    def __repr__(self):
+        return (
+            f"KojiTagRequestTargetModel(id={self.id}, "
+            f"tag_submitted_time={self.tag_request_submitted_time})"
         )
 
 
@@ -1992,7 +3003,7 @@ class SRPMBuildModel(ProjectAndEventsConnector, Base):
         package_name: Optional[str] = None,
         copr_build_id: Optional[str] = None,
         copr_web_url: Optional[str] = None,
-    ) -> Tuple["SRPMBuildModel", "PipelineModel"]:
+    ) -> tuple["SRPMBuildModel", "PipelineModel"]:
         """
         Create a new model for SRPM and connect it to the PipelineModel.
 
@@ -2016,7 +3027,7 @@ class SRPMBuildModel(ProjectAndEventsConnector, Base):
              collects this new TFTTestRunTargetModel with old SRPMBuildModel and
              CoprBuildTargetModel.
         """
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             srpm_build = cls()
             srpm_build.status = BuildStatus.pending
             srpm_build.copr_build_id = copr_build_id
@@ -2025,7 +3036,8 @@ class SRPMBuildModel(ProjectAndEventsConnector, Base):
 
             # Create a new run model, reuse project_event_model if it exists:
             new_run_model = PipelineModel.create(
-                project_event=project_event_model, package_name=package_name
+                project_event=project_event_model,
+                package_name=package_name,
             )
             new_run_model.srpm_build = srpm_build
             session.add(new_run_model)
@@ -2037,80 +3049,73 @@ class SRPMBuildModel(ProjectAndEventsConnector, Base):
         cls,
         id_: int,
     ) -> Optional["SRPMBuildModel"]:
-        return sa_session().query(SRPMBuildModel).filter_by(id=id_).first()
+        with sa_session_transaction() as session:
+            return session.query(SRPMBuildModel).filter_by(id=id_).first()
 
     @classmethod
     def get_range(cls, first: int, last: int) -> Iterable["SRPMBuildModel"]:
-        return (
-            sa_session()
-            .query(SRPMBuildModel)
-            .order_by(desc(SRPMBuildModel.id))
-            .slice(first, last)
-        )
+        with sa_session_transaction() as session:
+            return (
+                session.query(SRPMBuildModel).order_by(desc(SRPMBuildModel.id)).slice(first, last)
+            )
 
     @classmethod
     def get_by_copr_build_id(
-        cls, copr_build_id: Union[str, int]
+        cls,
+        copr_build_id: Union[str, int],
     ) -> Optional["SRPMBuildModel"]:
         if isinstance(copr_build_id, int):
             copr_build_id = str(copr_build_id)
-        return (
-            sa_session()
-            .query(SRPMBuildModel)
-            .filter_by(copr_build_id=copr_build_id)
-            .first()
-        )
+        with sa_session_transaction() as session:
+            return session.query(SRPMBuildModel).filter_by(copr_build_id=copr_build_id).first()
 
     @classmethod
     def get_older_than(cls, delta: timedelta) -> Iterable["SRPMBuildModel"]:
         """Return builds older than delta, whose logs/artifacts haven't been discarded yet."""
         delta_ago = datetime.now(timezone.utc) - delta
-        return (
-            sa_session()
-            .query(SRPMBuildModel)
-            .filter(
+        with sa_session_transaction() as session:
+            return session.query(SRPMBuildModel).filter(
                 SRPMBuildModel.build_submitted_time < delta_ago,
                 SRPMBuildModel.logs.isnot(None),
             )
-        )
 
     def set_url(self, url: Optional[str]) -> None:
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             self.url = null() if url is None else url
             session.add(self)
 
     def set_logs(self, logs: Optional[str]) -> None:
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             self.logs = null() if logs is None else logs
             session.add(self)
 
     def set_copr_build_id(self, copr_build_id: str) -> None:
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             self.copr_build_id = copr_build_id
             session.add(self)
 
     def set_copr_web_url(self, copr_web_url: str) -> None:
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             self.copr_web_url = copr_web_url
             session.add(self)
 
     def set_start_time(self, start_time: datetime) -> None:
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             self.build_start_time = start_time
             session.add(self)
 
     def set_end_time(self, end_time: datetime) -> None:
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             self.build_finished_time = end_time
             session.add(self)
 
     def set_build_logs_url(self, logs_url: str) -> None:
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             self.logs_url = logs_url
             session.add(self)
 
     def set_status(self, status: BuildStatus) -> None:
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             self.status = status
             session.add(self)
 
@@ -2134,7 +3139,10 @@ class AllowlistModel(Base):
 
     @classmethod
     def add_namespace(
-        cls, namespace: str, status: str, fas_account: Optional[str] = None
+        cls,
+        namespace: str,
+        status: str,
+        fas_account: Optional[str] = None,
     ):
         """
         Adds namespace with specific status to the allowlist. If namespace is present,
@@ -2152,7 +3160,7 @@ class AllowlistModel(Base):
         Returns:
             Newly created entry or entry that represents requested namespace.
         """
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             namespace_entry = cls.get_namespace(namespace)
             if not namespace_entry:
                 namespace_entry = cls()
@@ -2177,7 +3185,8 @@ class AllowlistModel(Base):
         Returns:
             Entry that represents namespace or `None` if cannot be found.
         """
-        return sa_session().query(AllowlistModel).filter_by(namespace=namespace).first()
+        with sa_session_transaction() as session:
+            return session.query(AllowlistModel).filter_by(namespace=namespace).first()
 
     @classmethod
     def get_by_status(cls, status: str) -> Iterable["AllowlistModel"]:
@@ -2190,22 +3199,24 @@ class AllowlistModel(Base):
         Returns:
             List of the namespaces with set status.
         """
-        return sa_session().query(AllowlistModel).filter_by(status=status)
+        with sa_session_transaction() as session:
+            return session.query(AllowlistModel).filter_by(status=status)
 
     @classmethod
     def remove_namespace(cls, namespace: str):
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             namespace_entry = session.query(AllowlistModel).filter_by(
-                namespace=namespace
+                namespace=namespace,
             )
             if namespace_entry.one_or_none():
                 namespace_entry.delete()
 
     @classmethod
     def get_all(cls) -> Iterable["AllowlistModel"]:
-        return sa_session().query(AllowlistModel)
+        with sa_session_transaction() as session:
+            return session.query(AllowlistModel)
 
-    def to_dict(self) -> Dict[str, str]:
+    def to_dict(self) -> dict[str, str]:
         return {
             "namespace": self.namespace,
             "status": self.status,
@@ -2244,6 +3255,15 @@ class TestingFarmResult(str, enum.Enum):
     needs_inspection = "needs_inspection"
     retry = "retry"
     complete = "complete"
+    canceled = "canceled"
+    cancel_requested = "cancel-requested"
+
+    @classmethod
+    def from_string(cls, value):
+        try:
+            return cls(value)
+        except ValueError:
+            return cls.unknown
 
 
 class TFTTestRunGroupModel(ProjectAndEventsConnector, GroupModel, Base):
@@ -2253,17 +3273,16 @@ class TFTTestRunGroupModel(ProjectAndEventsConnector, GroupModel, Base):
 
     runs = relationship("PipelineModel", back_populates="test_run_group")
     tft_test_run_targets = relationship(
-        "TFTTestRunTargetModel", back_populates="group_of_targets"
+        "TFTTestRunTargetModel",
+        back_populates="group_of_targets",
     )
 
     def __repr__(self) -> str:
-        return (
-            f"TFTTestRunGroupModel(id={self.id}, submitted_time={self.submitted_time})"
-        )
+        return f"TFTTestRunGroupModel(id={self.id}, submitted_time={self.submitted_time})"
 
     @classmethod
-    def create(cls, run_models: List["PipelineModel"]) -> "TFTTestRunGroupModel":
-        with sa_session_transaction() as session:
+    def create(cls, run_models: list["PipelineModel"]) -> "TFTTestRunGroupModel":
+        with sa_session_transaction(commit=True) as session:
             test_run_group = cls()
             session.add(test_run_group)
 
@@ -2285,12 +3304,13 @@ class TFTTestRunGroupModel(ProjectAndEventsConnector, GroupModel, Base):
             return test_run_group
 
     @property
-    def grouped_targets(self) -> List["TFTTestRunTargetModel"]:
+    def grouped_targets(self) -> list["TFTTestRunTargetModel"]:
         return self.tft_test_run_targets
 
     @classmethod
     def get_by_id(cls, group_id: int) -> Optional["TFTTestRunGroupModel"]:
-        return sa_session().query(TFTTestRunGroupModel).filter_by(id=group_id).first()
+        with sa_session_transaction() as session:
+            return session.query(TFTTestRunGroupModel).filter_by(id=group_id).first()
 
 
 class TFTTestRunTargetModel(GroupAndTargetModelConnector, Base):
@@ -2305,7 +3325,7 @@ class TFTTestRunTargetModel(GroupAndTargetModelConnector, Base):
     # so it will run when the model is initiated, not when the table is made
     submitted_time = Column(DateTime, default=datetime.utcnow)
     data = Column(JSON)
-    tft_test_run_group_id = Column(Integer, ForeignKey("tft_test_run_groups.id"))
+    tft_test_run_group_id = Column(Integer, ForeignKey("tft_test_run_groups.id"), index=True)
 
     copr_builds = relationship(
         "CoprBuildTargetModel",
@@ -2313,31 +3333,32 @@ class TFTTestRunTargetModel(GroupAndTargetModelConnector, Base):
         backref="tft_test_run_targets",
     )
     group_of_targets = relationship(
-        "TFTTestRunGroupModel", back_populates="tft_test_run_targets"
+        "TFTTestRunGroupModel",
+        back_populates="tft_test_run_targets",
     )
 
     def set_status(self, status: TestingFarmResult, created: Optional[DateTime] = None):
         """
         set status of the TF run and optionally set the created datetime as well
         """
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             self.status = status
             if created and not self.submitted_time:
                 self.submitted_time = created
             session.add(self)
 
     def set_web_url(self, web_url: str):
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             self.web_url = web_url
             session.add(self)
 
     def set_pipeline_id(self, pipeline_id: str) -> None:
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             self.pipeline_id = pipeline_id
             session.add(self)
 
     def add_copr_build(self, build: "CoprBuildTargetModel"):
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             self.copr_builds.append(build)
             session.add(self)
 
@@ -2349,11 +3370,11 @@ class TFTTestRunTargetModel(GroupAndTargetModelConnector, Base):
         target: str,
         test_run_group: "TFTTestRunGroupModel",
         web_url: Optional[str] = None,
-        data: dict = None,
+        data: Optional[dict] = None,
         identifier: Optional[str] = None,
-        copr_build_targets: Optional[List[CoprBuildTargetModel]] = None,
+        copr_build_targets: Optional[list[CoprBuildTargetModel]] = None,
     ) -> "TFTTestRunTargetModel":
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             test_run = cls()
             test_run.pipeline_id = pipeline_id
             test_run.identifier = identifier
@@ -2371,66 +3392,63 @@ class TFTTestRunTargetModel(GroupAndTargetModelConnector, Base):
 
     @classmethod
     def get_by_pipeline_id(cls, pipeline_id: str) -> Optional["TFTTestRunTargetModel"]:
-        return (
-            sa_session()
-            .query(TFTTestRunTargetModel)
-            .filter_by(pipeline_id=pipeline_id)
-            .first()
-        )
+        with sa_session_transaction() as session:
+            return session.query(TFTTestRunTargetModel).filter_by(pipeline_id=pipeline_id).first()
 
     @classmethod
     def get_all_by_status(
-        cls, *status: TestingFarmResult
+        cls,
+        *status: TestingFarmResult,
     ) -> Iterable["TFTTestRunTargetModel"]:
         """Returns all runs which currently have their status set to one
         of the requested statuses."""
-        return (
-            sa_session()
-            .query(TFTTestRunTargetModel)
-            .filter(TFTTestRunTargetModel.status.in_(status))
-        )
+        with sa_session_transaction() as session:
+            return session.query(TFTTestRunTargetModel).filter(
+                TFTTestRunTargetModel.status.in_(status),
+            )
 
     @classmethod
     def get_by_id(cls, id: int) -> Optional["TFTTestRunTargetModel"]:
-        return sa_session().query(TFTTestRunTargetModel).filter_by(id=id).first()
+        with sa_session_transaction() as session:
+            return session.query(TFTTestRunTargetModel).filter_by(id=id).first()
 
     @staticmethod
     def get_all_by_commit_target(
         commit_sha: str,
-        target: str = None,
+        target: Optional[str] = None,
     ) -> Iterable["TFTTestRunTargetModel"]:
         """
         All tests with the given commit_sha and optional target.
         """
-        query = (
-            sa_session()
-            .query(TFTTestRunTargetModel)
-            .join(
-                TFTTestRunTargetModel.group_of_targets,
+        with sa_session_transaction() as session:
+            query = (
+                session.query(TFTTestRunTargetModel)
+                .join(
+                    TFTTestRunTargetModel.group_of_targets,
+                )
+                .join(
+                    PipelineModel,
+                    PipelineModel.test_run_group_id == TFTTestRunGroupModel.id,
+                )
+                .join(
+                    ProjectEventModel,
+                    PipelineModel.project_event_id == ProjectEventModel.id,
+                )
+                .filter(ProjectEventModel.commit_sha == commit_sha)
             )
-            .join(
-                PipelineModel,
-                PipelineModel.test_run_group_id == TFTTestRunGroupModel.id,
-            )
-            .join(
-                ProjectEventModel,
-                PipelineModel.project_event_id == ProjectEventModel.id,
-            )
-            .filter(ProjectEventModel.commit_sha == commit_sha)
-        )
-        if target:
-            query = query.filter(TFTTestRunTargetModel.target == target)
+            if target:
+                query = query.filter(TFTTestRunTargetModel.target == target)
 
-        return query
+            return query
 
     @classmethod
     def get_range(cls, first: int, last: int) -> Iterable["TFTTestRunTargetModel"]:
-        return (
-            sa_session()
-            .query(TFTTestRunTargetModel)
-            .order_by(desc(TFTTestRunTargetModel.id))
-            .slice(first, last)
-        )
+        with sa_session_transaction() as session:
+            return (
+                session.query(TFTTestRunTargetModel)
+                .order_by(desc(TFTTestRunTargetModel.id))
+                .slice(first, last)
+            )
 
     def __repr__(self):
         return f"TFTTestRunTargetModel(id={self.id}, pipeline_id={self.pipeline_id})"
@@ -2449,16 +3467,22 @@ class SyncReleaseTargetModel(ProjectAndEventsConnector, Base):
     __tablename__ = "sync_release_run_targets"
     id = Column(Integer, primary_key=True)
     branch = Column(String, default="unknown")
-    downstream_pr_url = Column(String)
     status = Column(Enum(SyncReleaseTargetStatus))
     submitted_time = Column(DateTime, default=datetime.utcnow)
     start_time = Column(DateTime)
     finished_time = Column(DateTime)
     logs = Column(Text)
     sync_release_id = Column(Integer, ForeignKey("sync_release_runs.id"), index=True)
+    downstream_pr_url = Column(String)  # @TODO drop when the code uses downstream_pr
+    downstream_pr_id = Column(Integer, ForeignKey("sync_release_pull_request.id"))
 
     sync_release = relationship(
-        "SyncReleaseModel", back_populates="sync_release_targets"
+        "SyncReleaseModel",
+        back_populates="sync_release_targets",
+    )
+    pull_request = relationship(
+        "SyncReleasePullRequestModel",
+        back_populates="sync_release_targets",
     )
 
     def __repr__(self) -> str:
@@ -2466,9 +3490,11 @@ class SyncReleaseTargetModel(ProjectAndEventsConnector, Base):
 
     @classmethod
     def create(
-        cls, status: SyncReleaseTargetStatus, branch: str
+        cls,
+        status: SyncReleaseTargetStatus,
+        branch: str,
     ) -> "SyncReleaseTargetModel":
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             sync_release_target = cls()
             sync_release_target.status = status
             sync_release_target.branch = branch
@@ -2476,33 +3502,59 @@ class SyncReleaseTargetModel(ProjectAndEventsConnector, Base):
             return sync_release_target
 
     def set_status(self, status: SyncReleaseTargetStatus) -> None:
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             self.status = status
             session.add(self)
 
     def set_downstream_pr_url(self, downstream_pr_url: str) -> None:
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             self.downstream_pr_url = downstream_pr_url
             session.add(self)
 
+    def set_downstream_pr(self, downstream_pr: SyncReleasePullRequestModel) -> None:
+        with sa_session_transaction(commit=True) as session:
+            downstream_pr.sync_release_targets.append(self)
+            session.add(downstream_pr)
+
     def set_start_time(self, start_time: DateTime) -> None:
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             self.start_time = start_time
             session.add(self)
 
     def set_finished_time(self, finished_time: DateTime) -> None:
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             self.finished_time = finished_time
             session.add(self)
 
     def set_logs(self, logs: str) -> None:
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             self.logs = logs
             session.add(self)
 
     @classmethod
     def get_by_id(cls, id_: int) -> Optional["SyncReleaseTargetModel"]:
-        return sa_session().query(SyncReleaseTargetModel).filter_by(id=id_).first()
+        with sa_session_transaction() as session:
+            return session.query(SyncReleaseTargetModel).filter_by(id=id_).first()
+
+    @classmethod
+    def get_all_downstream_projects(cls) -> set["GitProjectModel"]:
+        """Get all downstream projects with a pr created by Packit."""
+        with sa_session_transaction() as session:
+            query = (
+                session.query(GitProjectModel, SyncReleaseTargetModel.status)
+                .join(
+                    SyncReleasePullRequestModel,
+                    SyncReleasePullRequestModel.project_id == GitProjectModel.id,
+                )
+                .join(
+                    SyncReleaseTargetModel,
+                    SyncReleaseTargetModel.downstream_pr_id == SyncReleasePullRequestModel.id,
+                )
+                .filter(
+                    SyncReleaseTargetModel.status == SyncReleaseTargetStatus.submitted,
+                )
+            )
+            return {row[0] for row in query}
 
 
 class SyncReleaseStatus(str, enum.Enum):
@@ -2522,12 +3574,14 @@ class SyncReleaseModel(ProjectAndEventsConnector, Base):
     status = Column(Enum(SyncReleaseStatus))
     submitted_time = Column(DateTime, default=datetime.utcnow)
     job_type = Column(
-        Enum(SyncReleaseJobType), default=SyncReleaseJobType.propose_downstream
+        Enum(SyncReleaseJobType),
+        default=SyncReleaseJobType.propose_downstream,
     )
 
     runs = relationship("PipelineModel", back_populates="sync_release_run")
     sync_release_targets = relationship(
-        "SyncReleaseTargetModel", back_populates="sync_release"
+        "SyncReleaseTargetModel",
+        back_populates="sync_release",
     )
 
     def __repr__(self) -> str:
@@ -2543,7 +3597,7 @@ class SyncReleaseModel(ProjectAndEventsConnector, Base):
         project_event_model: ProjectEventModel,
         job_type: SyncReleaseJobType,
         package_name: Optional[str] = None,
-    ) -> Tuple["SyncReleaseModel", "PipelineModel"]:
+    ) -> tuple["SyncReleaseModel", "PipelineModel"]:
         """
         Create a new model for SyncRelease and connect it to the PipelineModel.
 
@@ -2562,7 +3616,7 @@ class SyncReleaseModel(ProjectAndEventsConnector, Base):
           -> ProjectEventModel is reused.
         * TODO: we will use propose-downstream in commit-checks - fill in once it's implemented
         """
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             sync_release = cls()
             sync_release.status = status
             sync_release.job_type = job_type
@@ -2570,7 +3624,8 @@ class SyncReleaseModel(ProjectAndEventsConnector, Base):
 
             # Create a pipeline, reuse project_event_model if it exists:
             pipeline = PipelineModel.create(
-                project_event=project_event_model, package_name=package_name
+                project_event=project_event_model,
+                package_name=package_name,
             )
             pipeline.sync_release_run = sync_release
             session.add(pipeline)
@@ -2578,17 +3633,19 @@ class SyncReleaseModel(ProjectAndEventsConnector, Base):
             return sync_release, pipeline
 
     def set_status(self, status: SyncReleaseStatus) -> None:
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             self.status = status
             session.add(self)
 
     @classmethod
     def get_by_id(cls, id_: int) -> Optional["SyncReleaseModel"]:
-        return sa_session().query(SyncReleaseModel).filter_by(id=id_).first()
+        with sa_session_transaction() as session:
+            return session.query(SyncReleaseModel).filter_by(id=id_).first()
 
     @classmethod
     def get_all_by_status(cls, status: str) -> Iterable["SyncReleaseModel"]:
-        return sa_session().query(SyncReleaseModel).filter_by(status=status)
+        with sa_session_transaction() as session:
+            return session.query(SyncReleaseModel).filter_by(status=status)
 
     @classmethod
     def get_range(
@@ -2597,13 +3654,13 @@ class SyncReleaseModel(ProjectAndEventsConnector, Base):
         last: int,
         job_type: SyncReleaseJobType = SyncReleaseJobType.propose_downstream,
     ) -> Iterable["SyncReleaseModel"]:
-        return (
-            sa_session()
-            .query(SyncReleaseModel)
-            .order_by(desc(SyncReleaseModel.id))
-            .filter_by(job_type=job_type)
-            .slice(first, last)
-        )
+        with sa_session_transaction() as session:
+            return (
+                session.query(SyncReleaseModel)
+                .order_by(desc(SyncReleaseModel.id))
+                .filter_by(job_type=job_type)
+                .slice(first, last)
+            )
 
 
 AbstractBuildTestDbType = Union[
@@ -2620,7 +3677,8 @@ class ProjectAuthenticationIssueModel(Base):
 
     id = Column(Integer, primary_key=True)
     project = relationship(
-        "GitProjectModel", back_populates="project_authentication_issue"
+        "GitProjectModel",
+        back_populates="project_authentication_issue",
     )
     # Check to know if we created an issue for the repo.
     issue_created = Column(Boolean)
@@ -2628,11 +3686,16 @@ class ProjectAuthenticationIssueModel(Base):
 
     @classmethod
     def get_project(
-        cls, namespace: str, repo_name: str, project_url: str
+        cls,
+        namespace: str,
+        repo_name: str,
+        project_url: str,
     ) -> Optional["ProjectAuthenticationIssueModel"]:
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             project = GitProjectModel.get_or_create(
-                namespace=namespace, repo_name=repo_name, project_url=project_url
+                namespace=namespace,
+                repo_name=repo_name,
+                project_url=project_url,
             )
             return (
                 session.query(ProjectAuthenticationIssueModel)
@@ -2642,11 +3705,17 @@ class ProjectAuthenticationIssueModel(Base):
 
     @classmethod
     def create(
-        cls, namespace: str, repo_name: str, project_url: str, issue_created: bool
+        cls,
+        namespace: str,
+        repo_name: str,
+        project_url: str,
+        issue_created: bool,
     ) -> "ProjectAuthenticationIssueModel":
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             project = GitProjectModel.get_or_create(
-                namespace=namespace, repo_name=repo_name, project_url=project_url
+                namespace=namespace,
+                repo_name=repo_name,
+                project_url=project_url,
             )
 
             project_authentication_issue = cls()
@@ -2689,26 +3758,29 @@ class GithubInstallationModel(Base):
 
     @classmethod
     def get_by_id(cls, id: int) -> Optional["GithubInstallationModel"]:
-        return sa_session().query(GithubInstallationModel).filter_by(id=id).first()
+        with sa_session_transaction() as session:
+            return session.query(GithubInstallationModel).filter_by(id=id).first()
 
     @classmethod
     def get_by_account_login(
-        cls, account_login: str
+        cls,
+        account_login: str,
     ) -> Optional["GithubInstallationModel"]:
-        return (
-            sa_session()
-            .query(GithubInstallationModel)
-            .filter_by(account_login=account_login)
-            .first()
-        )
+        with sa_session_transaction() as session:
+            return (
+                session.query(GithubInstallationModel)
+                .filter_by(account_login=account_login)
+                .first()
+            )
 
     @classmethod
     def get_all(cls) -> Iterable["GithubInstallationModel"]:
-        return sa_session().query(GithubInstallationModel)
+        with sa_session_transaction() as session:
+            return session.query(GithubInstallationModel)
 
     @classmethod
     def create_or_update(cls, event):
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             installation = cls.get_by_account_login(event.account_login)
             if not installation:
                 installation = cls()
@@ -2720,9 +3792,7 @@ class GithubInstallationModel(Base):
             installation.sender_login = event.sender_login
             installation.sender_id = event.sender_id
             installation.created_at = event.created_at
-            installation.repositories = [
-                cls.get_project(repo).id for repo in event.repositories
-            ]
+            installation.repositories = [cls.get_project(repo).id for repo in event.repositories]
             session.add(installation)
             return installation
 
@@ -2747,10 +3817,16 @@ class SourceGitPRDistGitPRModel(Base):
     __tablename__ = "source_git_pr_dist_git_pr"
     id = Column(Integer, primary_key=True)  # our database PK
     source_git_pull_request_id = Column(
-        Integer, ForeignKey("pull_requests.id"), unique=True, index=True
+        Integer,
+        ForeignKey("pull_requests.id"),
+        unique=True,
+        index=True,
     )
     dist_git_pull_request_id = Column(
-        Integer, ForeignKey("pull_requests.id"), unique=True, index=True
+        Integer,
+        ForeignKey("pull_requests.id"),
+        unique=True,
+        index=True,
     )
     source_git_pull_request = relationship(
         "PullRequestModel",
@@ -2775,7 +3851,7 @@ class SourceGitPRDistGitPRModel(Base):
         dist_git_repo_name: str,
         dist_git_project_url: str,
     ) -> "SourceGitPRDistGitPRModel":
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             source_git_pull_request = PullRequestModel.get_or_create(
                 pr_id=source_git_pr_id,
                 namespace=source_git_namespace,
@@ -2803,30 +3879,26 @@ class SourceGitPRDistGitPRModel(Base):
 
     @classmethod
     def get_by_id(cls, id_: int) -> Optional["SourceGitPRDistGitPRModel"]:
-        return (
-            sa_session()
-            .query(SourceGitPRDistGitPRModel)
-            .filter_by(id=id_)
-            .one_or_none()
-        )
+        with sa_session_transaction() as session:
+            return session.query(SourceGitPRDistGitPRModel).filter_by(id=id_).one_or_none()
 
     @classmethod
     def get_by_source_git_id(cls, id_: int) -> Optional["SourceGitPRDistGitPRModel"]:
-        return (
-            sa_session()
-            .query(SourceGitPRDistGitPRModel)
-            .filter_by(source_git_pull_request_id=id_)
-            .one_or_none()
-        )
+        with sa_session_transaction() as session:
+            return (
+                session.query(SourceGitPRDistGitPRModel)
+                .filter_by(source_git_pull_request_id=id_)
+                .one_or_none()
+            )
 
     @classmethod
     def get_by_dist_git_id(cls, id_: int) -> Optional["SourceGitPRDistGitPRModel"]:
-        return (
-            sa_session()
-            .query(SourceGitPRDistGitPRModel)
-            .filter_by(dist_git_pull_request_id=id_)
-            .one_or_none()
-        )
+        with sa_session_transaction() as session:
+            return (
+                session.query(SourceGitPRDistGitPRModel)
+                .filter_by(dist_git_pull_request_id=id_)
+                .one_or_none()
+            )
 
 
 class VMImageBuildStatus(str, enum.Enum):
@@ -2875,57 +3947,63 @@ class VMImageBuildTargetModel(ProjectAndEventsConnector, Base):
     runs = relationship("PipelineModel", back_populates="vm_image_build")
 
     def set_start_time(self, start_time: datetime):
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             self.build_start_time = start_time
             session.add(self)
 
     def set_end_time(self, end_time: datetime):
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             self.build_finished_time = end_time
             session.add(self)
 
     def set_status(self, status: VMImageBuildStatus):
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             self.status = status
             session.add(self)
 
     def set_build_logs_url(self, build_logs: str):
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             self.build_logs_url = build_logs
             session.add(self)
 
     @classmethod
     def get_by_id(cls, id_: int) -> Optional["VMImageBuildTargetModel"]:
-        return sa_session().query(VMImageBuildTargetModel).filter_by(id=id_).first()
+        with sa_session_transaction() as session:
+            return session.query(VMImageBuildTargetModel).filter_by(id=id_).first()
 
     @classmethod
     def get_all(cls) -> Iterable["VMImageBuildTargetModel"]:
-        return (
-            sa_session()
-            .query(VMImageBuildTargetModel)
-            .order_by(desc(VMImageBuildTargetModel.id))
-        )
+        with sa_session_transaction() as session:
+            return session.query(VMImageBuildTargetModel).order_by(
+                desc(VMImageBuildTargetModel.id),
+            )
 
     @classmethod
     def get_all_by_build_id(
-        cls, build_id: Union[str, int]
+        cls,
+        build_id: Union[str, int],
     ) -> Iterable["VMImageBuildTargetModel"]:
         """Returns all builds with that build_id, irrespective of target"""
         if isinstance(build_id, int):
             # See the comment in get_by_task_id()
             build_id = str(build_id)
-        return sa_session().query(VMImageBuildTargetModel).filter_by(build_id=build_id)
+        with sa_session_transaction() as session:
+            return session.query(VMImageBuildTargetModel).filter_by(build_id=build_id)
 
     @classmethod
     def get_all_by_status(
-        cls, status: VMImageBuildStatus
+        cls,
+        status: VMImageBuildStatus,
     ) -> Iterable["VMImageBuildTargetModel"]:
         """Returns all builds which currently have the given status."""
-        return sa_session().query(VMImageBuildTargetModel).filter_by(status=status)
+        with sa_session_transaction() as session:
+            return session.query(VMImageBuildTargetModel).filter_by(status=status)
 
     @classmethod
     def get_by_build_id(
-        cls, build_id: Union[str, int], target: str = None
+        cls,
+        build_id: Union[str, int],
+        target: Optional[str] = None,
     ) -> Optional["VMImageBuildTargetModel"]:
         """Returns the build matching the build_id and the target"""
 
@@ -2935,62 +4013,62 @@ class VMImageBuildTargetModel(ProjectAndEventsConnector, Base):
             #   HINT:  No operator matches the given name and argument type(s).
             #   You might need to add explicit type casts.
             build_id = str(build_id)
-        query = sa_session().query(VMImageBuildTargetModel).filter_by(build_id=build_id)
-        if target:
-            query = query.filter_by(target=target)
-        return query.first()
+        with sa_session_transaction() as session:
+            query = session.query(VMImageBuildTargetModel).filter_by(build_id=build_id)
+            if target:
+                query = query.filter_by(target=target)
+            return query.first()
 
     @staticmethod
     def get_all_by(
         project_name: str,
         commit_sha: str,
-        owner: str = None,
-        target: str = None,
+        owner: Optional[str] = None,
+        target: Optional[str] = None,
     ) -> Iterable["VMImageBuildTargetModel"]:
         """All owner/project_name builds sorted from latest to oldest
         with the given commit_sha and optional target.
         """
-        query = (
-            sa_session()
-            .query(VMImageBuildTargetModel)
-            .join(
-                PipelineModel,
-                PipelineModel.vm_image_build_id == VMImageBuildTargetModel.id,
+        with sa_session_transaction() as session:
+            query = (
+                session.query(VMImageBuildTargetModel)
+                .join(
+                    PipelineModel,
+                    PipelineModel.vm_image_build_id == VMImageBuildTargetModel.id,
+                )
+                .join(
+                    ProjectEventModel,
+                    PipelineModel.project_event_id == ProjectEventModel.id,
+                )
+                .filter(VMImageBuildTargetModel.project_name == project_name)
+                .filter(ProjectEventModel.commit_sha == commit_sha)
+                .order_by(VMImageBuildTargetModel.build_id.desc())
             )
-            .join(
-                ProjectEventModel,
-                PipelineModel.project_event_id == ProjectEventModel.id,
-            )
-            .filter(VMImageBuildTargetModel.project_name == project_name)
-            .filter(ProjectEventModel.commit_sha == commit_sha)
-            .order_by(VMImageBuildTargetModel.build_id.desc())
-        )
 
-        if owner:
-            query = query.filter(VMImageBuildTargetModel.owner == owner)
-        if target:
-            query = query.filter(VMImageBuildTargetModel.target == target)
+            if owner:
+                query = query.filter(VMImageBuildTargetModel.owner == owner)
+            if target:
+                query = query.filter(VMImageBuildTargetModel.target == target)
 
-        return query
+            return query
 
     @classmethod
     def get_all_by_commit(cls, commit_sha: str) -> Iterable["VMImageBuildTargetModel"]:
         """Returns all builds that match a given commit sha"""
-        query = (
-            sa_session()
-            .query(VMImageBuildTargetModel)
-            .join(
-                PipelineModel,
-                PipelineModel.vm_image_build_id == VMImageBuildTargetModel.id,
+        with sa_session_transaction() as session:
+            return (
+                session.query(VMImageBuildTargetModel)
+                .join(
+                    PipelineModel,
+                    PipelineModel.vm_image_build_id == VMImageBuildTargetModel.id,
+                )
+                .join(
+                    ProjectEventModel,
+                    PipelineModel.project_event_id == ProjectEventModel.id,
+                )
+                .filter(ProjectEventModel.commit_sha == commit_sha)
+                .order_by(VMImageBuildTargetModel.build_id.desc())
             )
-            .join(
-                ProjectEventModel,
-                PipelineModel.project_event_id == ProjectEventModel.id,
-            )
-            .filter(ProjectEventModel.commit_sha == commit_sha)
-            .order_by(VMImageBuildTargetModel.build_id.desc())
-        )
-        return query
 
     @classmethod
     def create(
@@ -3004,7 +4082,7 @@ class VMImageBuildTargetModel(ProjectAndEventsConnector, Base):
         run_model: "PipelineModel",
         task_accepted_time: Optional[datetime] = None,
     ) -> "VMImageBuildTargetModel":
-        with sa_session_transaction() as session:
+        with sa_session_transaction(commit=True) as session:
             build = cls()
             build.build_id = build_id
             build.status = status
@@ -3044,3 +4122,508 @@ class VMImageBuildTargetModel(ProjectAndEventsConnector, Base):
             f"VMImageBuildTargetModel(id={self.id}, "
             f"build_submitted_time={self.build_submitted_time})"
         )
+
+
+class SidetagGroupModel(Base):
+    __tablename__ = "sidetag_groups"
+    id = Column(Integer, primary_key=True)
+    name = Column(String, unique=True, index=True)
+
+    sidetags = relationship("SidetagModel", back_populates="sidetag_group")
+
+    @classmethod
+    def get_or_create(cls, name: str) -> "SidetagGroupModel":
+        with sa_session_transaction(commit=True) as session:
+            group = cls.get_by_name(name)
+            if not group:
+                group = cls()
+                group.name = name
+                session.add(group)
+            return group
+
+    @classmethod
+    def get_by_name(cls, name: str) -> Optional["SidetagGroupModel"]:
+        with sa_session_transaction() as session:
+            return session.query(cls).filter_by(name=name).first()
+
+    def get_sidetag_by_target(self, target: str) -> Optional["SidetagModel"]:
+        with sa_session_transaction() as session:
+            return (
+                session.query(SidetagModel)
+                .filter_by(sidetag_group_id=self.id, target=target)
+                .first()
+            )
+
+
+class SidetagModel(Base):
+    __tablename__ = "sidetags"
+    id = Column(Integer, primary_key=True)
+    koji_name = Column(String, unique=True, index=True)
+    target = Column(String)
+    sidetag_group_id = Column(Integer, ForeignKey("sidetag_groups.id"))
+
+    sidetag_group = relationship("SidetagGroupModel", back_populates="sidetags")
+
+    @classmethod
+    @contextmanager
+    def get_or_create_for_updating(
+        cls,
+        group_name: str,
+        target: str,
+    ) -> Generator["SidetagModel", None, None]:
+        """
+        Context manager that gets or creates a sidetag upon entering the context,
+        provides a corresponding instance of `SidetagModel` to be updated within the context
+        and commits the changes upon exiting the context, all within a single transaction.
+        """
+        with sa_session_transaction(commit=True) as session:
+            # lock the sidetag group in the DB by using SELECT ... FOR UPDATE
+            # all other workers accessing this group will block here until the context is exited
+            group = (
+                session.query(SidetagGroupModel)
+                .filter_by(name=group_name)
+                .with_for_update()
+                .first()
+            )
+
+            sidetag = session.query(cls).filter_by(sidetag_group_id=group.id, target=target).first()
+            if not sidetag:
+                sidetag = cls()
+                sidetag.target = target
+                session.add(sidetag)
+
+                group.sidetags.append(sidetag)
+                session.add(group)
+
+            yield sidetag
+            session.add(sidetag)
+
+    @classmethod
+    def get_by_koji_name(cls, koji_name: str) -> Optional["SidetagModel"]:
+        with sa_session_transaction() as session:
+            return session.query(SidetagModel).filter_by(koji_name=koji_name).first()
+
+
+class OSHScanStatus(str, enum.Enum):
+    """An enum of all possible build statuses"""
+
+    pending = "pending"
+    running = "running"
+    succeeded = "succeeded"
+    failed = "failed"
+    canceled = "canceled"
+
+
+class OSHScanModel(Base):
+    __tablename__ = "scans"
+    id = Column(Integer, primary_key=True)
+    task_id = Column(Integer, unique=True)  # open scan hub id
+    status = Column(Enum(OSHScanStatus))
+    url = Column(String)
+    issues_added_count = Column(Integer)
+    issues_added_url = Column(String)
+    issues_fixed_url = Column(String)
+    scan_results_url = Column(String)
+    submitted_time = Column(DateTime, default=datetime.utcnow)
+    copr_build_target_id = Column(
+        Integer,
+        ForeignKey("copr_build_targets.id"),
+        unique=True,
+    )
+    copr_build_target = relationship(
+        "CoprBuildTargetModel",
+        back_populates="scan",
+        uselist=False,
+    )
+
+    @classmethod
+    def get_or_create(cls, task_id: int) -> "OSHScanModel":
+        with sa_session_transaction(commit=True) as session:
+            scan = cls.get_by_task_id(task_id)
+            if not scan:
+                scan = cls()
+                scan.task_id = task_id
+                scan.status = OSHScanStatus.pending
+                session.add(scan)
+            return scan
+
+    def set_status(self, status: OSHScanStatus) -> None:
+        with sa_session_transaction(commit=True) as session:
+            self.status = status
+            session.add(self)
+
+    def set_url(self, url: str) -> None:
+        with sa_session_transaction(commit=True) as session:
+            self.url = url
+            session.add(self)
+
+    def set_issues_added_url(self, issues_added_url: str) -> None:
+        with sa_session_transaction(commit=True) as session:
+            self.issues_added_url = issues_added_url
+            session.add(self)
+
+    def set_issues_fixed_url(self, issues_fixed_url: str) -> None:
+        with sa_session_transaction(commit=True) as session:
+            self.issues_fixed_url = issues_fixed_url
+            session.add(self)
+
+    def set_scan_results_url(self, scan_results_url: str) -> None:
+        with sa_session_transaction(commit=True) as session:
+            self.scan_results_url = scan_results_url
+            session.add(self)
+
+    def set_issues_added_count(self, issues_added_count: int) -> None:
+        with sa_session_transaction(commit=True) as session:
+            self.issues_added_count = issues_added_count
+            session.add(self)
+
+    @classmethod
+    def get_by_task_id(cls, task_id: int) -> Optional["OSHScanModel"]:
+        with sa_session_transaction() as session:
+            return session.query(cls).filter_by(task_id=task_id).first()
+
+    @classmethod
+    def get_by_id(cls, id_: int) -> Optional["OSHScanModel"]:
+        with sa_session_transaction() as session:
+            return session.query(OSHScanModel).filter_by(id=id_).first()
+
+    @classmethod
+    def get_range(cls, first: int, last: int) -> Iterable["OSHScanModel"]:
+        with sa_session_transaction() as session:
+            return session.query(OSHScanModel).order_by(desc(OSHScanModel.id)).slice(first, last)
+
+
+@cached(cache=TTLCache(maxsize=2048, ttl=(60 * 60 * 24)))
+def get_usage_data(datetime_from=None, datetime_to=None, top=10) -> dict:
+    """
+    Get usage data.
+
+    Example:
+    ```
+    >>> safe_dump(get_usage_data(top=3))
+    active_projects:
+      instances:
+        github.com: 279
+        gitlab.com: 3
+        gitlab.freedesktop.org: 3
+        gitlab.gnome.org: 2
+      project_count: 287
+      top_projects_by_events_handled:
+        https://github.com/avocado-framework/avocado: 1327
+        https://github.com/cockpit-project/cockpit: 1829
+        https://github.com/systemd/systemd: 4960
+    all_projects:
+      instances:
+        git.centos.org: 25
+        github.com: 7855
+        gitlab.com: 8
+        gitlab.freedesktop.org: 4
+        gitlab.gnome.org: 2
+        src.fedoraproject.org: 22175
+      project_count: 30069
+    events:
+      branch_push:
+        events_handled: 115
+        top_projects:
+          https://github.com/packit/ogr: 3
+          https://github.com/packit/packit: 3
+          https://github.com/rhinstaller/anaconda: 3
+      issue:
+        events_handled: 18
+        top_projects:
+          https://github.com/martinpitt/python-dbusmock: 2
+          https://github.com/packit/packit: 3
+          https://github.com/packit/specfile: 3
+      pull_request:
+        events_handled: 26605
+        top_projects:
+          https://github.com/avocado-framework/avocado: 1327
+          https://github.com/cockpit-project/cockpit: 1808
+          https://github.com/systemd/systemd: 4960
+      release:
+        events_handled: 425
+        top_projects:
+          https://github.com/facebook/folly: 40
+          https://github.com/packit/ogr: 33
+          https://github.com/packit/packit: 57
+    jobs:
+      copr_build_targets:
+        job_runs: 530955
+        per_event:
+          branch_push:
+            job_runs: 48160
+            top_projects_by_job_runs:
+              https://github.com/osandov/drgn: 5812
+              https://github.com/osbuild/osbuild: 7078
+              https://github.com/osbuild/osbuild-composer: 12847
+          issue:
+            job_runs: 0
+            top_projects_by_job_runs: {}
+          pull_request:
+            job_runs: 481561
+            top_projects_by_job_runs:
+              https://github.com/osbuild/osbuild: 31108
+              https://github.com/osbuild/osbuild-composer: 93939
+              https://github.com/systemd/systemd: 60158
+          release:
+            job_runs: 1234
+            top_projects_by_job_runs:
+              https://github.com/facebook/folly: 340
+              https://github.com/packit/ogr: 104
+              https://github.com/packit/packit: 174
+        top_projects_by_job_runs:
+          https://github.com/osbuild/osbuild: 38186
+          https://github.com/osbuild/osbuild-composer: 106786
+          https://github.com/systemd/systemd: 60158
+      koji_build_targets:
+        job_runs: 1466
+        per_event:
+          branch_push:
+            job_runs: 56
+            top_projects_by_job_runs:
+              https://github.com/besser82/libxcrypt: 46
+              https://github.com/ostreedev/ostree: 10
+          issue:
+            job_runs: 0
+            top_projects_by_job_runs: {}
+          pull_request:
+            job_runs: 1410
+            top_projects_by_job_runs:
+              https://github.com/containers/podman: 297
+              https://github.com/packit/ogr: 509
+              https://github.com/rear/rear: 267
+          release:
+            job_runs: 0
+            top_projects_by_job_runs: {}
+        top_projects_by_job_runs:
+          https://github.com/containers/podman: 297
+          https://github.com/packit/ogr: 509
+          https://github.com/rear/rear: 267
+      srpm_builds:
+        job_runs: 103695
+        per_event:
+          branch_push:
+            job_runs: 7084
+            top_projects_by_job_runs:
+              https://github.com/osbuild/osbuild-composer: 646
+              https://github.com/packit/packit: 549
+              https://github.com/rhinstaller/anaconda: 1015
+          issue:
+            job_runs: 0
+            top_projects_by_job_runs: {}
+          pull_request:
+            job_runs: 96305
+            top_projects_by_job_runs:
+              https://github.com/cockpit-project/cockpit: 6915
+              https://github.com/packit/hello-world: 10401
+              https://github.com/systemd/systemd: 14489
+          release:
+            job_runs: 306
+            top_projects_by_job_runs:
+              https://github.com/facebook/folly: 40
+              https://github.com/packit/ogr: 34
+              https://github.com/packit/packit: 54
+        top_projects_by_job_runs:
+          https://github.com/cockpit-project/cockpit: 6937
+          https://github.com/packit/hello-world: 10409
+          https://github.com/systemd/systemd: 14489
+      sync_release_runs:
+        job_runs: 419
+        per_event:
+          branch_push:
+            job_runs: 0
+            top_projects_by_job_runs: {}
+          issue:
+            job_runs: 22
+            top_projects_by_job_runs:
+              https://github.com/martinpitt/python-dbusmock: 3
+              https://github.com/packit/packit: 3
+              https://github.com/packit/specfile: 6
+          pull_request:
+            job_runs: 0
+            top_projects_by_job_runs: {}
+          release:
+            job_runs: 397
+            top_projects_by_job_runs:
+              https://github.com/martinpitt/python-dbusmock: 35
+              https://github.com/packit/packit: 35
+              https://github.com/rhinstaller/anaconda: 34
+        top_projects_by_job_runs:
+          https://github.com/martinpitt/python-dbusmock: 38
+          https://github.com/packit/packit: 38
+          https://github.com/rhinstaller/anaconda: 34
+      tft_test_run_targets:
+        job_runs: 150525
+        per_event:
+          branch_push:
+            job_runs: 441
+            top_projects_by_job_runs:
+              https://github.com/oamg/convert2rhel: 209
+              https://github.com/packit-service/packit: 50
+              https://github.com/python-bugzilla/python-bugzilla: 88
+          issue:
+            job_runs: 0
+            top_projects_by_job_runs: {}
+          pull_request:
+            job_runs: 150026
+            top_projects_by_job_runs:
+              https://github.com/cockpit-project/cockpit: 21157
+              https://github.com/oamg/convert2rhel: 15297
+              https://github.com/teemtee/tmt: 22136
+          release:
+            job_runs: 58
+            top_projects_by_job_runs:
+              https://github.com/fedora-infra/fedora-messaging: 8
+              https://github.com/fedora-iot/zezere: 8
+              https://github.com/psss/tmt: 21
+        top_projects_by_job_runs:
+          https://github.com/cockpit-project/cockpit: 21157
+          https://github.com/oamg/convert2rhel: 15506
+          https://github.com/teemtee/tmt: 22136
+      vm_image_build_targets:
+        job_runs: 2
+        per_event:
+          branch_push:
+            job_runs: 0
+            top_projects_by_job_runs: {}
+          issue:
+            job_runs: 0
+            top_projects_by_job_runs: {}
+          pull_request:
+            job_runs: 2
+            top_projects_by_job_runs:
+              https://github.com/packit/ogr: 2
+          release:
+            job_runs: 0
+            top_projects_by_job_runs: {}
+        top_projects_by_job_runs:
+          https://github.com/packit/ogr: 2
+
+    ```
+    """
+    jobs = {}
+    for job_model in [
+        SRPMBuildModel,
+        CoprBuildGroupModel,
+        KojiBuildGroupModel,
+        VMImageBuildTargetModel,
+        TFTTestRunGroupModel,
+        SyncReleaseModel,
+    ]:
+        if not hasattr(job_model, "__tablename__"):
+            # otherwise mypi complains:
+            # "type[ProjectAndEventsConnector]" has no attribute "__tablename__"
+            continue
+
+        jobs[job_model.__tablename__] = {
+            "job_runs": GitProjectModel.get_job_usage_numbers_count_all_project_events(
+                datetime_from=datetime_from,
+                datetime_to=datetime_to,
+                job_result_model=job_model,
+            ),
+            "top_projects_by_job_runs": GitProjectModel.get_job_usage_numbers_all_project_events(
+                datetime_from=datetime_from,
+                datetime_to=datetime_to,
+                top=top,
+                job_result_model=job_model,
+            ),
+        }
+        jobs[job_model.__tablename__]["per_event"] = {
+            project_event_type.value: {
+                "job_runs": GitProjectModel.get_job_usage_numbers_count(
+                    datetime_from=datetime_from,
+                    datetime_to=datetime_to,
+                    job_result_model=job_model,
+                    project_event_type=project_event_type,
+                ),
+                "top_projects_by_job_runs": GitProjectModel.get_job_usage_numbers(
+                    datetime_from=datetime_from,
+                    datetime_to=datetime_to,
+                    top=top,
+                    job_result_model=job_model,
+                    project_event_type=project_event_type,
+                ),
+            }
+            for project_event_type in ProjectEventModelType
+        }
+
+    return {
+        "all_projects": {
+            "project_count": GitProjectModel.get_project_count(),
+            "instances": GitProjectModel.get_instance_numbers(),
+        },
+        "active_projects": {
+            "project_count": GitProjectModel.get_active_projects_count(
+                datetime_from=datetime_from,
+                datetime_to=datetime_to,
+            ),
+            "top_projects_by_events_handled": GitProjectModel.get_active_projects_usage_numbers(
+                datetime_from=datetime_from,
+                datetime_to=datetime_to,
+                top=top,
+            ),
+            "instances": GitProjectModel.get_instance_numbers_for_active_projects(
+                datetime_from=datetime_from,
+                datetime_to=datetime_to,
+            ),
+        },
+        "events": {
+            project_event_type.value: {
+                "events_handled": GitProjectModel.get_project_event_usage_count(
+                    datetime_from=datetime_from,
+                    datetime_to=datetime_to,
+                    project_event_type=project_event_type,
+                ),
+                "top_projects": GitProjectModel.get_project_event_usage_numbers(
+                    datetime_from=datetime_from,
+                    datetime_to=datetime_to,
+                    top=top,
+                    project_event_type=project_event_type,
+                ),
+            }
+            for project_event_type in ProjectEventModelType
+        },
+        "jobs": jobs,
+    }
+
+
+@cached(cache=TTLCache(maxsize=1, ttl=(60 * 60 * 24)))
+def get_onboarded_projects() -> tuple[dict[int, str], dict[int, str]]:
+    """Returns a tuple with two dictionaries of project IDs and URLs:
+    onboarded projects: projects which have a
+      merged downstream PR, a Koji build or a Bodhi update
+    almost onboarded projects: projects with
+      a downstream PR created but not yet merged
+    """
+    known_onboarded_projects = GitProjectModel.get_known_onboarded_downstream_projects()
+
+    bodhi_updates = BodhiUpdateTargetModel.get_all_projects()
+    koji_builds = KojiBuildTargetModel.get_all_projects()
+    onboarded_projects = bodhi_updates.union(koji_builds).union(
+        known_onboarded_projects,
+    )
+
+    # find **downstream git projects** with a PR created by Packit
+    downstream_synced_projects = SyncReleaseTargetModel.get_all_downstream_projects()
+    # if there exist a downstream Packit PR we are not sure it has been
+    # merged, the project is *almost onboarded* until the PR is merged
+    # (unless we already know it has a koji build or bodhi update, then
+    # we don't need to check for a merged PR - it obviously has one)
+    almost_onboarded_projects = downstream_synced_projects.difference(
+        onboarded_projects,
+    )
+    # do not re-check projects we already checked and we know they
+    # have a merged Packit PR
+    recheck_if_onboarded = almost_onboarded_projects.difference(
+        known_onboarded_projects,
+    )
+
+    onboarded = {
+        project.id: project.project_url
+        for project in onboarded_projects.union(known_onboarded_projects)
+    }
+    almost_onboarded = {
+        project.id: project.project_url
+        for project in recheck_if_onboarded.difference(onboarded_projects)
+    }
+    return (onboarded, almost_onboarded)

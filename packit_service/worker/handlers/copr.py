@@ -3,42 +3,49 @@
 
 import logging
 from datetime import datetime, timezone
-from typing import Tuple, Type, Optional
+from typing import Optional
 
-from celery import signature, Task
-
+from celery import Task, signature
 from ogr.services.github import GithubProject
 from ogr.services.gitlab import GitlabProject
 from packit.config import (
     JobConfig,
+    JobConfigTriggerType,
     JobType,
 )
-from packit.config import JobConfigTriggerType
 from packit.config.package_config import PackageConfig
+
+from packit_service import sentry_integration
 from packit_service.constants import (
     COPR_API_SUCC_STATE,
     COPR_SRPM_CHROOT,
 )
 from packit_service.models import (
-    CoprBuildTargetModel,
     BuildStatus,
+    CoprBuildTargetModel,
+    ProjectEventModelType,
 )
 from packit_service.service.urls import get_copr_build_info_url, get_srpm_build_info_url
 from packit_service.utils import (
     dump_job_config,
     dump_package_config,
     elapsed_seconds,
+    pr_labels_match_configuration,
 )
 from packit_service.worker.checker.abstract import Checker
 from packit_service.worker.checker.copr import (
-    CanActorRunTestsJob,
     AreOwnerAndProjectMatchingJob,
-    IsGitForgeProjectAndEventOk,
     BuildNotAlreadyStarted,
+    CanActorRunTestsJob,
+    IsGitForgeProjectAndEventOk,
     IsJobConfigTriggerMatching,
     IsPackageMatchingJobView,
 )
 from packit_service.worker.events import (
+    AbstractPRCommentEvent,
+    CheckRerunCommitEvent,
+    CheckRerunPullRequestEvent,
+    CheckRerunReleaseEvent,
     CoprBuildEndEvent,
     CoprBuildStartEvent,
     MergeRequestGitlabEvent,
@@ -46,26 +53,25 @@ from packit_service.worker.events import (
     PushGitHubEvent,
     PushGitlabEvent,
     ReleaseEvent,
-    CheckRerunCommitEvent,
-    CheckRerunPullRequestEvent,
-    CheckRerunReleaseEvent,
-    AbstractPRCommentEvent,
     ReleaseGitlabEvent,
 )
+from packit_service.worker.events.comment import CommitCommentEvent
 from packit_service.worker.handlers.abstract import (
     JobHandler,
+    RetriableJobHandler,
     TaskName,
     configured_as,
     reacts_to,
-    run_for_comment,
     run_for_check_rerun,
-    RetriableJobHandler,
+    run_for_comment,
 )
 from packit_service.worker.handlers.mixin import (
+    ConfigFromEventMixin,
     GetCoprBuildEventMixin,
     GetCoprBuildJobHelperForIdMixin,
     GetCoprBuildJobHelperMixin,
 )
+from packit_service.worker.helpers.open_scan_hub import OpenScanHubHelper
 from packit_service.worker.mixin import PackitAPIWithDownstreamMixin
 from packit_service.worker.reporting import BaseCommitStatus, DuplicateCheckMode
 from packit_service.worker.result import TaskResults
@@ -74,7 +80,6 @@ logger = logging.getLogger(__name__)
 
 
 @configured_as(job_type=JobType.copr_build)
-@configured_as(job_type=JobType.build)
 @run_for_comment(command="build")
 @run_for_comment(command="copr-build")
 @run_for_comment(command="rebuild-failed")
@@ -89,8 +94,12 @@ logger = logging.getLogger(__name__)
 @reacts_to(CheckRerunPullRequestEvent)
 @reacts_to(CheckRerunCommitEvent)
 @reacts_to(CheckRerunReleaseEvent)
+@reacts_to(CommitCommentEvent)
 class CoprBuildHandler(
-    RetriableJobHandler, PackitAPIWithDownstreamMixin, GetCoprBuildJobHelperMixin
+    RetriableJobHandler,
+    ConfigFromEventMixin,
+    PackitAPIWithDownstreamMixin,
+    GetCoprBuildJobHelperMixin,
 ):
     task_name = TaskName.copr_build
 
@@ -111,7 +120,7 @@ class CoprBuildHandler(
         self._copr_build_group_id = copr_build_group_id
 
     @staticmethod
-    def get_checkers() -> Tuple[Type[Checker], ...]:
+    def get_checkers() -> tuple[type[Checker], ...]:
         return (
             IsJobConfigTriggerMatching,
             IsGitForgeProjectAndEventOk,
@@ -129,20 +138,20 @@ class AbstractCoprBuildReportHandler(
     GetCoprBuildEventMixin,
 ):
     @staticmethod
-    def get_checkers() -> Tuple[Type[Checker], ...]:
+    def get_checkers() -> tuple[type[Checker], ...]:
         return (AreOwnerAndProjectMatchingJob, IsPackageMatchingJobView)
 
 
 @configured_as(job_type=JobType.copr_build)
-@configured_as(job_type=JobType.build)
 @reacts_to(event=CoprBuildStartEvent)
 class CoprBuildStartHandler(AbstractCoprBuildReportHandler):
     topic = "org.fedoraproject.prod.copr.build.start"
     task_name = TaskName.copr_build_start
 
     @staticmethod
-    def get_checkers() -> Tuple[Type[Checker], ...]:
-        return super(CoprBuildStartHandler, CoprBuildStartHandler).get_checkers() + (
+    def get_checkers() -> tuple[type[Checker], ...]:
+        return (
+            *super(CoprBuildStartHandler, CoprBuildStartHandler).get_checkers(),
             BuildNotAlreadyStarted,
         )
 
@@ -160,26 +169,35 @@ class CoprBuildStartHandler(AbstractCoprBuildReportHandler):
 
     def run(self):
         if not self.build:
-            model = (
-                "SRPMBuildDB"
-                if self.copr_event.chroot == COPR_SRPM_CHROOT
-                else "CoprBuildDB"
-            )
+            model = "SRPMBuildDB" if self.copr_event.chroot == COPR_SRPM_CHROOT else "CoprBuildDB"
             msg = f"Copr build {self.copr_event.build_id} not in {model}."
             logger.warning(msg)
             return TaskResults(success=False, details={"msg": msg})
 
         if self.build.build_start_time is not None:
-            logger.debug(
-                f"Copr build start for {self.copr_event.build_id} is already"
-                f" processed."
+            msg = f"Copr build start for {self.copr_event.build_id} is already" f" processed."
+            logger.debug(msg)
+            return TaskResults(success=True, details={"msg": msg})
+
+        if BuildStatus.is_final_state(self.build.status):
+            msg = (
+                "Copr build start is being processed, but the DB build "
+                "is already in the final state, setting only start time."
             )
+            logger.debug(msg)
+            self.set_start_time()
+            return TaskResults(success=True, details={"msg": msg})
 
         self.set_logs_url()
 
         if self.copr_event.chroot == COPR_SRPM_CHROOT:
             url = get_srpm_build_info_url(self.build.id)
-            self.copr_build_helper.report_status_to_all(
+            report_status = (
+                self.copr_build_helper.report_status_to_all
+                if self.job_config.sync_test_job_statuses_with_builds
+                else self.copr_build_helper.report_status_to_build
+            )
+            report_status(
                 description="SRPM build is in progress...",
                 state=BaseCommitStatus.running,
                 url=url,
@@ -192,7 +210,12 @@ class CoprBuildStartHandler(AbstractCoprBuildReportHandler):
         url = get_copr_build_info_url(self.build.id)
         self.build.set_status(BuildStatus.pending)
 
-        self.copr_build_helper.report_status_to_all_for_chroot(
+        report_status_for_chroot = (
+            self.copr_build_helper.report_status_to_all_for_chroot
+            if self.job_config.sync_test_job_statuses_with_builds
+            else self.copr_build_helper.report_status_to_build_for_chroot
+        )
+        report_status_for_chroot(
             description="RPM build is in progress...",
             state=BaseCommitStatus.running,
             url=url,
@@ -204,7 +227,6 @@ class CoprBuildStartHandler(AbstractCoprBuildReportHandler):
 
 
 @configured_as(job_type=JobType.copr_build)
-@configured_as(job_type=JobType.build)
 @reacts_to(event=CoprBuildEndEvent)
 class CoprBuildEndHandler(AbstractCoprBuildReportHandler):
     topic = "org.fedoraproject.prod.copr.build.end"
@@ -223,7 +245,7 @@ class CoprBuildEndHandler(AbstractCoprBuildReportHandler):
             return
 
         srpm_url = self.copr_build_helper.get_build(
-            self.copr_event.build_id
+            self.copr_event.build_id,
         ).source_package.get("url")
 
         if srpm_url is not None:
@@ -240,7 +262,8 @@ class CoprBuildEndHandler(AbstractCoprBuildReportHandler):
     def measure_time_after_reporting(self):
         reported_time = datetime.now(timezone.utc)
         build_ended_on = self.copr_build_helper.get_build_chroot(
-            int(self.build.build_id), self.build.target
+            int(self.build.build_id),
+            self.build.target,
         ).ended_on
 
         reported_after_time = elapsed_seconds(
@@ -248,7 +271,7 @@ class CoprBuildEndHandler(AbstractCoprBuildReportHandler):
             end=reported_time,
         )
         logger.debug(
-            f"Copr build end reported after {reported_after_time / 60} minutes."
+            f"Copr build end reported after {reported_after_time / 60} minutes.",
         )
 
         self.pushgateway.copr_build_end_reported_after_time.observe(reported_after_time)
@@ -259,18 +282,15 @@ class CoprBuildEndHandler(AbstractCoprBuildReportHandler):
             return
 
         built_packages = self.copr_build_helper.get_built_packages(
-            int(self.build.build_id), self.build.target
+            int(self.build.build_id),
+            self.build.target,
         )
         self.build.set_built_packages(built_packages)
 
     def run(self):
         if not self.build:
             # TODO: how could this happen?
-            model = (
-                "SRPMBuildDB"
-                if self.copr_event.chroot == COPR_SRPM_CHROOT
-                else "CoprBuildDB"
-            )
+            model = "SRPMBuildDB" if self.copr_event.chroot == COPR_SRPM_CHROOT else "CoprBuildDB"
             msg = f"Copr build {self.copr_event.build_id} not in {model}."
             logger.warning(msg)
             return TaskResults(success=False, details={"msg": msg})
@@ -297,7 +317,8 @@ class CoprBuildEndHandler(AbstractCoprBuildReportHandler):
         # if the build is needed only for test, it doesn't have the task_accepted_time
         if self.build.task_accepted_time:
             copr_build_time = elapsed_seconds(
-                begin=self.build.task_accepted_time, end=datetime.now(timezone.utc)
+                begin=self.build.task_accepted_time,
+                end=datetime.now(timezone.utc),
             )
             self.pushgateway.copr_build_finished_time.observe(copr_build_time)
 
@@ -305,18 +326,20 @@ class CoprBuildEndHandler(AbstractCoprBuildReportHandler):
         if self.copr_event.status != COPR_API_SUCC_STATE:
             failed_msg = "RPMs failed to be built."
             packit_dashboard_url = get_copr_build_info_url(self.build.id)
-            self.copr_build_helper.report_status_to_all_for_chroot(
-                state=BaseCommitStatus.failure,
-                description=failed_msg,
-                url=packit_dashboard_url,
-                chroot=self.copr_event.chroot,
-            )
-            self.measure_time_after_reporting()
-            self.copr_build_helper.notify_about_failure_if_configured(
-                packit_dashboard_url=packit_dashboard_url,
-                external_dashboard_url=self.build.web_url,
-                logs_url=self.build.build_logs_url,
-            )
+            # if SRPM build failed it has been reported already so skip reporting
+            if self.build.get_srpm_build().status != BuildStatus.failure:
+                self.copr_build_helper.report_status_to_all_for_chroot(
+                    state=BaseCommitStatus.failure,
+                    description=failed_msg,
+                    url=packit_dashboard_url,
+                    chroot=self.copr_event.chroot,
+                )
+                self.measure_time_after_reporting()
+                self.copr_build_helper.notify_about_failure_if_configured(
+                    packit_dashboard_url=packit_dashboard_url,
+                    external_dashboard_url=self.build.web_url,
+                    logs_url=self.build.build_logs_url,
+                )
             self.build.set_status(BuildStatus.failure)
             return TaskResults(success=False, details={"msg": failed_msg})
 
@@ -327,13 +350,30 @@ class CoprBuildEndHandler(AbstractCoprBuildReportHandler):
         self.build.set_status(BuildStatus.success)
         self.handle_testing_farm()
 
+        if (
+            not OpenScanHubHelper.osh_disabled()
+            and self.db_project_event.type == ProjectEventModelType.pull_request
+            and self.build.target == "fedora-rawhide-x86_64"
+            and self.job_config.osh_diff_scan_after_copr_build
+        ):
+            try:
+                OpenScanHubHelper(
+                    copr_build_helper=self.copr_build_helper,
+                    build=self.build,
+                ).handle_scan()
+            except Exception as ex:
+                sentry_integration.send_to_sentry(ex)
+                logger.debug(
+                    f"Handling the scan raised an exception: {ex}. Skipping "
+                    f"as this is only experimental functionality for now.",
+                )
+
         return TaskResults(success=True, details={})
 
     def report_successful_build(self):
         if (
             self.copr_build_helper.job_build
-            and self.copr_build_helper.job_build.trigger
-            == JobConfigTriggerType.pull_request
+            and self.copr_build_helper.job_build.trigger == JobConfigTriggerType.pull_request
             and self.copr_event.pr_id
             and isinstance(self.project, (GithubProject, GitlabProject))
             and self.job_config.notifications.pull_request.successful_build
@@ -348,7 +388,8 @@ class CoprBuildEndHandler(AbstractCoprBuildReportHandler):
                 "\nPlease note that the RPMs should be used only in a testing environment."
             )
             self.copr_build_helper.status_reporter.comment(
-                msg, duplicate_check=DuplicateCheckMode.check_last_comment
+                msg,
+                duplicate_check=DuplicateCheckMode.check_last_comment,
             )
 
         url = get_copr_build_info_url(self.build.id)
@@ -359,12 +400,13 @@ class CoprBuildEndHandler(AbstractCoprBuildReportHandler):
             url=url,
             chroot=self.copr_event.chroot,
         )
-        self.copr_build_helper.report_status_to_all_test_jobs_for_chroot(
-            state=BaseCommitStatus.pending,
-            description="RPMs were built successfully.",
-            url=url,
-            chroot=self.copr_event.chroot,
-        )
+        if self.job_config.sync_test_job_statuses_with_builds:
+            self.copr_build_helper.report_status_to_all_test_jobs_for_chroot(
+                state=BaseCommitStatus.pending,
+                description="RPMs were built successfully.",
+                url=url,
+                chroot=self.copr_event.chroot,
+            )
 
     def handle_srpm_end(self):
         url = get_srpm_build_info_url(self.build.id)
@@ -383,18 +425,24 @@ class CoprBuildEndHandler(AbstractCoprBuildReportHandler):
             )
             self.build.set_status(BuildStatus.failure)
             self.copr_build_helper.monitor_not_submitted_copr_builds(
-                len(self.copr_build_helper.build_targets), "srpm_failure"
+                len(self.copr_build_helper.build_targets),
+                "srpm_failure",
             )
             return TaskResults(success=False, details={"msg": failed_msg})
 
         for build in CoprBuildTargetModel.get_all_by_build_id(
-            str(self.copr_event.build_id)
+            str(self.copr_event.build_id),
         ):
             # from waiting_for_srpm to pending
             build.set_status(BuildStatus.pending)
 
         self.build.set_status(BuildStatus.success)
-        self.copr_build_helper.report_status_to_all(
+        report_status = (
+            self.copr_build_helper.report_status_to_all
+            if self.job_config.sync_test_job_statuses_with_builds
+            else self.copr_build_helper.report_status_to_build
+        )
+        report_status(
             state=BaseCommitStatus.running,
             description="SRPM build succeeded. Waiting for RPM build to start...",
             url=url,
@@ -404,29 +452,43 @@ class CoprBuildEndHandler(AbstractCoprBuildReportHandler):
         return TaskResults(success=True, details={"msg": msg})
 
     def handle_testing_farm(self):
-        if self.copr_build_helper.job_tests_all:
-            event_dict = self.data.get_dict()
-
-            for job_config in self.copr_build_helper.job_tests_all:
-                if (
-                    not job_config.skip_build
-                    and not job_config.manual_trigger
-                    and self.copr_event.chroot
-                    in self.copr_build_helper.build_targets_for_test_job(job_config)
-                ):
-                    event_dict["tests_targets_override"] = list(
-                        self.copr_build_helper.build_target2test_targets_for_test_job(
-                            self.copr_event.chroot, job_config
-                        )
-                    )
-                    signature(
-                        TaskName.testing_farm.value,
-                        kwargs={
-                            "package_config": dump_package_config(self.package_config),
-                            "job_config": dump_job_config(job_config),
-                            "event": event_dict,
-                            "build_id": self.build.id,
-                        },
-                    ).apply_async()
-        else:
+        if not self.copr_build_helper.job_tests_all:
             logger.debug("Testing farm not in the job config.")
+            return
+
+        event_dict = self.data.get_dict()
+
+        for job_config in self.copr_build_helper.job_tests_all:
+            if (
+                not job_config.skip_build
+                and not job_config.manual_trigger
+                # we need to check the labels here
+                # the same way as when scheduling jobs for event
+                and (
+                    job_config.trigger != JobConfigTriggerType.pull_request
+                    or not (job_config.require.label.present or job_config.require.label.absent)
+                    or pr_labels_match_configuration(
+                        pull_request=self.copr_build_helper.pull_request_object,
+                        configured_labels_absent=job_config.require.label.absent,
+                        configured_labels_present=job_config.require.label.present,
+                    )
+                )
+                and self.copr_event.chroot
+                in self.copr_build_helper.build_targets_for_test_job(job_config)
+            ):
+                event_dict["tests_targets_override"] = [
+                    (target, job_config.identifier)
+                    for target in self.copr_build_helper.build_target2test_targets_for_test_job(
+                        self.copr_event.chroot,
+                        job_config,
+                    )
+                ]
+                signature(
+                    TaskName.testing_farm.value,
+                    kwargs={
+                        "package_config": dump_package_config(self.package_config),
+                        "job_config": dump_job_config(job_config),
+                        "event": event_dict,
+                        "build_id": self.build.id,
+                    },
+                ).apply_async()

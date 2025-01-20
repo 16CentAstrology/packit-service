@@ -5,27 +5,29 @@ Revises: adbdc1c21d7e
 Create Date: 2020-08-05 18:14:20.277673
 
 """
-from alembic import op
-import sqlalchemy as sa
+
+import enum
 from datetime import datetime
+from typing import TYPE_CHECKING
+
+import sqlalchemy as sa
 from sqlalchemy import (
-    Column,
-    Integer,
-    String,
-    DateTime,
-    ForeignKey,
-    Enum,
-    orm,
-    Text,
     JSON,
     Boolean,
+    Column,
+    DateTime,
+    Enum,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
     desc,
+    orm,
 )
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Session, relationship
-from typing import TYPE_CHECKING
-import enum
 
+from alembic import op
 
 # revision identifiers, used by Alembic.
 revision = "726cb0f70c6d"
@@ -171,10 +173,7 @@ class SRPMBuildModel(Base):
 
     @classmethod
     def get_all(cls, session: Session):
-        srpm_builds = (
-            session.query(SRPMBuildModel).order_by(desc(SRPMBuildModel.id)).all()
-        )
-        return srpm_builds
+        return session.query(SRPMBuildModel).order_by(desc(SRPMBuildModel.id)).all()
 
     def __repr__(self):
         return f"SRPMBuildModel(id={self.id} trigger={self.job_trigger_id})"
@@ -184,10 +183,15 @@ def upgrade():
     # Start schema migration
 
     op.add_column(
-        "srpm_builds", sa.Column("job_trigger_id", sa.Integer(), nullable=True)
+        "srpm_builds",
+        sa.Column("job_trigger_id", sa.Integer(), nullable=True),
     )
     op.create_foreign_key(
-        None, "srpm_builds", "build_triggers", ["job_trigger_id"], ["id"]
+        None,
+        "srpm_builds",
+        "build_triggers",
+        ["job_trigger_id"],
+        ["id"],
     )
     # End schema migration
 

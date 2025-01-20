@@ -1,15 +1,8 @@
 # Copyright Contributors to the Packit project.
 # SPDX-License-Identifier: MIT
-from pathlib import Path
 
 import pytest
 from flexmock import flexmock
-
-from packit.config.notifications import (
-    NotificationsConfig,
-    FailureCommentNotificationsConfig,
-)
-from packit.copr_helper import CoprHelper
 from packit.config import (
     CommonPackageConfig,
     JobConfig,
@@ -18,8 +11,14 @@ from packit.config import (
     PackageConfig,
 )
 from packit.config.aliases import get_build_targets
+from packit.config.notifications import (
+    FailureCommentNotificationsConfig,
+    NotificationsConfig,
+)
+from packit.copr_helper import CoprHelper
 from packit.local_project import LocalProject
 from packit.utils.repo import RepositoryCache
+
 from packit_service.config import ServiceConfig
 from packit_service.models import ProjectEventModelType
 from packit_service.worker.helpers.build.copr_build import CoprBuildJobHelper
@@ -27,7 +26,7 @@ from packit_service.worker.helpers.build.koji_build import KojiBuildJobHelper
 
 # packit.config.aliases.get_aliases() return value example
 from packit_service.worker.helpers.testing_farm import TestingFarmJobHelper
-from packit_service.worker.reporting import StatusReporter, DuplicateCheckMode
+from packit_service.worker.reporting import DuplicateCheckMode, StatusReporter
 
 ALIASES = {
     "fedora-development": ["fedora-33", "fedora-rawhide"],
@@ -38,9 +37,9 @@ ALIASES = {
 
 STABLE_VERSIONS = ALIASES["fedora-stable"]
 STABLE_CHROOTS = {f"{version}-x86_64" for version in STABLE_VERSIONS}
-ONE_CHROOT_SET = {list(STABLE_CHROOTS)[0]}
+ONE_CHROOT_SET = {next(iter(STABLE_CHROOTS))}
 STABLE_KOJI_TARGETS = {f"f{version[-2:]}" for version in STABLE_VERSIONS}
-ONE_KOJI_TARGET_SET = {list(STABLE_KOJI_TARGETS)[0]}
+ONE_KOJI_TARGET_SET = {next(iter(STABLE_KOJI_TARGETS))}
 
 
 def _mock_targets(jobs, job, job_type):
@@ -57,7 +56,8 @@ def _mock_targets(jobs, job, job_type):
     return CoprBuildJobHelper(
         service_config=ServiceConfig.get_service_config(),
         package_config=PackageConfig(
-            jobs=jobs, packages={"package": CommonPackageConfig()}
+            jobs=jobs,
+            packages={"package": CommonPackageConfig()},
         ),
         job_config=job,  # BuildHelper looks at all jobs in the end
         project=flexmock(
@@ -85,9 +85,9 @@ def _mock_targets(jobs, job, job_type):
                     packages={
                         "package": CommonPackageConfig(
                             _targets=STABLE_VERSIONS,
-                        )
+                        ),
                     },
-                )
+                ),
             ],
             (JobConfigTriggerType.pull_request, ProjectEventModelType.pull_request),
             set(STABLE_VERSIONS),
@@ -101,9 +101,9 @@ def _mock_targets(jobs, job, job_type):
                     packages={
                         "package": CommonPackageConfig(
                             _targets=STABLE_VERSIONS,
-                        )
+                        ),
                     },
-                )
+                ),
             ],
             (JobConfigTriggerType.pull_request, ProjectEventModelType.pull_request),
             set(STABLE_VERSIONS),
@@ -117,9 +117,9 @@ def _mock_targets(jobs, job, job_type):
                     packages={
                         "package": CommonPackageConfig(
                             _targets=STABLE_VERSIONS,
-                        )
+                        ),
                     },
-                )
+                ),
             ],
             (JobConfigTriggerType.release, ProjectEventModelType.release),
             set(STABLE_VERSIONS),
@@ -133,9 +133,9 @@ def _mock_targets(jobs, job, job_type):
                     packages={
                         "package": CommonPackageConfig(
                             _targets=STABLE_VERSIONS,
-                        )
+                        ),
                     },
-                )
+                ),
             ],
             (JobConfigTriggerType.commit, ProjectEventModelType.branch_push),
             set(STABLE_VERSIONS),
@@ -158,7 +158,7 @@ def _mock_targets(jobs, job, job_type):
                     packages={
                         "package": CommonPackageConfig(
                             _targets=["different", "os", "target"],
-                        )
+                        ),
                     },
                 ),
             ],
@@ -174,7 +174,7 @@ def _mock_targets(jobs, job, job_type):
                     packages={
                         "package": CommonPackageConfig(
                             _targets=STABLE_VERSIONS,
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
@@ -183,7 +183,7 @@ def _mock_targets(jobs, job, job_type):
                     packages={
                         "package": CommonPackageConfig(
                             _targets=["different", "os", "target"],
-                        )
+                        ),
                     },
                 ),
             ],
@@ -199,7 +199,7 @@ def _mock_targets(jobs, job, job_type):
                     packages={
                         "package": CommonPackageConfig(
                             _targets=["different", "os", "target"],
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
@@ -222,7 +222,7 @@ def _mock_targets(jobs, job, job_type):
                     type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"packages": CommonPackageConfig()},
-                )
+                ),
             ],
             (JobConfigTriggerType.pull_request, ProjectEventModelType.pull_request),
             {"fedora-stable"},
@@ -234,7 +234,7 @@ def _mock_targets(jobs, job, job_type):
                     type=JobType.tests,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"packages": CommonPackageConfig()},
-                )
+                ),
             ],
             (JobConfigTriggerType.pull_request, ProjectEventModelType.pull_request),
             {"fedora-stable"},
@@ -248,9 +248,9 @@ def _mock_targets(jobs, job, job_type):
                     packages={
                         "package": CommonPackageConfig(
                             _targets=STABLE_VERSIONS,
-                        )
+                        ),
                     },
-                )
+                ),
             ],
             (JobConfigTriggerType.pull_request, ProjectEventModelType.pull_request),
             set(STABLE_VERSIONS),
@@ -281,7 +281,7 @@ def _mock_targets(jobs, job, job_type):
                     packages={
                         "package": CommonPackageConfig(
                             _targets=STABLE_VERSIONS,
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
@@ -307,7 +307,7 @@ def _mock_targets(jobs, job, job_type):
                     packages={
                         "package": CommonPackageConfig(
                             _targets=STABLE_VERSIONS,
-                        )
+                        ),
                     },
                 ),
             ],
@@ -328,7 +328,7 @@ def _mock_targets(jobs, job, job_type):
                     packages={
                         "package": CommonPackageConfig(
                             _targets=list(ONE_CHROOT_SET),
-                        )
+                        ),
                     },
                 ),
             ],
@@ -454,7 +454,7 @@ def _mock_targets(jobs, job, job_type):
         pytest.param(
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"packages": CommonPackageConfig()},
                 ),
@@ -464,7 +464,7 @@ def _mock_targets(jobs, job, job_type):
                     packages={
                         "package": CommonPackageConfig(
                             _targets=list(ONE_CHROOT_SET),
-                        )
+                        ),
                     },
                 ),
             ],
@@ -475,12 +475,12 @@ def _mock_targets(jobs, job, job_type):
         pytest.param(
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={
                         "package": CommonPackageConfig(
                             _targets=STABLE_VERSIONS,
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
@@ -489,12 +489,12 @@ def _mock_targets(jobs, job, job_type):
                     packages={
                         "package": CommonPackageConfig(
                             _targets=["fedora-rawhide"],
-                        )
+                        ),
                     },
                 ),
             ],
             (JobConfigTriggerType.pull_request, ProjectEventModelType.pull_request),
-            set(STABLE_VERSIONS + ["fedora-rawhide"]),
+            {*STABLE_VERSIONS, "fedora-rawhide"},
             id="build_with_mixed_build_tests",
         ),
     ],
@@ -517,7 +517,7 @@ def test_configured_build_targets(jobs, job_type, build_chroots):
                     type=JobType.tests,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
-                )
+                ),
             ],
             (JobConfigTriggerType.pull_request, ProjectEventModelType.pull_request),
             {"fedora-stable"},
@@ -531,9 +531,9 @@ def test_configured_build_targets(jobs, job_type, build_chroots):
                     packages={
                         "package": CommonPackageConfig(
                             _targets=STABLE_VERSIONS,
-                        )
+                        ),
                     },
-                )
+                ),
             ],
             (JobConfigTriggerType.pull_request, ProjectEventModelType.pull_request),
             set(STABLE_VERSIONS),
@@ -564,7 +564,7 @@ def test_configured_build_targets(jobs, job_type, build_chroots):
                     packages={
                         "package": CommonPackageConfig(
                             _targets=STABLE_VERSIONS,
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
@@ -590,7 +590,7 @@ def test_configured_build_targets(jobs, job_type, build_chroots):
                     packages={
                         "package": CommonPackageConfig(
                             _targets=STABLE_VERSIONS,
-                        )
+                        ),
                     },
                 ),
             ],
@@ -611,7 +611,7 @@ def test_configured_build_targets(jobs, job_type, build_chroots):
                     packages={
                         "package": CommonPackageConfig(
                             _targets=list(ONE_CHROOT_SET),
-                        )
+                        ),
                     },
                 ),
             ],
@@ -737,7 +737,7 @@ def test_configured_build_targets(jobs, job_type, build_chroots):
         pytest.param(
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
@@ -747,7 +747,7 @@ def test_configured_build_targets(jobs, job_type, build_chroots):
                     packages={
                         "package": CommonPackageConfig(
                             _targets=list(ONE_CHROOT_SET),
-                        )
+                        ),
                     },
                 ),
             ],
@@ -758,12 +758,12 @@ def test_configured_build_targets(jobs, job_type, build_chroots):
         pytest.param(
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={
                         "package": CommonPackageConfig(
                             _targets=STABLE_VERSIONS,
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
@@ -772,7 +772,7 @@ def test_configured_build_targets(jobs, job_type, build_chroots):
                     packages={
                         "package": CommonPackageConfig(
                             _targets=["fedora-rawhide"],
-                        )
+                        ),
                     },
                 ),
             ],
@@ -789,10 +789,7 @@ def test_configured_tests_targets(jobs, job_type, test_chroots):
         project_event_model_type=project_event_model_type,
     )
     db_project_event = (
-        flexmock()
-        .should_receive("get_project_event_object")
-        .and_return(db_project_object)
-        .mock()
+        flexmock().should_receive("get_project_event_object").and_return(db_project_object).mock()
     )
     if job_config_trigger_type == JobConfigTriggerType.commit:
         db_project_object.name = "main"
@@ -801,7 +798,8 @@ def test_configured_tests_targets(jobs, job_type, test_chroots):
     helper = TestingFarmJobHelper(
         service_config=ServiceConfig.get_service_config(),
         package_config=PackageConfig(
-            jobs=jobs, packages={"package": CommonPackageConfig()}
+            jobs=jobs,
+            packages={"package": CommonPackageConfig()},
         ),
         job_config=jobs[-1],  # test job is always the last in the list
         project=flexmock(
@@ -829,7 +827,7 @@ def test_deduced_copr_targets():
                 "package": CommonPackageConfig(
                     owner="mf",
                     project="custom-copr-targets",
-                )
+                ),
             },
         ),
         JobConfig(
@@ -862,7 +860,8 @@ def test_deduced_copr_targets():
     assert TestingFarmJobHelper(
         service_config=ServiceConfig.get_service_config(),
         package_config=PackageConfig(
-            jobs=jobs, packages={"package": CommonPackageConfig()}
+            jobs=jobs,
+            packages={"package": CommonPackageConfig()},
         ),
         job_config=jobs[-1],  # BuildHelper looks at all jobs in the end
         project=flexmock(
@@ -879,7 +878,7 @@ def test_deduced_copr_targets():
                 job_config_trigger_type=job_type[0],
                 project_event_model_type=job_type[1],
                 name="main",
-            )
+            ),
         )
         .mock(),
     ).configured_tests_targets == {"opensuse-tumbleweed-x86_64"}
@@ -887,7 +886,7 @@ def test_deduced_copr_targets():
 
 @pytest.mark.parametrize(
     "jobs,job_config_trigger_type,build_targets_override,"
-    "tests_targets_override,build_targets",
+    "tests_targets_override,build_targets,build_targets_for_job,tests_targets_for_job",
     [
         pytest.param(
             [
@@ -897,7 +896,7 @@ def test_deduced_copr_targets():
                     packages={
                         "package": CommonPackageConfig(
                             _targets=STABLE_VERSIONS,
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
@@ -907,9 +906,11 @@ def test_deduced_copr_targets():
                 ),
             ],
             JobConfigTriggerType.pull_request,
-            {"fedora-32-x86_64"},
+            {("fedora-32-x86_64", None)},
             None,
             {"fedora-32-x86_64"},
+            [{"fedora-32-x86_64"}],
+            [{"fedora-32-x86_64"}],
             id="target_in_config_for_both",
         ),
         pytest.param(
@@ -920,14 +921,16 @@ def test_deduced_copr_targets():
                     packages={
                         "package": CommonPackageConfig(
                             _targets=STABLE_VERSIONS,
-                        )
+                        ),
                     },
-                )
+                ),
             ],
             JobConfigTriggerType.pull_request,
-            {"fedora-32-x86_64"},
+            {("fedora-32-x86_64", None)},
             None,
             {"fedora-32-x86_64"},
+            [{"fedora-32-x86_64"}],
+            None,
             id="target_in_config",
         ),
         pytest.param(
@@ -938,14 +941,16 @@ def test_deduced_copr_targets():
                     packages={
                         "package": CommonPackageConfig(
                             _targets=STABLE_VERSIONS,
-                        )
+                        ),
                     },
-                )
+                ),
             ],
             JobConfigTriggerType.pull_request,
-            {"fedora-33-x86_64"},
+            {("fedora-33-x86_64", None)},
             None,
             set(),
+            [set()],
+            None,
             id="target_not_in_config",
         ),
         pytest.param(
@@ -956,16 +961,18 @@ def test_deduced_copr_targets():
                     packages={
                         "package": CommonPackageConfig(
                             _targets={
-                                "epel-7-x86_64": {"distros": ["centos-7", "rhel-7"]}
+                                "epel-7-x86_64": {"distros": ["centos-7", "rhel-7"]},
                             },
-                        )
+                        ),
                     },
-                )
+                ),
             ],
             JobConfigTriggerType.pull_request,
             None,
-            {"centos-7-x86_64"},
+            {("centos-7-x86_64", None)},
             {"epel-7-x86_64"},
+            None,
+            [{"centos-7-x86_64"}],
             id="build_test_mapping_test_overrides",
         ),
         pytest.param(
@@ -976,16 +983,18 @@ def test_deduced_copr_targets():
                     packages={
                         "package": CommonPackageConfig(
                             _targets={
-                                "epel-7-x86_64": {"distros": ["centos-7", "rhel-7"]}
+                                "epel-7-x86_64": {"distros": ["centos-7", "rhel-7"]},
                             },
-                        )
+                        ),
                     },
-                )
+                ),
             ],
             JobConfigTriggerType.pull_request,
-            {"epel-7-x86_64"},
+            {("epel-7-x86_64", None)},
             None,
             {"epel-7-x86_64"},
+            None,
+            [{"centos-7-x86_64", "rhel-7-x86_64"}],
             id="build_test_mapping_build_overrides",
         ),
         pytest.param(
@@ -996,25 +1005,27 @@ def test_deduced_copr_targets():
                     packages={
                         "package": CommonPackageConfig(
                             _targets=["centos-stream-8"],
-                        )
+                        ),
                     },
-                )
+                ),
             ],
             JobConfigTriggerType.pull_request,
             None,
+            {("centos-stream-8-x86_64", None)},
             {"centos-stream-8-x86_64"},
-            {"centos-stream-8-x86_64"},
+            None,
+            [{"centos-stream-8-x86_64"}],
             id="targets_in_tests_no_mapping",
         ),
         pytest.param(
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={
                         "package": CommonPackageConfig(
                             _targets=["centos-stream-8"],
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
@@ -1025,8 +1036,10 @@ def test_deduced_copr_targets():
             ],
             JobConfigTriggerType.pull_request,
             None,
+            {("centos-stream-8-x86_64", None)},
             {"centos-stream-8-x86_64"},
-            {"centos-stream-8-x86_64"},
+            [{"centos-stream-8-x86_64"}],
+            [{"centos-stream-8-x86_64"}],
             id="targets_in_build_no_mapping",
         ),
         pytest.param(
@@ -1037,14 +1050,16 @@ def test_deduced_copr_targets():
                     packages={
                         "package": CommonPackageConfig(
                             _targets=["epel-7-x86_64"],
-                        )
+                        ),
                     },
-                )
+                ),
             ],
             JobConfigTriggerType.pull_request,
-            {"epel-7-x86_64"},
+            {("epel-7-x86_64", None)},
             None,
             {"epel-7-x86_64"},
+            None,
+            [{"centos-7-x86_64"}],
             id="default_mapping_build_override",
         ),
         pytest.param(
@@ -1055,14 +1070,16 @@ def test_deduced_copr_targets():
                     packages={
                         "package": CommonPackageConfig(
                             _targets=["epel-7-x86_64"],
-                        )
+                        ),
                     },
-                )
+                ),
             ],
             JobConfigTriggerType.pull_request,
             None,
-            {"centos-7-x86_64"},
+            {("centos-7-x86_64", None)},
             {"epel-7-x86_64"},
+            None,
+            [{"centos-7-x86_64"}],
             id="default_mapping_test_override",
         ),
         pytest.param(
@@ -1073,14 +1090,16 @@ def test_deduced_copr_targets():
                     packages={
                         "package": CommonPackageConfig(
                             _targets=["epel-7-ppc64le"],
-                        )
+                        ),
                     },
-                )
+                ),
             ],
             JobConfigTriggerType.pull_request,
-            {"epel-7-ppc64le"},
+            {("epel-7-ppc64le", None)},
             None,
             {"epel-7-ppc64le"},
+            None,
+            [{"centos-7-ppc64le"}],
             id="default_mapping_build_override_different_arch",
         ),
         pytest.param(
@@ -1091,15 +1110,105 @@ def test_deduced_copr_targets():
                     packages={
                         "package": CommonPackageConfig(
                             _targets=["epel-7-ppc64le"],
-                        )
+                        ),
                     },
-                )
+                ),
             ],
             JobConfigTriggerType.pull_request,
             None,
-            {"centos-7-ppc64le"},
+            {("centos-7-ppc64le", None)},
             {"epel-7-ppc64le"},
+            None,
+            [{"centos-7-ppc64le"}],
             id="default_mapping_test_override_different_arch",
+        ),
+        pytest.param(
+            [
+                JobConfig(
+                    type=JobType.tests,
+                    trigger=JobConfigTriggerType.pull_request,
+                    packages={
+                        "package": CommonPackageConfig(
+                            _targets=["fedora-41-x86_64"], identifier="latest"
+                        ),
+                    },
+                ),
+                JobConfig(
+                    type=JobType.tests,
+                    trigger=JobConfigTriggerType.pull_request,
+                    packages={
+                        "package": CommonPackageConfig(
+                            _targets=["fedora-rawhide-x86_64"],
+                        ),
+                    },
+                ),
+            ],
+            JobConfigTriggerType.pull_request,
+            {("fedora-rawhide-x86_64", None)},
+            None,
+            {"fedora-rawhide-x86_64"},
+            None,
+            [{"fedora-rawhide-x86_64"}, set()],
+            id="rebuild_default_job_targets",
+        ),
+        pytest.param(
+            [
+                JobConfig(
+                    type=JobType.tests,
+                    trigger=JobConfigTriggerType.pull_request,
+                    packages={
+                        "package": CommonPackageConfig(
+                            _targets=["fedora-41-x86_64"], identifier="latest"
+                        ),
+                    },
+                ),
+                JobConfig(
+                    type=JobType.tests,
+                    trigger=JobConfigTriggerType.pull_request,
+                    packages={
+                        "package": CommonPackageConfig(
+                            _targets=["fedora-rawhide-x86_64"],
+                        ),
+                    },
+                ),
+            ],
+            JobConfigTriggerType.pull_request,
+            {("fedora-41-x86_64", "latest")},
+            None,
+            {"fedora-41-x86_64"},
+            None,
+            [set(), {"fedora-41-x86_64"}],
+            id="rebuild_latest_job_targets",
+        ),
+        pytest.param(
+            [
+                JobConfig(
+                    type=JobType.tests,
+                    trigger=JobConfigTriggerType.pull_request,
+                    packages={
+                        "package": CommonPackageConfig(
+                            _targets=["fedora-41-x86_64", "fedora-rawhide-x86_64"],
+                            identifier="latest",
+                        ),
+                    },
+                ),
+                JobConfig(
+                    type=JobType.tests,
+                    trigger=JobConfigTriggerType.pull_request,
+                    packages={
+                        "package": CommonPackageConfig(
+                            _targets=["fedora-rawhide-x86_64"],
+                        ),
+                    },
+                ),
+            ],
+            JobConfigTriggerType.pull_request,
+            {("fedora-41-x86_64", "latest")},
+            None,
+            {"fedora-41-x86_64"},
+            None,
+            [set(), {"fedora-41-x86_64"}],
+            id="rebuild_latest_job_targets_for_job_with_identifier",
         ),
     ],
 )
@@ -1109,11 +1218,14 @@ def test_build_targets_overrides(
     build_targets_override,
     tests_targets_override,
     build_targets,
+    build_targets_for_job,
+    tests_targets_for_job,
 ):
     copr_build_helper = CoprBuildJobHelper(
         service_config=ServiceConfig.get_service_config(),
         package_config=PackageConfig(
-            jobs=jobs, packages={"package": CommonPackageConfig()}
+            jobs=jobs,
+            packages={"package": CommonPackageConfig()},
         ),
         job_config=jobs[-1],  # BuildHelper looks at all jobs in the end
         project=flexmock(),
@@ -1126,29 +1238,58 @@ def test_build_targets_overrides(
         tests_targets_override=tests_targets_override,
     )
     flexmock(CoprHelper).should_receive("get_valid_build_targets").with_args(
-        "fedora-31", "fedora-32", default=None
+        "fedora-31",
+        "fedora-32",
+        default=None,
     ).and_return(STABLE_CHROOTS)
     flexmock(CoprHelper).should_receive("get_valid_build_targets").with_args(
-        "fedora-32", "fedora-31", default=None
+        "fedora-32",
+        "fedora-31",
+        default=None,
     ).and_return(STABLE_CHROOTS)
     flexmock(CoprHelper).should_receive("get_valid_build_targets").with_args(
-        default=None
+        default=None,
     ).and_return(set())
     flexmock(CoprHelper).should_receive("get_valid_build_targets").with_args(
-        "epel-7-x86_64", default=None
+        "epel-7-x86_64",
+        default=None,
     ).and_return({"epel-7-x86_64"})
     flexmock(CoprHelper).should_receive("get_valid_build_targets").with_args(
-        "epel-7-ppc64le", default=None
+        "epel-7-ppc64le",
+        default=None,
     ).and_return({"epel-7-ppc64le"})
     flexmock(CoprHelper).should_receive("get_valid_build_targets").with_args(
-        "centos-stream-8", default=None
+        "centos-stream-8",
+        default=None,
     ).and_return({"centos-stream-8-x86_64"})
+    flexmock(CoprHelper).should_receive("get_valid_build_targets").with_args(
+        "fedora-rawhide-x86_64",
+        "fedora-41-x86_64",
+        default=None,
+    ).and_return({"fedora-rawhide-x86_64", "fedora-41-x86_64"})
+    flexmock(CoprHelper).should_receive("get_valid_build_targets").with_args(
+        "fedora-41-x86_64",
+        default=None,
+    ).and_return({"fedora-41-x86_64"})
+    flexmock(CoprHelper).should_receive("get_valid_build_targets").with_args(
+        "fedora-rawhide-x86_64",
+        default=None,
+    ).and_return({"fedora-rawhide-x86_64"})
+    flexmock(CoprHelper).should_receive("get_valid_build_targets").with_args(
+        "fedora-41-x86_64",
+        "fedora-rawhide-x86_64",
+        default=None,
+    ).and_return({"fedora-rawhide-x86_64", "fedora-41-x86_64"})
+
     assert copr_build_helper.build_targets == build_targets
+    for job in [job for job in jobs if job.type == JobType.copr_build]:
+        assert copr_build_helper.build_targets_for_test_job(job) == build_targets_for_job.pop()
+    for job in [job for job in jobs if job.type == JobType.tests]:
+        assert copr_build_helper.tests_targets_for_test_job(job) == tests_targets_for_job.pop()
 
 
 @pytest.mark.parametrize(
-    "jobs,job_config_trigger_type,build_targets_override,"
-    "tests_targets_override,test_targets",
+    "jobs,job_config_trigger_type,build_targets_override," "tests_targets_override,test_targets",
     [
         pytest.param(
             [
@@ -1158,7 +1299,7 @@ def test_build_targets_overrides(
                     packages={
                         "package": CommonPackageConfig(
                             _targets=STABLE_VERSIONS,
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
@@ -1168,7 +1309,7 @@ def test_build_targets_overrides(
                 ),
             ],
             JobConfigTriggerType.pull_request,
-            {"fedora-32-x86_64"},
+            {("fedora-32-x86_64", None)},
             None,
             {"fedora-32-x86_64"},
             id="target_in_config_for_both",
@@ -1181,15 +1322,15 @@ def test_build_targets_overrides(
                     packages={
                         "package": CommonPackageConfig(
                             _targets={
-                                "epel-7-x86_64": {"distros": ["centos-7", "rhel-7"]}
+                                "epel-7-x86_64": {"distros": ["centos-7", "rhel-7"]},
                             },
-                        )
+                        ),
                     },
-                )
+                ),
             ],
             JobConfigTriggerType.pull_request,
             None,
-            {"centos-7-x86_64"},
+            {("centos-7-x86_64", None)},
             {"centos-7-x86_64"},
             id="build_test_mapping_test_overrides",
         ),
@@ -1201,14 +1342,14 @@ def test_build_targets_overrides(
                     packages={
                         "package": CommonPackageConfig(
                             _targets={
-                                "epel-7-x86_64": {"distros": ["centos-7", "rhel-7"]}
+                                "epel-7-x86_64": {"distros": ["centos-7", "rhel-7"]},
                             },
-                        )
+                        ),
                     },
-                )
+                ),
             ],
             JobConfigTriggerType.pull_request,
-            {"epel-7-x86_64"},
+            {("epel-7-x86_64", None)},
             None,
             {"centos-7-x86_64", "rhel-7-x86_64"},
             id="build_test_mapping_build_overrides",
@@ -1221,25 +1362,25 @@ def test_build_targets_overrides(
                     packages={
                         "package": CommonPackageConfig(
                             _targets=["centos-stream-8"],
-                        )
+                        ),
                     },
-                )
+                ),
             ],
             JobConfigTriggerType.pull_request,
             None,
-            {"centos-stream-8-x86_64"},
+            {("centos-stream-8-x86_64", None)},
             {"centos-stream-8-x86_64"},
             id="targets_in_tests_no_mapping",
         ),
         pytest.param(
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={
                         "package": CommonPackageConfig(
                             _targets=["centos-stream-8"],
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
@@ -1250,7 +1391,7 @@ def test_build_targets_overrides(
             ],
             JobConfigTriggerType.pull_request,
             None,
-            {"centos-stream-8-x86_64"},
+            {("centos-stream-8-x86_64", None)},
             {"centos-stream-8-x86_64"},
             id="targets_in_build_no_mapping",
         ),
@@ -1262,12 +1403,12 @@ def test_build_targets_overrides(
                     packages={
                         "package": CommonPackageConfig(
                             _targets=["epel-7-x86_64"],
-                        )
+                        ),
                     },
-                )
+                ),
             ],
             JobConfigTriggerType.pull_request,
-            {"epel-7-x86_64"},
+            {("epel-7-x86_64", None)},
             None,
             {"centos-7-x86_64"},
             id="default_mapping_build_override",
@@ -1280,13 +1421,13 @@ def test_build_targets_overrides(
                     packages={
                         "package": CommonPackageConfig(
                             _targets=["epel-7-x86_64"],
-                        )
+                        ),
                     },
-                )
+                ),
             ],
             JobConfigTriggerType.pull_request,
             None,
-            {"centos-7-x86_64"},
+            {("centos-7-x86_64", None)},
             {"centos-7-x86_64"},
             id="default_mapping_test_override",
         ),
@@ -1298,12 +1439,12 @@ def test_build_targets_overrides(
                     packages={
                         "package": CommonPackageConfig(
                             _targets=["epel-7-ppc64le"],
-                        )
+                        ),
                     },
-                )
+                ),
             ],
             JobConfigTriggerType.pull_request,
-            {"epel-7-ppc64le"},
+            {("epel-7-ppc64le", None)},
             None,
             {"centos-7-ppc64le"},
             id="default_mapping_build_override_different_arch",
@@ -1316,13 +1457,13 @@ def test_build_targets_overrides(
                     packages={
                         "package": CommonPackageConfig(
                             _targets=["epel-7-ppc64le"],
-                        )
+                        ),
                     },
-                )
+                ),
             ],
             JobConfigTriggerType.pull_request,
             None,
-            {"centos-7-ppc64le"},
+            {("centos-7-ppc64le", None)},
             {"centos-7-ppc64le"},
             id="default_mapping_test_override_different_arch",
         ),
@@ -1334,12 +1475,12 @@ def test_build_targets_overrides(
                     packages={
                         "package": CommonPackageConfig(
                             _targets=["epel-7-x86_64"],
-                        )
+                        ),
                     },
-                )
+                ),
             ],
             JobConfigTriggerType.pull_request,
-            {"fedora-rawhide-x86_64"},
+            {("fedora-rawhide-x86_64", None)},
             None,
             set(),
             id="build-target-not-in-test",
@@ -1356,7 +1497,8 @@ def test_tests_targets_overrides(
     testing_farm_helper = TestingFarmJobHelper(
         service_config=ServiceConfig.get_service_config(),
         package_config=PackageConfig(
-            jobs=jobs, packages={"package": CommonPackageConfig()}
+            jobs=jobs,
+            packages={"package": CommonPackageConfig()},
         ),
         job_config=jobs[-1],  # BuildHelper looks at all jobs in the end
         project=flexmock(),
@@ -1369,22 +1511,29 @@ def test_tests_targets_overrides(
         tests_targets_override=tests_targets_override,
     )
     flexmock(CoprHelper).should_receive("get_valid_build_targets").with_args(
-        "fedora-31", "fedora-32", default=None
+        "fedora-31",
+        "fedora-32",
+        default=None,
     ).and_return(STABLE_CHROOTS)
     flexmock(CoprHelper).should_receive("get_valid_build_targets").with_args(
-        "fedora-32", "fedora-31", default=None
+        "fedora-32",
+        "fedora-31",
+        default=None,
     ).and_return(STABLE_CHROOTS)
     flexmock(CoprHelper).should_receive("get_valid_build_targets").with_args(
-        default=None
+        default=None,
     ).and_return(set())
     flexmock(CoprHelper).should_receive("get_valid_build_targets").with_args(
-        "epel-7-x86_64", default=None
+        "epel-7-x86_64",
+        default=None,
     ).and_return({"epel-7-x86_64"})
     flexmock(CoprHelper).should_receive("get_valid_build_targets").with_args(
-        "epel-7-ppc64le", default=None
+        "epel-7-ppc64le",
+        default=None,
     ).and_return({"epel-7-ppc64le"})
     flexmock(CoprHelper).should_receive("get_valid_build_targets").with_args(
-        "centos-stream-8", default=None
+        "centos-stream-8",
+        default=None,
     ).and_return({"centos-stream-8-x86_64"})
     assert testing_farm_helper.tests_targets == test_targets
 
@@ -1444,7 +1593,10 @@ def test_tests_targets_overrides(
     ],
 )
 def test_copr_build_target2test_targets(
-    configured_targets, use_internal_tf, build_target, test_targets
+    configured_targets,
+    use_internal_tf,
+    build_target,
+    test_targets,
 ):
     jobs = [
         JobConfig(
@@ -1454,14 +1606,15 @@ def test_copr_build_target2test_targets(
                 "package": CommonPackageConfig(
                     _targets=configured_targets,
                     use_internal_tf=use_internal_tf,
-                )
+                ),
             },
-        )
+        ),
     ]
     copr_build_helper = CoprBuildJobHelper(
         service_config=ServiceConfig.get_service_config(),
         package_config=PackageConfig(
-            jobs=jobs, packages={"package": CommonPackageConfig()}
+            jobs=jobs,
+            packages={"package": CommonPackageConfig()},
         ),
         job_config=jobs[0],
         project=flexmock(),
@@ -1489,7 +1642,7 @@ def test_copr_build_and_test_targets_both_jobs_defined():
                         "epel-8-x86_64": {},
                         "fedora-35-x86_64": {"distros": ["fedora-35", "fedora-36"]},
                     },
-                )
+                ),
             },
         ),
         JobConfig(
@@ -1498,21 +1651,18 @@ def test_copr_build_and_test_targets_both_jobs_defined():
             packages={
                 "package": CommonPackageConfig(
                     _targets=["fedora-35", "fedora-36", "epel-8"],
-                )
+                ),
             },
         ),
     ]
     flexmock(CoprHelper, get_valid_build_targets=get_build_targets)
     for i in [0, 1]:
-        helper = (
-            CoprBuildJobHelper
-            if jobs[i].type == JobType.copr_build
-            else TestingFarmJobHelper
-        )
+        helper = CoprBuildJobHelper if jobs[i].type == JobType.copr_build else TestingFarmJobHelper
         helper = helper(
             service_config=ServiceConfig.get_service_config(),
             package_config=PackageConfig(
-                jobs=jobs, packages={"package": CommonPackageConfig()}
+                jobs=jobs,
+                packages={"package": CommonPackageConfig()},
             ),
             job_config=jobs[i],
             project=flexmock(),
@@ -1520,22 +1670,21 @@ def test_copr_build_and_test_targets_both_jobs_defined():
             db_project_event=flexmock()
             .should_receive("get_project_event_object")
             .and_return(
-                flexmock(job_config_trigger_type=JobConfigTriggerType.pull_request)
+                flexmock(job_config_trigger_type=JobConfigTriggerType.pull_request),
             )
             .mock(),
         )
         assert helper.build_target2test_targets_for_test_job(
-            "fedora-35-x86_64", jobs[0]
+            "fedora-35-x86_64",
+            jobs[0],
         ) == {
             "fedora-35-x86_64",
             "fedora-36-x86_64",
         }
-        assert (
-            helper.build_target2test_targets_for_test_job("fedora-36-x86_64", jobs[0])
-            == set()
-        )
+        assert helper.build_target2test_targets_for_test_job("fedora-36-x86_64", jobs[0]) == set()
         assert helper.build_target2test_targets_for_test_job(
-            "epel-8-x86_64", jobs[0]
+            "epel-8-x86_64",
+            jobs[0],
         ) == {"centos-stream-8-x86_64"}
         assert helper.build_targets == {
             "fedora-35-x86_64",
@@ -1565,9 +1714,9 @@ def test_copr_build_and_test_targets_both_jobs_defined():
                     packages={
                         "package": CommonPackageConfig(
                             _targets=STABLE_VERSIONS,
-                        )
+                        ),
                     },
-                )
+                ),
             ],
             "fedora-32-x86_64",
             "fedora-32-x86_64",
@@ -1581,11 +1730,11 @@ def test_copr_build_and_test_targets_both_jobs_defined():
                     packages={
                         "package": CommonPackageConfig(
                             _targets={
-                                "epel-7-x86_64": {"distros": ["centos-7", "rhel-7"]}
+                                "epel-7-x86_64": {"distros": ["centos-7", "rhel-7"]},
                             },
-                        )
+                        ),
                     },
-                )
+                ),
             ],
             "centos-7-x86_64",
             "epel-7-x86_64",
@@ -1599,11 +1748,11 @@ def test_copr_build_and_test_targets_both_jobs_defined():
                     packages={
                         "package": CommonPackageConfig(
                             _targets={
-                                "epel-7-x86_64": {"distros": ["centos-7", "rhel-7"]}
+                                "epel-7-x86_64": {"distros": ["centos-7", "rhel-7"]},
                             },
-                        )
+                        ),
                     },
-                )
+                ),
             ],
             "rhel-7-x86_64",
             "epel-7-x86_64",
@@ -1617,11 +1766,11 @@ def test_copr_build_and_test_targets_both_jobs_defined():
                     packages={
                         "package": CommonPackageConfig(
                             _targets={
-                                "epel-7-x86_64": {"distros": ["centos-7", "rhel-7"]}
+                                "epel-7-x86_64": {"distros": ["centos-7", "rhel-7"]},
                             },
-                        )
+                        ),
                     },
-                )
+                ),
             ],
             "rhel-7-x86_64",
             "epel-7-x86_64",
@@ -1635,9 +1784,9 @@ def test_copr_build_and_test_targets_both_jobs_defined():
                     packages={
                         "package": CommonPackageConfig(
                             _targets=["epel-7-x86_64"],
-                        )
+                        ),
                     },
-                )
+                ),
             ],
             "centos-7-x86_64",
             "epel-7-x86_64",
@@ -1652,9 +1801,9 @@ def test_copr_build_and_test_targets_both_jobs_defined():
                         "package": CommonPackageConfig(
                             _targets=["epel-7-x86_64"],
                             use_internal_tf=True,
-                        )
+                        ),
                     },
-                )
+                ),
             ],
             "rhel-7-x86_64",
             "epel-7-x86_64",
@@ -1668,9 +1817,9 @@ def test_copr_build_and_test_targets_both_jobs_defined():
                     packages={
                         "package": CommonPackageConfig(
                             _targets=["centos-stream-9-x86_64"],
-                        )
+                        ),
                     },
-                )
+                ),
             ],
             "centos-stream-9-x86_64",
             "centos-stream-9-x86_64",
@@ -1689,7 +1838,7 @@ def test_copr_build_and_test_targets_both_jobs_defined():
                     packages={
                         "package": CommonPackageConfig(
                             _targets=["centos-stream-9-x86_64"],
-                        )
+                        ),
                     },
                 ),
             ],
@@ -1706,9 +1855,9 @@ def test_copr_build_and_test_targets_both_jobs_defined():
                         "package": CommonPackageConfig(
                             _targets=["centos-stream-9-x86_64"],
                             use_internal_tf=True,
-                        )
+                        ),
                     },
-                )
+                ),
             ],
             "centos-stream-9-x86_64",
             "centos-stream-9-x86_64",
@@ -1721,7 +1870,8 @@ def test_copr_test_target2build_target(job_config, test_target, build_target):
     testing_farm_helper = TestingFarmJobHelper(
         service_config=ServiceConfig.get_service_config(),
         package_config=PackageConfig(
-            jobs=jobs, packages={"package": CommonPackageConfig()}
+            jobs=jobs,
+            packages={"package": CommonPackageConfig()},
         ),
         job_config=jobs[0],
         project=flexmock(),
@@ -1732,16 +1882,22 @@ def test_copr_test_target2build_target(job_config, test_target, build_target):
         .mock(),
     )
     flexmock(CoprHelper).should_receive("get_valid_build_targets").with_args(
-        "fedora-31", "fedora-32", default=None
+        "fedora-31",
+        "fedora-32",
+        default=None,
     ).and_return(STABLE_CHROOTS)
     flexmock(CoprHelper).should_receive("get_valid_build_targets").with_args(
-        "fedora-32", "fedora-31", default=None
+        "fedora-32",
+        "fedora-31",
+        default=None,
     ).and_return(STABLE_CHROOTS)
     flexmock(CoprHelper).should_receive("get_valid_build_targets").with_args(
-        "centos-stream-9-x86_64", default=None
+        "centos-stream-9-x86_64",
+        default=None,
     ).and_return({"centos-stream-9-x86_64"})
     flexmock(CoprHelper).should_receive("get_valid_build_targets").with_args(
-        "epel-7-x86_64", default=None
+        "epel-7-x86_64",
+        default=None,
     ).and_return({"epel-7-x86_64"})
     assert testing_farm_helper.test_target2build_target(test_target) == build_target
 
@@ -1752,46 +1908,50 @@ def test_copr_test_target2build_target(job_config, test_target, build_target):
         pytest.param(
             [
                 JobConfig(
-                    type=JobType.production_build,
+                    type=JobType.upstream_koji_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={
                         "package": CommonPackageConfig(
                             _targets=STABLE_VERSIONS,
-                        )
+                        ),
                     },
-                )
+                ),
             ],
             JobConfigTriggerType.pull_request,
-            {"f32"},
+            {("f32", None)},
             {"f32"},
             id="target_in_config",
         ),
         pytest.param(
             [
                 JobConfig(
-                    type=JobType.production_build,
+                    type=JobType.upstream_koji_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={
                         "package": CommonPackageConfig(
                             _targets=STABLE_VERSIONS,
-                        )
+                        ),
                     },
-                )
+                ),
             ],
             JobConfigTriggerType.pull_request,
-            {"f33"},
+            {("f33", None)},
             set(),
             id="target_not_in_config",
         ),
     ],
 )
 def test_koji_targets_overrides(
-    jobs, job_config_trigger_type, targets_override, build_targets
+    jobs,
+    job_config_trigger_type,
+    targets_override,
+    build_targets,
 ):
     koji_build_helper = KojiBuildJobHelper(
         service_config=ServiceConfig.get_service_config(),
         package_config=PackageConfig(
-            jobs=jobs, packages={"package": CommonPackageConfig()}
+            jobs=jobs,
+            packages={"package": CommonPackageConfig()},
         ),
         job_config=jobs[0],
         project=flexmock(),
@@ -1814,7 +1974,7 @@ def test_koji_targets_overrides(
                     type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"packages": CommonPackageConfig()},
-                )
+                ),
             ],
             JobConfig(
                 type=JobType.copr_build,
@@ -1833,19 +1993,19 @@ def test_koji_targets_overrides(
         pytest.param(
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"packages": CommonPackageConfig()},
-                )
+                ),
             ],
             JobConfig(
-                type=JobType.build,
+                type=JobType.copr_build,
                 trigger=JobConfigTriggerType.pull_request,
                 packages={"packages": CommonPackageConfig()},
             ),
             JobConfigTriggerType.pull_request,
             JobConfig(
-                type=JobType.build,
+                type=JobType.copr_build,
                 trigger=JobConfigTriggerType.pull_request,
                 packages={"packages": CommonPackageConfig()},
             ),
@@ -1858,7 +2018,7 @@ def test_koji_targets_overrides(
                     type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"packages": CommonPackageConfig()},
-                )
+                ),
             ],
             JobConfig(
                 type=JobType.copr_build,
@@ -1880,7 +2040,7 @@ def test_koji_targets_overrides(
                     type=JobType.copr_build,
                     trigger=JobConfigTriggerType.release,
                     packages={"packages": CommonPackageConfig()},
-                )
+                ),
             ],
             JobConfig(
                 type=JobType.copr_build,
@@ -1902,7 +2062,7 @@ def test_koji_targets_overrides(
                     type=JobType.copr_build,
                     trigger=JobConfigTriggerType.commit,
                     packages={"packages": CommonPackageConfig()},
-                )
+                ),
             ],
             JobConfig(
                 type=JobType.copr_build,
@@ -2005,7 +2165,7 @@ def test_koji_targets_overrides(
                     type=JobType.tests,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"packages": CommonPackageConfig()},
-                )
+                ),
             ],
             JobConfig(
                 type=JobType.tests,
@@ -2055,7 +2215,7 @@ def test_koji_targets_overrides(
         pytest.param(
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"packages": CommonPackageConfig()},
                 ),
@@ -2066,13 +2226,13 @@ def test_koji_targets_overrides(
                 ),
             ],
             JobConfig(
-                type=JobType.build,
+                type=JobType.copr_build,
                 trigger=JobConfigTriggerType.pull_request,
                 packages={"packages": CommonPackageConfig()},
             ),
             JobConfigTriggerType.pull_request,
             JobConfig(
-                type=JobType.build,
+                type=JobType.copr_build,
                 trigger=JobConfigTriggerType.pull_request,
                 packages={"packages": CommonPackageConfig()},
             ),
@@ -2206,7 +2366,8 @@ def test_build_handler_job_and_test_properties(
     copr_build_helper = CoprBuildJobHelper(
         service_config=ServiceConfig.get_service_config(),
         package_config=PackageConfig(
-            jobs=jobs, packages={"package": CommonPackageConfig()}
+            jobs=jobs,
+            packages={"package": CommonPackageConfig()},
         ),
         job_config=init_job,
         project=flexmock(default_branch="main"),
@@ -2232,7 +2393,7 @@ def test_build_handler_job_and_test_properties(
                     type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"packages": CommonPackageConfig()},
-                )
+                ),
             ],
             JobConfigTriggerType.pull_request,
             ProjectEventModelType.pull_request,
@@ -2249,9 +2410,9 @@ def test_build_handler_job_and_test_properties(
                     packages={
                         "package": CommonPackageConfig(
                             owner="custom-owner",
-                        )
+                        ),
                     },
-                )
+                ),
             ],
             JobConfigTriggerType.pull_request,
             ProjectEventModelType.pull_request,
@@ -2268,9 +2429,9 @@ def test_build_handler_job_and_test_properties(
                     packages={
                         "package": CommonPackageConfig(
                             project="custom-project",
-                        )
+                        ),
                     },
-                )
+                ),
             ],
             JobConfigTriggerType.pull_request,
             ProjectEventModelType.pull_request,
@@ -2288,9 +2449,9 @@ def test_build_handler_job_and_test_properties(
                         "package": CommonPackageConfig(
                             owner="custom-owner",
                             project="custom-project",
-                        )
+                        ),
                     },
-                )
+                ),
             ],
             JobConfigTriggerType.pull_request,
             ProjectEventModelType.pull_request,
@@ -2302,15 +2463,15 @@ def test_build_handler_job_and_test_properties(
         pytest.param(
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={
                         "package": CommonPackageConfig(
                             owner="custom-owner",
                             project="custom-project",
-                        )
+                        ),
                     },
-                )
+                ),
             ],
             JobConfigTriggerType.pull_request,
             ProjectEventModelType.pull_request,
@@ -2325,7 +2486,7 @@ def test_build_handler_job_and_test_properties(
                     type=JobType.copr_build,
                     trigger=JobConfigTriggerType.commit,
                     packages={"packages": CommonPackageConfig()},
-                )
+                ),
             ],
             JobConfigTriggerType.commit,
             ProjectEventModelType.branch_push,
@@ -2340,7 +2501,7 @@ def test_build_handler_job_and_test_properties(
                     type=JobType.copr_build,
                     trigger=JobConfigTriggerType.release,
                     packages={"packages": CommonPackageConfig()},
-                )
+                ),
             ],
             JobConfigTriggerType.release,
             ProjectEventModelType.release,
@@ -2355,7 +2516,7 @@ def test_build_handler_job_and_test_properties(
                     type=JobType.copr_build,
                     trigger=JobConfigTriggerType.release,
                     packages={"packages": CommonPackageConfig()},
-                )
+                ),
             ],
             JobConfigTriggerType.release,
             ProjectEventModelType.release,
@@ -2373,7 +2534,7 @@ def test_build_handler_job_and_test_properties(
                         "package": CommonPackageConfig(
                             owner="commit-owner",
                             project="commit-project",
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
@@ -2383,7 +2544,7 @@ def test_build_handler_job_and_test_properties(
                         "package": CommonPackageConfig(
                             owner="pr-owner",
                             project="pr-project",
-                        )
+                        ),
                     },
                 ),
             ],
@@ -2423,7 +2584,7 @@ def test_build_handler_job_and_test_properties(
                         "package": CommonPackageConfig(
                             owner="custom-owner",
                             project="custom-project",
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
@@ -2453,7 +2614,7 @@ def test_build_handler_job_and_test_properties(
                         "package": CommonPackageConfig(
                             owner="custom-owner",
                             project="custom-project",
-                        )
+                        ),
                     },
                 ),
             ],
@@ -2473,7 +2634,7 @@ def test_build_handler_job_and_test_properties(
                         "package": CommonPackageConfig(
                             owner="pr-owner",
                             project="pr-project",
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
@@ -2488,7 +2649,7 @@ def test_build_handler_job_and_test_properties(
                         "package": CommonPackageConfig(
                             owner="commit-owner",
                             project="commit-project",
-                        )
+                        ),
                     },
                 ),
             ],
@@ -2508,7 +2669,7 @@ def test_build_handler_job_and_test_properties(
                         "package": CommonPackageConfig(
                             owner="pr-owner",
                             project="pr-project",
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
@@ -2523,7 +2684,7 @@ def test_build_handler_job_and_test_properties(
                         "package": CommonPackageConfig(
                             owner="commit-owner",
                             project="commit-project",
-                        )
+                        ),
                     },
                 ),
             ],
@@ -2547,7 +2708,8 @@ def test_copr_project_and_namespace(
     copr_build_helper = CoprBuildJobHelper(
         service_config=ServiceConfig.get_service_config(),
         package_config=PackageConfig(
-            jobs=jobs, packages={"package": CommonPackageConfig()}
+            jobs=jobs,
+            packages={"package": CommonPackageConfig()},
         ),
         job_config=jobs[0],  # BuildHelper looks at all jobs in the end
         project=flexmock(
@@ -2557,7 +2719,9 @@ def test_copr_project_and_namespace(
             default_branch="main",
         ),
         metadata=flexmock(
-            pr_id=None, identifier="the-event-identifier", tag_name=tag_name
+            pr_id=None,
+            identifier="the-event-identifier",
+            tag_name=tag_name,
         ),
         db_project_event=flexmock()
         .should_receive("get_project_event_object")
@@ -2566,12 +2730,12 @@ def test_copr_project_and_namespace(
                 job_config_trigger_type=job_config_trigger_type,
                 project_event_model_type=project_event_model_type,
                 name="main",
-            )
+            ),
         )
         .mock(),
     )
     copr_build_helper._api = flexmock(
-        copr_helper=flexmock(copr_client=flexmock(config={"username": "nobody"}))
+        copr_helper=flexmock(copr_client=flexmock(config={"username": "nobody"})),
     )
 
     assert copr_build_helper.job_project == job_project
@@ -2589,7 +2753,7 @@ def test_copr_project_and_namespace(
                     "package": CommonPackageConfig(
                         owner="the-owner",
                         project="the-project",
-                    )
+                    ),
                 },
             ),
             "",
@@ -2604,7 +2768,7 @@ def test_copr_project_and_namespace(
                     "package": CommonPackageConfig(
                         owner="the-owner",
                         project="the-project",
-                    )
+                    ),
                 },
             ),
             "something/different",
@@ -2619,7 +2783,7 @@ def test_copr_project_and_namespace(
                     "package": CommonPackageConfig(
                         owner="the-owner",
                         project="the-project",
-                    )
+                    ),
                 },
             ),
             "git.instance.io/the/example/namespace/the-example-repo",
@@ -2634,7 +2798,7 @@ def test_copr_project_and_namespace(
                     "package": CommonPackageConfig(
                         owner="the-owner",
                         project="the-project",
-                    )
+                    ),
                 },
             ),
             "something/different\ngit.instance.io/the/example/namespace/the-example-repo",
@@ -2652,14 +2816,16 @@ def test_check_if_custom_copr_can_be_used_and_report(
     copr_build_helper = CoprBuildJobHelper(
         service_config=service_config,
         package_config=PackageConfig(
-            jobs=[job], packages={"package": CommonPackageConfig()}
+            jobs=[job],
+            packages={"package": CommonPackageConfig()},
         ),
         job_config=job,  # BuildHelper looks at all jobs in the end
         project=flexmock(
             namespace="the/example/namespace",
             repo="the-example-repo",
             service=flexmock(
-                instance_url="https://git.instance.io", hostname="git.instance.io"
+                instance_url="https://git.instance.io",
+                hostname="git.instance.io",
             ),
         ),
         metadata=flexmock(pr_id=None, identifier="the-event-identifier", tag_name=None),
@@ -2669,7 +2835,7 @@ def test_check_if_custom_copr_can_be_used_and_report(
             flexmock(
                 job_config_trigger_type=JobConfigTriggerType.pull_request,
                 project_event_model_type=ProjectEventModelType.pull_request,
-            )
+            ),
         )
         .mock(),
     )
@@ -2678,17 +2844,18 @@ def test_check_if_custom_copr_can_be_used_and_report(
             config={"username": "nobody"},
             project_proxy=flexmock(
                 get=lambda owner, project: {
-                    "packit_forge_projects_allowed": git_forge_allowed_list
-                }
+                    "packit_forge_projects_allowed": git_forge_allowed_list,
+                },
             ),
-        )
+        ),
     )
     copr_helper.should_receive("get_copr_settings_url").with_args(
-        "the-owner", "the-project"
+        "the-owner",
+        "the-project",
     ).and_return().times(0 if allowed else 1)
     copr_build_helper._api = flexmock(copr_helper=copr_helper)
     flexmock(CoprBuildJobHelper).should_receive("report_status_to_build").times(
-        0 if allowed else 1
+        0 if allowed else 1,
     )
     assert copr_build_helper.check_if_custom_copr_can_be_used_and_report() is allowed
 
@@ -2699,14 +2866,14 @@ def test_check_if_custom_copr_can_be_used_and_report(
         pytest.param(
             [
                 JobConfig(
-                    type=JobType.production_build,
+                    type=JobType.upstream_koji_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={
                         "package": CommonPackageConfig(
                             _targets=STABLE_VERSIONS,
-                        )
+                        ),
                     },
-                )
+                ),
             ],
             JobConfigTriggerType.pull_request,
             set(STABLE_VERSIONS),
@@ -2716,15 +2883,15 @@ def test_check_if_custom_copr_can_be_used_and_report(
         pytest.param(
             [
                 JobConfig(
-                    type=JobType.production_build,
+                    type=JobType.upstream_koji_build,
                     trigger=JobConfigTriggerType.commit,
                     packages={
                         "package": CommonPackageConfig(
                             _targets=STABLE_VERSIONS,
                             branch="build-branch",
-                        )
+                        ),
                     },
-                )
+                ),
             ],
             JobConfigTriggerType.commit,
             set(STABLE_VERSIONS),
@@ -2734,15 +2901,15 @@ def test_check_if_custom_copr_can_be_used_and_report(
         pytest.param(
             [
                 JobConfig(
-                    type=JobType.production_build,
+                    type=JobType.upstream_koji_build,
                     trigger=JobConfigTriggerType.release,
                     packages={
                         "package": CommonPackageConfig(
                             _targets=STABLE_VERSIONS,
                             branch="build-branch",
-                        )
+                        ),
                     },
-                )
+                ),
             ],
             JobConfigTriggerType.release,
             set(STABLE_VERSIONS),
@@ -2752,13 +2919,17 @@ def test_check_if_custom_copr_can_be_used_and_report(
     ],
 )
 def test_targets_for_koji_build(
-    jobs, job_config_trigger_type, build_targets, koji_targets
+    jobs,
+    job_config_trigger_type,
+    build_targets,
+    koji_targets,
 ):
     pr_id = 41 if job_config_trigger_type == JobConfigTriggerType.pull_request else None
     koji_build_helper = KojiBuildJobHelper(
         service_config=ServiceConfig.get_service_config(),
         package_config=PackageConfig(
-            jobs=jobs, packages={"package": CommonPackageConfig()}
+            jobs=jobs,
+            packages={"package": CommonPackageConfig()},
         ),
         job_config=jobs[0],
         project=flexmock(),
@@ -2767,8 +2938,9 @@ def test_targets_for_koji_build(
         .should_receive("get_project_event_object")
         .and_return(
             flexmock(
-                job_config_trigger_type=job_config_trigger_type, name="build-branch"
-            )
+                job_config_trigger_type=job_config_trigger_type,
+                name="build-branch",
+            ),
         )
         .mock(),
     )
@@ -2786,7 +2958,7 @@ def test_repository_cache_invocation():
     service_config.add_repositories_to_repository_cache = False
     service_config.command_handler_work_dir = "/tmp/some-dir"
 
-    copr_build_helper = CoprBuildJobHelper(
+    copr_build_helper = KojiBuildJobHelper(
         service_config=service_config,
         package_config=PackageConfig(
             jobs=[
@@ -2796,9 +2968,9 @@ def test_repository_cache_invocation():
                     packages={
                         "package": CommonPackageConfig(
                             _targets=STABLE_VERSIONS,
-                        )
+                        ),
                     },
-                )
+                ),
             ],
             packages={"package": CommonPackageConfig()},
         ),
@@ -2808,13 +2980,13 @@ def test_repository_cache_invocation():
             packages={
                 "package": CommonPackageConfig(
                     _targets=STABLE_VERSIONS,
-                )
+                ),
             },
         ),
         project=flexmock(
             service=flexmock(),
             get_git_urls=lambda: {
-                "git": "https://github.com/some-namespace/some-repo.git"
+                "git": "https://github.com/some-namespace/some-repo.git",
             },
             repo=flexmock(),
             namespace=flexmock(),
@@ -2829,12 +3001,12 @@ def test_repository_cache_invocation():
     flexmock(RepositoryCache).should_call("__init__").once()
     flexmock(RepositoryCache).should_receive("get_repo").with_args(
         "https://github.com/some-namespace/some-repo.git",
-        directory=Path("/tmp/some-dir"),
+        directory="/tmp/some-dir",
     ).and_return(
         flexmock(
             git=flexmock().should_receive("checkout").and_return().mock(),
             commit=lambda: "commit",
-        )
+        ),
     ).once()
     assert copr_build_helper.local_project
 
@@ -2845,12 +3017,13 @@ def test_local_project_not_called_when_initializing_api():
             type=JobType.copr_build,
             trigger=JobConfigTriggerType.pull_request,
             packages={"packages": CommonPackageConfig()},
-        )
+        ),
     ]
     copr_build_helper = CoprBuildJobHelper(
         service_config=ServiceConfig.get_service_config(),
         package_config=PackageConfig(
-            jobs=jobs, packages={"package": CommonPackageConfig()}
+            jobs=jobs,
+            packages={"package": CommonPackageConfig()},
         ),
         job_config=jobs[0],
         project=flexmock(),
@@ -2920,17 +3093,18 @@ def test_notify_about_failure_if_configured(failure_comment, kwargs, result_comm
                 "packages": CommonPackageConfig(
                     notifications=NotificationsConfig(
                         failure_comment=FailureCommentNotificationsConfig(
-                            failure_comment
-                        )
-                    )
-                )
+                            failure_comment,
+                        ),
+                    ),
+                ),
             },
-        )
+        ),
     ]
     copr_build_helper = CoprBuildJobHelper(
         service_config=ServiceConfig.get_service_config(),
         package_config=PackageConfig(
-            jobs=jobs, packages={"package": CommonPackageConfig()}
+            jobs=jobs,
+            packages={"package": CommonPackageConfig()},
         ),
         job_config=jobs[0],
         project=flexmock(),

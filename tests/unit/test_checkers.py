@@ -3,21 +3,35 @@
 
 import pytest
 from flexmock import flexmock
-
+from ogr import PagureService
+from ogr.abstract import AccessLevel, PRStatus
+from ogr.services.pagure import PagureProject
 from packit.config import (
     CommonPackageConfig,
-    JobType,
+    JobConfig,
     JobConfigTriggerType,
     JobConfigView,
-    JobConfig,
+    JobType,
+    PackageConfig,
 )
+from packit.config.commands import TestCommandConfig
+from packit.config.requirements import LabelRequirementsConfig, RequirementsConfig
+from packit.copr_helper import CoprHelper
+
 from packit_service.config import ServiceConfig
 from packit_service.models import CoprBuildTargetModel
+from packit_service.worker.checker.bodhi import IsKojiBuildOwnerMatchingConfiguration
 from packit_service.worker.checker.copr import (
     IsJobConfigTriggerMatching as IsJobConfigTriggerMatchingCopr,
+)
+from packit_service.worker.checker.copr import (
     IsPackageMatchingJobView,
 )
-from packit_service.worker.checker.distgit import IsUpstreamTagMatchingConfig
+from packit_service.worker.checker.distgit import (
+    IsUpstreamTagMatchingConfig,
+    LabelsOnDistgitPR,
+)
+from packit_service.worker.checker.helper import DistgitAccountsChecker
 from packit_service.worker.checker.koji import (
     IsJobConfigTriggerMatching as IsJobConfigTriggerMatchingKoji,
 )
@@ -25,22 +39,24 @@ from packit_service.worker.checker.koji import (
     PermissionOnKoji,
 )
 from packit_service.worker.checker.testing_farm import (
-    IsJobConfigTriggerMatching as IsJobConfigTriggerMatchingTF,
     IsIdentifierFromCommentMatching,
     IsLabelFromCommentMatching,
 )
+from packit_service.worker.checker.testing_farm import (
+    IsJobConfigTriggerMatching as IsJobConfigTriggerMatchingTF,
+)
 from packit_service.worker.checker.vm_image import (
-    IsCoprBuildForChrootOk,
     HasAuthorWriteAccess,
+    IsCoprBuildForChrootOk,
 )
 from packit_service.worker.events import (
-    PullRequestGithubEvent,
     AbstractCoprBuildEvent,
+    PullRequestGithubEvent,
 )
 from packit_service.worker.events.event import EventData
 from packit_service.worker.events.github import (
-    PushGitHubEvent,
     PullRequestCommentGithubEvent,
+    PushGitHubEvent,
 )
 from packit_service.worker.events.gitlab import MergeRequestGitlabEvent, PushGitlabEvent
 from packit_service.worker.events.pagure import PushPagureEvent
@@ -112,6 +128,7 @@ def construct_dict(event, action=None, git_ref="random-non-configured-branch"):
     ),
 )
 def test_koji_permissions(success, event, is_scratch, can_merge_pr, trigger):
+    event["pr_id"] = 1
     package_config = flexmock(jobs=[])
     job_config = flexmock(
         type=JobType.upstream_koji_build,
@@ -131,13 +148,12 @@ def test_koji_permissions(success, event, is_scratch, can_merge_pr, trigger):
     flexmock(ConfigFromEventMixin).should_receive("project").and_return(git_project)
 
     db_project_object = flexmock(
-        job_config_trigger_type=trigger, name=event["git_ref"], pr_id=1
+        job_config_trigger_type=trigger,
+        name=event["git_ref"],
+        pr_id=1,
     )
     flexmock(EventData).should_receive("db_project_event").and_return(
-        flexmock()
-        .should_receive("get_project_event_object")
-        .and_return(db_project_object)
-        .mock()
+        flexmock().should_receive("get_project_event_object").and_return(db_project_object).mock(),
     )
 
     if not success:
@@ -203,10 +219,7 @@ def test_branch_push_event_checker(success, event, trigger, checker_kls):
 
     db_project_object = flexmock(job_config_trigger_type=trigger, name=event["git_ref"])
     flexmock(EventData).should_receive("db_project_event").and_return(
-        flexmock()
-        .should_receive("get_project_event_object")
-        .and_return(db_project_object)
-        .mock()
+        flexmock().should_receive("get_project_event_object").and_return(db_project_object).mock(),
     )
 
     checker = checker_kls(package_config, job_config, event)
@@ -256,6 +269,7 @@ def test_branch_push_event_checker(success, event, trigger, checker_kls):
     ),
 )
 def test_pr_event_checker(configured_branch, success, event, trigger, checker_kls):
+    event["pr_id"] = 1
     package_config = flexmock(jobs=[])
     job_config = flexmock(
         type=JobType.upstream_koji_build,
@@ -273,10 +287,7 @@ def test_pr_event_checker(configured_branch, success, event, trigger, checker_kl
 
     db_project_object = flexmock(job_config_trigger_type=trigger, pr_id=1)
     flexmock(EventData).should_receive("db_project_event").and_return(
-        flexmock()
-        .should_receive("get_project_event_object")
-        .and_return(db_project_object)
-        .mock()
+        flexmock().should_receive("get_project_event_object").and_return(db_project_object).mock(),
     )
 
     checker = checker_kls(package_config, job_config, event)
@@ -317,9 +328,9 @@ def test_pr_event_checker(configured_branch, success, event, trigger, checker_kl
             None,
             None,
             [],
-            "No successful Copr build found for "
+            "No successful Copr build found for project packit/packit-stg-packit-hello-world-None, "
             "commit 1 and chroot (target) fedora-36-x86_64",
-            id="No copr build found, job config without Copr project info",
+            id="No copr build found for default packit repo, job config without Copr project info",
         ),
     ),
 )
@@ -336,6 +347,10 @@ def test_vm_image_is_copr_build_ok_for_chroot(
     job_config.owner = owner
 
     flexmock(CoprBuildTargetModel).should_receive("get_all_by").and_return(copr_builds)
+    flexmock(EventData).should_receive("_add_project_object_and_event").and_return()
+    flexmock(CoprHelper).should_receive("copr_client").and_return(
+        flexmock(config=flexmock().should_receive("get").and_return("packit").mock()),
+    )
 
     checker = IsCoprBuildForChrootOk(
         package_config,
@@ -343,10 +358,21 @@ def test_vm_image_is_copr_build_ok_for_chroot(
         {"event_type": PullRequestCommentGithubEvent.__name__, "commit_sha": "1"},
     )
     checker.data._db_project_object = flexmock(id=1)
+    checker.data._db_project_event = (
+        flexmock()
+        .should_receive("get_project_event_object")
+        .and_return(flexmock(project_event_model_type="pull_request"))
+        .mock()
+    )
+    checker._project = flexmock(
+        service=flexmock(instance_url="packit-stg"),
+        namespace="packit",
+        repo="hello-world",
+    )
 
     if error_msg:
         flexmock(checker).should_receive("report_pre_check_failure").with_args(
-            error_msg
+            error_msg,
         ).once()
 
     assert checker.pre_check() == success
@@ -361,11 +387,11 @@ def test_copr_build_is_package_matching_job_view():
                 packages={"package-a": CommonPackageConfig()},
             ),
             "package-a",
-        )
+        ),
     ]
 
     flexmock(AbstractCoprBuildEvent).should_receive("from_event_dict").and_return(
-        flexmock(build_id=123)
+        flexmock(build_id=123),
     )
 
     checker = IsPackageMatchingJobView(
@@ -374,11 +400,7 @@ def test_copr_build_is_package_matching_job_view():
         {"pkg": "package"},
     )
     checker._build = (
-        flexmock()
-        .should_receive("get_package_name")
-        .and_return("package-b")
-        .once()
-        .mock()
+        flexmock().should_receive("get_package_name").and_return("package-b").once().mock()
     )
 
     assert not checker.pre_check()
@@ -400,7 +422,9 @@ def test_copr_build_is_package_matching_job_view():
     ),
 )
 def test_vm_image_has_author_write_access(
-    fake_package_config_job_config_project_db_trigger, has_write_access, result
+    fake_package_config_job_config_project_db_trigger,
+    has_write_access,
+    result,
 ):
     package_config, job_config, _, _ = fake_package_config_job_config_project_db_trigger
 
@@ -417,13 +441,13 @@ def test_vm_image_has_author_write_access(
     )
 
     flexmock(ServiceConfig).should_receive("get_project").with_args(
-        url=project_url
+        url=project_url,
     ).and_return(
         flexmock(repo="repo", namespace="ns")
         .should_receive("has_write_access")
         .with_args(user=actor)
         .and_return(has_write_access)
-        .mock()
+        .mock(),
     )
 
     if not has_write_access:
@@ -463,10 +487,7 @@ def test_koji_branch_merge_queue():
         name="gh-readonly-queue/main/pr-767-0203dd99c3d003cbfd912cec946cc5b46f695b10",
     )
     flexmock(EventData).should_receive("db_project_event").and_return(
-        flexmock()
-        .should_receive("get_project_event_object")
-        .and_return(db_project_object)
-        .mock()
+        flexmock().should_receive("get_project_event_object").and_return(db_project_object).mock(),
     )
 
     checker = IsJobConfigTriggerMatchingKoji(package_config, job_config, event)
@@ -478,17 +499,27 @@ def test_koji_branch_merge_queue():
     "comment, result",
     (
         pytest.param(
-            "/packit-dev test --identifier my-id-1",
+            "/packit test --identifier my-id-1",
             True,
             id="Matching identifier specified",
         ),
         pytest.param(
-            "/packit-dev test",
+            "/packit test --id my-id-1",
+            True,
+            id="Matching identifier specified",
+        ),
+        pytest.param(
+            "/packit test -i my-id-1",
+            True,
+            id="Matching identifier specified",
+        ),
+        pytest.param(
+            "/packit test",
             True,
             id="No identifier specified",
         ),
         pytest.param(
-            "/packit-dev test --identifier my-id-2",
+            "/packit test --identifier my-id-2",
             False,
             id="Non-matching identifier specified",
         ),
@@ -507,6 +538,7 @@ def test_tf_comment_identifier(comment, result):
         manual_trigger=True,
         packages={"package": CommonPackageConfig()},
         identifier="my-id-1",
+        test_command=TestCommandConfig(default_labels=None, default_identifier=None),
     )
 
     event = {
@@ -525,16 +557,106 @@ def test_tf_comment_identifier(comment, result):
         pr_id=1,
     )
     flexmock(EventData).should_receive("db_project_event").and_return(
-        flexmock()
-        .should_receive("get_project_event_object")
-        .and_return(db_project_object)
-        .mock()
+        flexmock().should_receive("get_project_event_object").and_return(db_project_object).mock(),
     )
 
     checker = IsIdentifierFromCommentMatching(
-        package_config=package_config, job_config=job_config, event=event
+        package_config=package_config,
+        job_config=job_config,
+        event=event,
     )
 
+    assert checker.pre_check() == result
+
+
+@pytest.mark.parametrize(
+    "comment, default_identifier, job_identifier, result",
+    (
+        pytest.param(
+            "/packit test --identifier my-id2",
+            "id1",
+            "id1",
+            False,
+            id="Identifier specified in comment",
+        ),
+        pytest.param(
+            "/packit test",
+            None,
+            "id1",
+            True,
+            id="No identifier specified, no default identifier",
+        ),
+        pytest.param(
+            "/packit test",
+            "id1",
+            "id1",
+            True,
+            id="No identifier specified, default identifier matching",
+        ),
+        pytest.param(
+            "/packit test",
+            "id1",
+            "id2",
+            False,
+            id="No identifier specified, default identifier not matching",
+        ),
+        pytest.param(
+            "/packit test",
+            "id1",
+            None,
+            False,
+            id="No identifier specified, default identifier not matching (job without label)",
+        ),
+    ),
+)
+def test_tf_comment_default_identifier(
+    comment,
+    default_identifier,
+    job_identifier,
+    result,
+):
+    """
+    Check that Testing Farm checker for comment attributes works properly.
+    """
+    package_config = flexmock(jobs=[])
+    job_config = flexmock(
+        type=JobType.tests,
+        trigger=JobConfigTriggerType.pull_request,
+        targets={"fedora-37"},
+        skip_build=True,
+        manual_trigger=True,
+        packages={"package": CommonPackageConfig()},
+        identifier=job_identifier,
+        test_command=TestCommandConfig(
+            default_labels=None,
+            default_identifier=default_identifier,
+        ),
+    )
+
+    event = {
+        "event_type": PullRequestCommentGithubEvent.__name__,
+        "comment": comment,
+    }
+
+    git_project = flexmock(
+        namespace="packit",
+        repo="ogr",
+    )
+    flexmock(ConfigFromEventMixin).should_receive("project").and_return(git_project)
+
+    db_project_object = flexmock(
+        job_config_trigger_type=JobConfigTriggerType.pull_request,
+        pr_id=1,
+    )
+    flexmock(EventData).should_receive("db_project_event").and_return(
+        flexmock().should_receive("get_project_event_object").and_return(db_project_object).mock(),
+    )
+
+    checker = IsIdentifierFromCommentMatching(
+        package_config=package_config,
+        job_config=job_config,
+        event=event,
+    )
     assert checker.pre_check() == result
 
 
@@ -542,17 +664,17 @@ def test_tf_comment_identifier(comment, result):
     "comment, result",
     (
         pytest.param(
-            "/packit-dev test --labels label1,label2",
+            "/packit test --labels label1,label2",
             True,
             id="Matching label specified",
         ),
         pytest.param(
-            "/packit-dev test",
+            "/packit test",
             True,
             id="No labels specified",
         ),
         pytest.param(
-            "/packit-dev test --labels random-label1,random-label2",
+            "/packit test --labels random-label1,random-label2",
             False,
             id="Non-matching label specified",
         ),
@@ -572,6 +694,7 @@ def test_tf_comment_labels(comment, result):
         packages={"package": CommonPackageConfig()},
         identifier="my-id-1",
         labels=["label1", "label3"],
+        test_command=TestCommandConfig(default_labels=None, default_identifier=None),
     )
 
     event = {
@@ -590,14 +713,101 @@ def test_tf_comment_labels(comment, result):
         pr_id=1,
     )
     flexmock(EventData).should_receive("db_project_event").and_return(
-        flexmock()
-        .should_receive("get_project_event_object")
-        .and_return(db_project_object)
-        .mock()
+        flexmock().should_receive("get_project_event_object").and_return(db_project_object).mock(),
     )
 
     checker = IsLabelFromCommentMatching(
-        package_config=package_config, job_config=job_config, event=event
+        package_config=package_config,
+        job_config=job_config,
+        event=event,
+    )
+
+    assert checker.pre_check() == result
+
+
+@pytest.mark.parametrize(
+    "comment, default_labels, job_labels, result",
+    (
+        pytest.param(
+            "/packit test --labels label1,label2",
+            ["label3"],
+            ["label3"],
+            False,
+            id="Labels specified in comment",
+        ),
+        pytest.param(
+            "/packit test",
+            None,
+            ["label1"],
+            True,
+            id="No labels specified, no default labels",
+        ),
+        pytest.param(
+            "/packit test",
+            ["label2"],
+            ["label1", "label2"],
+            True,
+            id="No labels specified, default labels matching",
+        ),
+        pytest.param(
+            "/packit test",
+            ["label3"],
+            ["label1", "label2"],
+            False,
+            id="No labels specified, default labels not matching",
+        ),
+        pytest.param(
+            "/packit test",
+            ["label3"],
+            [],
+            False,
+            id="No labels specified, default labels not matching (job without label)",
+        ),
+    ),
+)
+def test_tf_comment_default_labels(comment, default_labels, job_labels, result):
+    """
+    Check that Testing Farm checker for comment attributes works properly.
+    """
+    package_config = flexmock(jobs=[])
+    job_config = flexmock(
+        type=JobType.tests,
+        trigger=JobConfigTriggerType.pull_request,
+        targets={"fedora-37"},
+        skip_build=True,
+        manual_trigger=True,
+        packages={"package": CommonPackageConfig()},
+        identifier="my-id-1",
+        labels=job_labels,
+        test_command=TestCommandConfig(
+            default_labels=default_labels,
+            default_identifier=None,
+        ),
+    )
+
+    event = {
+        "event_type": PullRequestCommentGithubEvent.__name__,
+        "comment": comment,
+    }
+
+    git_project = flexmock(
+        namespace="packit",
+        repo="ogr",
+    )
+    flexmock(ConfigFromEventMixin).should_receive("project").and_return(git_project)
+
+    db_project_object = flexmock(
+        job_config_trigger_type=JobConfigTriggerType.pull_request,
+        pr_id=1,
+    )
+    flexmock(EventData).should_receive("db_project_event").and_return(
+        flexmock().should_receive("get_project_event_object").and_return(db_project_object).mock(),
+    )
+
+    checker = IsLabelFromCommentMatching(
+        package_config=package_config,
+        job_config=job_config,
+        event=event,
     )
 
     assert checker.pre_check() == result
@@ -612,12 +822,12 @@ def test_tf_comment_labels(comment, result):
     "comment, result",
     (
         pytest.param(
-            "/packit-dev test",
+            "/packit test",
             True,
             id="No labels specified, none in config: should pass",
         ),
         pytest.param(
-            "/packit-dev test --labels should_fail,should_fail_hard",
+            "/packit test --labels should_fail,should_fail_hard",
             False,
             id="Labels specified, none in config: should fail",
         ),
@@ -634,6 +844,7 @@ def test_tf_comment_labels_none_in_config(comment, result):
         packages={"package": CommonPackageConfig()},
         labels=None,
         identifier="my-id-1",
+        test_command=TestCommandConfig(default_labels=None, default_identifier=None),
     )
 
     event = {
@@ -652,14 +863,13 @@ def test_tf_comment_labels_none_in_config(comment, result):
         pr_id=1,
     )
     flexmock(EventData).should_receive("db_project_event").and_return(
-        flexmock()
-        .should_receive("get_project_event_object")
-        .and_return(db_project_object)
-        .mock()
+        flexmock().should_receive("get_project_event_object").and_return(db_project_object).mock(),
     )
 
     checker = IsLabelFromCommentMatching(
-        package_config=package_config, job_config=job_config, event=event
+        package_config=package_config,
+        job_config=job_config,
+        event=event,
     )
 
     assert checker.pre_check() == result
@@ -728,3 +938,178 @@ def test_sync_release_matching_tag(upstream_tag_include, upstream_tag_exclude, r
     )
 
     assert checker.pre_check() == result
+
+
+@pytest.mark.parametrize(
+    "account, allowed_pr_authors, should_pass",
+    (
+        ("direct-account", ["all_admins", "direct-account"], True),
+        ("admin-1", ["all_admins"], True),
+        ("admin-2", ["all_admins"], False),
+        ("group-account-1", ["all_admins", "@copr"], True),
+        ("group-account-2", ["all_admins", "@copr"], False),
+    ),
+)
+def test_koji_check_allowed_accounts(
+    distgit_push_event,
+    account,
+    allowed_pr_authors,
+    should_pass,
+):
+    flexmock(PagureProject).should_receive("get_users_with_given_access").with_args(
+        [AccessLevel.maintain],
+    ).and_return({"admin-1"})
+    flexmock(PagureService).should_receive("get_group").with_args("copr").and_return(
+        flexmock(members={"group-account-1"}),
+    )
+
+    assert (
+        DistgitAccountsChecker(
+            distgit_push_event.project,
+            allowed_pr_authors,
+            account,
+        ).check_allowed_accounts()
+        == should_pass
+    )
+
+
+@pytest.mark.parametrize(
+    "pr_labels,labels_present,labels_absent,should_pass",
+    (
+        ([], [], [], True),
+        ([flexmock(name="allowed-1")], [], ["skip-ci"], True),
+        ([flexmock(name="allowed-1")], ["allowed-1"], ["skip-ci"], True),
+        ([flexmock(name="allowed-1")], ["allowed-1"], ["skip-ci"], True),
+        (
+            [flexmock(name="allowed-1"), flexmock(name="skip-ci")],
+            ["allowed-1"],
+            ["skip-ci"],
+            False,
+        ),
+    ),
+)
+def test_labels_on_distgit_pr(
+    distgit_push_event,
+    pr_labels,
+    labels_present,
+    labels_absent,
+    should_pass,
+):
+    jobs = [
+        JobConfig(
+            type=JobType.koji_build,
+            trigger=JobConfigTriggerType.commit,
+            packages={
+                "package": CommonPackageConfig(
+                    dist_git_branches=["f36"],
+                    require=RequirementsConfig(
+                        LabelRequirementsConfig(
+                            absent=labels_absent,
+                            present=labels_present,
+                        ),
+                    ),
+                ),
+            },
+        ),
+    ]
+
+    package_config = PackageConfig(
+        jobs=jobs,
+        packages={"package": CommonPackageConfig()},
+    )
+    job_config = jobs[0]
+
+    flexmock(PagureProject).should_receive("get_pr").and_return(
+        flexmock(
+            id=5,
+            head_commit="ad0c308af91da45cf40b253cd82f07f63ea9cbbf",
+            status=PRStatus.open,
+            labels=pr_labels,
+            target_branch="f36",
+        ),
+    )
+
+    checker = LabelsOnDistgitPR(
+        package_config,
+        job_config,
+        distgit_push_event.get_dict(),
+    )
+    assert checker.pre_check() == should_pass
+
+
+@pytest.mark.parametrize(
+    "allowed_builders,owner,should_pass",
+    (
+        (["packit"], "packit", True),
+        (["packit"], "another-account", False),
+        (["packit", "another-account"], "another-account", True),
+        (["packit", "another-account"], "packit", True),
+    ),
+)
+def test_allowed_builders_for_bodhi(
+    koji_build_completed_event,
+    allowed_builders,
+    owner,
+    should_pass,
+):
+    koji_build_completed_event.owner = owner
+    jobs = [
+        JobConfig(
+            type=JobType.bodhi_update,
+            trigger=JobConfigTriggerType.commit,
+            packages={
+                "package": CommonPackageConfig(
+                    dist_git_branches=["f36"],
+                    allowed_builders=allowed_builders,
+                ),
+            },
+        ),
+    ]
+
+    package_config = PackageConfig(
+        jobs=jobs,
+        packages={"package": CommonPackageConfig()},
+    )
+    job_config = jobs[0]
+
+    checker = IsKojiBuildOwnerMatchingConfiguration(
+        package_config,
+        job_config,
+        koji_build_completed_event.get_dict(),
+    )
+    assert checker.pre_check() == should_pass
+
+
+def test_allowed_builders_for_bodhi_alias(
+    koji_build_completed_event,
+):
+    koji_build_completed_event.owner = "owner"
+    jobs = [
+        JobConfig(
+            type=JobType.bodhi_update,
+            trigger=JobConfigTriggerType.commit,
+            packages={
+                "package": CommonPackageConfig(
+                    dist_git_branches=["f36"],
+                    allowed_builders=["all_admins"],
+                ),
+            },
+        ),
+    ]
+
+    flexmock(PagureProject).should_receive("get_users_with_given_access").and_return(
+        ["owner"],
+    )
+
+    package_config = PackageConfig(
+        jobs=jobs,
+        packages={"package": CommonPackageConfig()},
+    )
+    job_config = jobs[0]
+
+    checker = IsKojiBuildOwnerMatchingConfiguration(
+        package_config,
+        job_config,
+        koji_build_completed_event.get_dict(),
+    )
+    assert checker.pre_check()

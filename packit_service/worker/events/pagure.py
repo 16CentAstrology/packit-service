@@ -2,23 +2,23 @@
 # SPDX-License-Identifier: MIT
 
 from logging import getLogger
-from typing import Dict, Optional
+from typing import Optional
 
 from ogr.abstract import Comment, GitProject
 from ogr.parsing import RepoUrl
 from packit.config import PackageConfig
-from packit_service.utils import get_packit_commands_from_comment
-from packit_service.config import PackageConfigGetter, ServiceConfig
 
+from packit_service.config import PackageConfigGetter, ServiceConfig
 from packit_service.service.db_project_events import (
     AddBranchPushEventToDb,
     AddPullRequestEventToDb,
 )
+from packit_service.utils import get_packit_commands_from_comment
+from packit_service.worker.events.comment import AbstractPRCommentEvent
 from packit_service.worker.events.enums import (
     PullRequestAction,
     PullRequestCommentAction,
 )
-from packit_service.worker.events.comment import AbstractPRCommentEvent
 from packit_service.worker.events.event import AbstractForgeIndependentEvent
 
 logger = getLogger(__name__)
@@ -29,9 +29,24 @@ class AbstractPagureEvent(AbstractForgeIndependentEvent):
         super().__init__(pr_id=pr_id)
         self.project_url: str = project_url
         self.git_ref: Optional[str] = None  # git ref that can be 'git checkout'-ed
-        self.identifier: Optional[
-            str
-        ] = None  # will be shown to users -- e.g. in logs or in the copr-project name
+        self.identifier: Optional[str] = (
+            None  # will be shown to users -- e.g. in logs or in the copr-project name
+        )
+
+    def get_packages_config(self) -> Optional[PackageConfig]:
+        logger.debug(
+            f"Getting packages_config:\n"
+            f"\tproject: {self.project}\n"
+            f"\tdefault_branch: {self.project.default_branch}\n",
+        )
+
+        return PackageConfigGetter.get_package_config_from_repo(
+            base_project=None,
+            project=self.project,
+            pr_id=None,
+            reference=self.project.default_branch,
+            fail_when_missing=self.fail_when_config_file_missing,
+        )
 
 
 class PushPagureEvent(AddBranchPushEventToDb, AbstractPagureEvent):
@@ -43,8 +58,9 @@ class PushPagureEvent(AddBranchPushEventToDb, AbstractPagureEvent):
         project_url: str,
         commit_sha: str,
         committer: str,
+        pr_id: Optional[int],
     ):
-        super().__init__(project_url=project_url)
+        super().__init__(project_url=project_url, pr_id=pr_id)
         self.repo_namespace = repo_namespace
         self.repo_name = repo_name
         self.git_ref = git_ref
@@ -90,7 +106,7 @@ class PullRequestCommentPagureEvent(AbstractPRCommentEvent, AbstractPagureEvent)
 
         self._repo_url: Optional[RepoUrl] = None
 
-    def get_dict(self, default_dict: Optional[Dict] = None) -> dict:
+    def get_dict(self, default_dict: Optional[dict] = None) -> dict:
         d = self.__dict__
         d["repo_name"] = self.repo_name
         d["repo_namespace"] = self.repo_namespace
@@ -112,39 +128,52 @@ class PullRequestCommentPagureEvent(AbstractPRCommentEvent, AbstractPagureEvent)
     def get_packages_config(self) -> Optional[PackageConfig]:
         comment = self.__dict__["comment"]
         commands = get_packit_commands_from_comment(
-            comment, ServiceConfig.get_service_config().comment_command_prefix
+            comment,
+            ServiceConfig.get_service_config().comment_command_prefix,
         )
         if not commands:
             return super().get_packages_config()
         command = commands[0]
-        args = commands[1] if len(commands) > 1 else ""
-        if command == "pull-from-upstream" and "--with-pr-config" not in args:
-            # when retriggering pull-from-upstream from PR comment
-            # take packages config from the downstream default branch
+        args = commands[1:] if len(commands) > 1 else []
+        if command == "pull-from-upstream" and "--with-pr-config" in args:
+            # take packages config from the corresponding branch
+            # for pull-from-upstream --with-pr-config
             logger.debug(
                 f"Getting packages_config:\n"
                 f"\tproject: {self.project}\n"
                 f"\tbase_project: {self.base_project}\n"
-                f"\treference: {self.base_project.default_branch}\n"
+                f"\treference: {self.commit_sha}\n"
+                f"\tpr_id: {self.pr_id}",
             )
             packages_config = PackageConfigGetter.get_package_config_from_repo(
                 base_project=self.base_project,
                 project=self.project,
-                reference=self.base_project.default_branch,
-                pr_id=None,
-                fail_when_missing=True,
+                reference=self.commit_sha,
+                pr_id=self.pr_id,
+                fail_when_missing=self.fail_when_config_file_missing,
             )
-            return packages_config
+
         else:
-            return super().get_packages_config()
+            logger.debug(
+                f"Getting packages_config:\n"
+                f"\tproject: {self.project}\n"
+                f"\tdefault_branch: {self.base_project.default_branch}\n",
+            )
+            packages_config = PackageConfigGetter.get_package_config_from_repo(
+                base_project=None,
+                project=self.project,
+                reference=self.project.default_branch,
+                pr_id=None,
+                fail_when_missing=self.fail_when_config_file_missing,
+            )
+
+        return packages_config
 
     @property
     def repo_url(self) -> Optional[RepoUrl]:
         if not self._repo_url:
             self._repo_url = RepoUrl.parse(
-                self.packages_config.upstream_project_url
-                if self.packages_config
-                else None
+                (self.packages_config.upstream_project_url if self.packages_config else None),
             )
         return self._repo_url
 
@@ -165,11 +194,12 @@ class PullRequestPagureEvent(AddPullRequestEventToDb, AbstractPagureEvent):
         base_repo_namespace: str,
         base_repo_name: str,
         base_repo_owner: str,
-        base_ref: str,
+        base_ref: Optional[str],
         target_repo: str,
         project_url: str,
         commit_sha: str,
         user_login: str,
+        target_branch: str,
     ):
         super().__init__(project_url=project_url, pr_id=pr_id)
         self.action = action
@@ -183,8 +213,9 @@ class PullRequestPagureEvent(AddPullRequestEventToDb, AbstractPagureEvent):
         self.identifier = str(pr_id)
         self.git_ref = None  # pr_id will be used for checkout
         self.project_url = project_url
+        self.target_branch = target_branch
 
-    def get_dict(self, default_dict: Optional[Dict] = None) -> dict:
+    def get_dict(self, default_dict: Optional[dict] = None) -> dict:
         result = super().get_dict()
         result["action"] = result["action"].value
         return result
@@ -198,6 +229,15 @@ class PullRequestPagureEvent(AddPullRequestEventToDb, AbstractPagureEvent):
         )
         logger.debug(f"Base project: {fork} owned by {self.base_repo_owner}")
         return fork
+
+    def get_packages_config(self) -> Optional[PackageConfig]:
+        return PackageConfigGetter.get_package_config_from_repo(
+            base_project=self.base_project,
+            project=self.project,
+            reference=self.commit_sha,
+            pr_id=self.pr_id,
+            fail_when_missing=self.fail_when_config_file_missing,
+        )
 
 
 class PullRequestFlagPagureEvent(AbstractPagureEvent):

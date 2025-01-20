@@ -24,6 +24,11 @@ jobs:
     steps:
       - uses: actions/checkout@v3
 
+      - name: Install QEMU dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static
+
       - name: Extract branch name and set tag
         shell: bash
         run: |
@@ -50,6 +55,7 @@ jobs:
           dockerfiles: ${{ matrix.dockerfile }}
           image: ${{ matrix.image }}
           tags: ${{ steps.branch_tag.outputs.tag }}
+          archs: amd64, arm64
           # Uncomment once we stop using oc cluster up for tests
           #           oci: true
           build-args: |

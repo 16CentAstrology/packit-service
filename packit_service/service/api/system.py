@@ -3,17 +3,13 @@
 import re
 from http import HTTPStatus
 from logging import getLogger
-
 from typing import Optional
 
-from setuptools_scm import get_version
-
-import packit
-
 import ogr
-from flask_restx import Namespace, Resource
-
+import packit
 import specfile
+from flask_restx import Namespace, Resource
+from setuptools_scm import get_version
 
 import packit_service
 from packit_service.service.api.utils import response_maker
@@ -48,10 +44,9 @@ class SystemInformation(Resource):
         }
         # packit_service might not be installed (i.e. when running locally)
         # so it's treated differently
-        packages_and_versions[
-            packit_service
-        ] = packit_service.__version__ or get_version(
-            root="..", relative_to=packit_service.__file__
+        packages_and_versions[packit_service] = packit_service.__version__ or get_version(
+            root="..",
+            relative_to=packit_service.__file__,
         )
 
         response_data = {

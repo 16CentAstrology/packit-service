@@ -1,38 +1,40 @@
 # Copyright Contributors to the Packit project.
 # SPDX-License-Identifier: MIT
-import pytest
-
+import contextlib
 from datetime import datetime, timedelta
 
-from sqlalchemy.exc import ProgrammingError, IntegrityError
+import pytest
+from sqlalchemy.exc import IntegrityError, ProgrammingError
 
 from packit_service.models import (
-    CoprBuildTargetModel,
+    BodhiUpdateTargetModel,
+    BuildStatus,
     CoprBuildGroupModel,
+    CoprBuildTargetModel,
     GitBranchModel,
-    GitProjectModel,
     GithubInstallationModel,
-    ProjectEventModelType,
-    KojiBuildTargetModel,
+    GitProjectModel,
     KojiBuildGroupModel,
+    KojiBuildTargetModel,
+    OSHScanModel,
+    PipelineModel,
     ProjectAuthenticationIssueModel,
+    ProjectEventModel,
+    ProjectEventModelType,
     ProjectReleaseModel,
     PullRequestModel,
-    ProjectEventModel,
-    SRPMBuildModel,
+    Session,
     SourceGitPRDistGitPRModel,
-    TFTTestRunTargetModel,
-    TFTTestRunGroupModel,
-    TestingFarmResult,
-    sa_session_transaction,
-    PipelineModel,
-    SyncReleaseTargetStatus,
+    SRPMBuildModel,
+    SyncReleaseJobType,
+    SyncReleaseModel,
     SyncReleaseStatus,
     SyncReleaseTargetModel,
-    SyncReleaseModel,
-    Session,
-    BuildStatus,
-    SyncReleaseJobType,
+    SyncReleaseTargetStatus,
+    TestingFarmResult,
+    TFTTestRunGroupModel,
+    TFTTestRunTargetModel,
+    sa_session_transaction,
 )
 from tests_openshift.conftest import SampleValues
 
@@ -64,7 +66,8 @@ def test_create_pr_project_event_model(clean_before_and_after, pr_project_event_
 
 
 def test_create_release_project_event_model(
-    clean_before_and_after, release_project_event_model
+    clean_before_and_after,
+    release_project_event_model,
 ):
     assert release_project_event_model.type == ProjectEventModelType.release
     release_model = release_project_event_model.get_project_event_object()
@@ -73,7 +76,8 @@ def test_create_release_project_event_model(
 
 
 def test_create_branch_trigger_model(
-    clean_before_and_after, branch_project_event_model
+    clean_before_and_after,
+    branch_project_event_model,
 ):
     assert branch_project_event_model.type == ProjectEventModelType.branch_push
     branch = branch_project_event_model.get_project_event_object()
@@ -99,7 +103,8 @@ def test_create_copr_build(clean_before_and_after, a_copr_build_for_pr):
 
 
 def test_copr_build_get_pr_id(
-    clean_before_and_after, copr_builds_with_different_triggers
+    clean_before_and_after,
+    copr_builds_with_different_triggers,
 ):
     assert copr_builds_with_different_triggers[0].get_pr_id() == 342
     assert not copr_builds_with_different_triggers[1].get_pr_id()
@@ -107,7 +112,8 @@ def test_copr_build_get_pr_id(
 
 
 def test_copr_build_get_branch(
-    clean_before_and_after, copr_builds_with_different_triggers
+    clean_before_and_after,
+    copr_builds_with_different_triggers,
 ):
     assert not copr_builds_with_different_triggers[0].get_branch_name()
     assert copr_builds_with_different_triggers[1].get_branch_name() == "build-branch"
@@ -123,10 +129,7 @@ def test_get_merged_chroots(clean_before_and_after, too_many_copr_builds):
     assert len(builds_list[0].target) == 2
 
     # check that IDs are different
-    assert (
-        builds_list[0].packit_id_per_chroot[0][0]
-        != builds_list[0].packit_id_per_chroot[1][0]
-    )
+    assert builds_list[0].packit_id_per_chroot[0][0] != builds_list[0].packit_id_per_chroot[1][0]
 
     assert builds_list[1].status[0][0] == "success"
     assert ["fedora-42-x86_64"] in builds_list[2].target
@@ -138,12 +141,14 @@ def test_get_copr_build(clean_before_and_after, a_copr_build_for_pr):
 
     # pass in a build_id and a target
     b = CoprBuildTargetModel.get_by_build_id(
-        a_copr_build_for_pr.build_id, SampleValues.target
+        a_copr_build_for_pr.build_id,
+        SampleValues.target,
     )
     assert b.id == a_copr_build_for_pr.id
     # let's make sure passing int works as well
     b2 = CoprBuildTargetModel.get_by_build_id(
-        int(a_copr_build_for_pr.build_id), SampleValues.target
+        int(a_copr_build_for_pr.build_id),
+        SampleValues.target,
     )
     assert b2.id == a_copr_build_for_pr.id
 
@@ -160,7 +165,8 @@ def test_copr_build_set_status(clean_before_and_after, a_copr_build_for_pr):
     a_copr_build_for_pr.set_status(BuildStatus.success)
     assert a_copr_build_for_pr.status == BuildStatus.success
     b = CoprBuildTargetModel.get_by_build_id(
-        a_copr_build_for_pr.build_id, SampleValues.target
+        a_copr_build_for_pr.build_id,
+        SampleValues.target,
     )
     assert b.status == BuildStatus.success
 
@@ -170,7 +176,8 @@ def test_copr_build_set_build_logs_url(clean_before_and_after, a_copr_build_for_
     a_copr_build_for_pr.set_build_logs_url(url)
     assert a_copr_build_for_pr.build_logs_url == url
     b = CoprBuildTargetModel.get_by_build_id(
-        a_copr_build_for_pr.build_id, SampleValues.target
+        a_copr_build_for_pr.build_id,
+        SampleValues.target,
     )
     assert b.build_logs_url == url
 
@@ -191,12 +198,14 @@ def test_create_koji_build(clean_before_and_after, a_koji_build_for_pr):
 def test_get_koji_build(clean_before_and_after, a_koji_build_for_pr):
     assert a_koji_build_for_pr.id
     b = KojiBuildTargetModel.get_by_task_id(
-        a_koji_build_for_pr.task_id, SampleValues.target
+        a_koji_build_for_pr.task_id,
+        SampleValues.target,
     )
     assert b.id == a_koji_build_for_pr.id
     # let's make sure passing int works as well
     b = KojiBuildTargetModel.get_by_task_id(
-        int(a_koji_build_for_pr.task_id), SampleValues.target
+        int(a_koji_build_for_pr.task_id),
+        SampleValues.target,
     )
     assert b.id == a_koji_build_for_pr.id
     b2 = KojiBuildTargetModel.get_by_id(b.id)
@@ -208,7 +217,8 @@ def test_koji_build_set_status(clean_before_and_after, a_koji_build_for_pr):
     a_koji_build_for_pr.set_status("awesome")
     assert a_koji_build_for_pr.status == "awesome"
     b = KojiBuildTargetModel.get_by_task_id(
-        a_koji_build_for_pr.task_id, SampleValues.target
+        a_koji_build_for_pr.task_id,
+        SampleValues.target,
     )
     assert b.status == "awesome"
 
@@ -216,12 +226,13 @@ def test_koji_build_set_status(clean_before_and_after, a_koji_build_for_pr):
 def test_koji_build_set_build_logs_urls(clean_before_and_after, a_koji_build_for_pr):
     urls = {
         "x86_64": "https://kojipkgs.fedoraproject.org//"
-        "packages/python-ogr/0.11.0/1.fc30/data/logs/noarch/build.log"
+        "packages/python-ogr/0.11.0/1.fc30/data/logs/noarch/build.log",
     }
     a_koji_build_for_pr.set_build_logs_urls(urls)
     assert a_koji_build_for_pr.build_logs_urls == urls
     b = KojiBuildTargetModel.get_by_task_id(
-        a_koji_build_for_pr.task_id, SampleValues.target
+        a_koji_build_for_pr.task_id,
+        SampleValues.target,
     )
     assert b.build_logs_urls == urls
 
@@ -263,15 +274,13 @@ def test_get_or_create_pr(clean_before_and_after):
 
 def test_errors_while_doing_db(clean_before_and_after):
     with sa_session_transaction() as session:
-        try:
+        with contextlib.suppress(ProgrammingError):
             PullRequestModel.get_or_create(
                 pr_id="nope",
                 namespace="",
                 repo_name=False,
                 project_url="https://github.com/the-namespace/the-repo",
             )
-        except ProgrammingError:
-            pass
         assert len(session.query(PullRequestModel).all()) == 0
         PullRequestModel.get_or_create(
             pr_id=111,
@@ -283,7 +292,8 @@ def test_errors_while_doing_db(clean_before_and_after):
 
 
 def test_get_srpm_builds_in_give_range(
-    clean_before_and_after, srpm_build_model_with_new_run_for_pr
+    clean_before_and_after,
+    srpm_build_model_with_new_run_for_pr,
 ):
     builds_list = list(SRPMBuildModel.get_range(0, 10))
     assert len(builds_list) == 1
@@ -311,25 +321,29 @@ def test_get_all_build_id(clean_before_and_after, multiple_copr_builds):
 def test_get_by_build_id(clean_before_and_after, multiple_copr_builds):
     # these are not iterable and thus should be accessible directly
     build_a = CoprBuildTargetModel.get_by_build_id(
-        SampleValues.build_id, SampleValues.target
+        SampleValues.build_id,
+        SampleValues.target,
     )
     assert build_a.project_name == "the-project-name"
     assert build_a.target == "fedora-42-x86_64"
 
     build_b = CoprBuildTargetModel.get_by_build_id(
-        SampleValues.build_id, SampleValues.different_target
+        SampleValues.build_id,
+        SampleValues.different_target,
     )
     assert build_b.project_name == "the-project-name"
     assert build_b.target == "fedora-43-x86_64"
 
     build_c = CoprBuildTargetModel.get_by_build_id(
-        SampleValues.another_different_build_id, SampleValues.target
+        SampleValues.another_different_build_id,
+        SampleValues.target,
     )
     assert build_c.project_name == "different-project-name"
 
 
 def test_copr_get_all_by_owner_project_commit_target(
-    clean_before_and_after, multiple_copr_builds
+    clean_before_and_after,
+    multiple_copr_builds,
 ):
     builds_list = list(
         CoprBuildTargetModel.get_all_by(
@@ -337,22 +351,18 @@ def test_copr_get_all_by_owner_project_commit_target(
             project_name=SampleValues.project,
             target=SampleValues.target,
             commit_sha=SampleValues.ref,
-        )
+        ),
     )
     assert len(builds_list) == 2
     # both should have the same project_name
-    assert (
-        builds_list[1].project_name
-        == builds_list[0].project_name
-        == SampleValues.project
-    )
+    assert builds_list[1].project_name == builds_list[0].project_name == SampleValues.project
 
     # test without target and owner
     builds_list_without_target = list(
         CoprBuildTargetModel.get_all_by(
             project_name=SampleValues.project,
             commit_sha=SampleValues.ref,
-        )
+        ),
     )
     assert len(builds_list_without_target) == 3
     assert (
@@ -365,7 +375,7 @@ def test_copr_get_all_by_owner_project_commit_target(
 
 def test_copr_get_all_by_commit(clean_before_and_after, multiple_copr_builds):
     builds_list = list(
-        CoprBuildTargetModel.get_all_by_commit(commit_sha=SampleValues.ref)
+        CoprBuildTargetModel.get_all_by_commit(commit_sha=SampleValues.ref),
     )
     assert len(builds_list) == 3
     # they should have the same project_name
@@ -419,18 +429,20 @@ def test_copr_and_koji_build_for_one_trigger(clean_before_and_after):
         project_url="https://github.com/the-namespace/the-repo-name",
     )
     project_event = ProjectEventModel.get_or_create(
-        type=ProjectEventModelType.pull_request, event_id=pr1.id, commit_sha="abcdef"
+        type=ProjectEventModelType.pull_request,
+        event_id=pr1.id,
+        commit_sha="abcdef",
     )
     # SRPMBuildModel is (sadly) not shared between Koji and Copr builds.
     srpm_build_for_copr, run_model_for_copr = SRPMBuildModel.create_with_new_run(
-        project_event_model=project_event
+        project_event_model=project_event,
     )
     copr_group = CoprBuildGroupModel.create(run_model_for_copr)
     srpm_build_for_copr.set_logs("asd\nqwe\n")
     srpm_build_for_copr.set_status(BuildStatus.success)
 
     srpm_build_for_koji, run_model_for_koji = SRPMBuildModel.create_with_new_run(
-        project_event_model=project_event
+        project_event_model=project_event,
     )
     koji_group = KojiBuildGroupModel.create(run_model_for_koji)
     srpm_build_for_copr.set_logs("asd\nqwe\n")
@@ -520,7 +532,9 @@ def test_tmt_test_run_get_project(clean_before_and_after, a_new_test_run_pr):
 
 
 def test_tmt_test_run_get_copr_build(
-    clean_before_and_after, a_copr_build_for_pr, a_new_test_run_pr
+    clean_before_and_after,
+    a_copr_build_for_pr,
+    a_new_test_run_pr,
 ):
     assert len(a_new_test_run_pr.group_of_targets.runs) == 1
     assert (
@@ -535,7 +549,8 @@ def test_tmt_test_run_get_pr_id(clean_before_and_after, a_new_test_run_pr):
 
 
 def test_tmt_test_run_set_web_url(
-    clean_before_and_after, srpm_build_model_with_new_run_for_pr
+    clean_before_and_after,
+    srpm_build_model_with_new_run_for_pr,
 ):
     _, run_model = srpm_build_model_with_new_run_for_pr
     group = TFTTestRunGroupModel.create(run_models=[run_model])
@@ -554,14 +569,16 @@ def test_tmt_test_run_set_web_url(
     assert test_run_model.web_url == new_url
 
     test_run_for_pipeline_id = TFTTestRunTargetModel.get_by_pipeline_id(
-        test_run_model.pipeline_id
+        test_run_model.pipeline_id,
     )
     assert test_run_for_pipeline_id
     assert test_run_for_pipeline_id.web_url == new_url
 
 
 def test_tmt_test_get_by_pipeline_id_pr(
-    clean_before_and_after, pr_model, srpm_build_model_with_new_run_for_pr
+    clean_before_and_after,
+    pr_model,
+    srpm_build_model_with_new_run_for_pr,
 ):
     _, run_model = srpm_build_model_with_new_run_for_pr
     group = TFTTestRunGroupModel.create(run_models=[run_model])
@@ -573,7 +590,7 @@ def test_tmt_test_get_by_pipeline_id_pr(
     )
 
     test_run_for_pipeline_id = TFTTestRunTargetModel.get_by_pipeline_id(
-        test_run_model.pipeline_id
+        test_run_model.pipeline_id,
     )
     assert test_run_for_pipeline_id
     assert test_run_for_pipeline_id.get_project_event_object() == pr_model
@@ -663,7 +680,9 @@ def test_get_projects(clean_before_and_after, a_copr_build_for_pr):
 
 def test_get_project(clean_before_and_after, a_copr_build_for_pr):
     project = GitProjectModel.get_project(
-        "github.com", "the-namespace", "the-repo-name"
+        "github.com",
+        "the-namespace",
+        "the-repo-name",
     )
     assert project.namespace == "the-namespace"
     assert project.repo_name == "the-repo-name"
@@ -684,7 +703,7 @@ def test_get_by_forge(clean_before_and_after, multiple_forge_projects):
 
 def test_get_by_forge_namespace(clean_before_and_after, multiple_copr_builds):
     projects = list(
-        GitProjectModel.get_by_forge_namespace("github.com", "the-namespace")
+        GitProjectModel.get_by_forge_namespace(0, 10, "github.com", "the-namespace"),
     )
     assert projects[0].namespace == "the-namespace"
     assert projects[0].repo_name == "the-repo-name"
@@ -693,22 +712,34 @@ def test_get_by_forge_namespace(clean_before_and_after, multiple_copr_builds):
 def test_get_project_prs(clean_before_and_after, a_copr_build_for_pr):
     prs_a = list(
         GitProjectModel.get_project_prs(
-            0, 10, "github.com", "the-namespace", "the-repo-name"
-        )
+            0,
+            10,
+            "github.com",
+            "the-namespace",
+            "the-repo-name",
+        ),
     )
     assert prs_a
     assert len(prs_a) == 1
     assert prs_a[0].id is not None  # cant explicitly check because its random like
     prs_b = list(
         GitProjectModel.get_project_prs(
-            0, 10, "gitlab.com", "the-namespace", "the-repo-name"
-        )
+            0,
+            10,
+            "gitlab.com",
+            "the-namespace",
+            "the-repo-name",
+        ),
     )
     assert prs_b == []
     prs_c = list(
         GitProjectModel.get_project_prs(
-            0, 10, "github", "the-namespace", "the-repo-name"
-        )
+            0,
+            10,
+            "github",
+            "the-namespace",
+            "the-repo-name",
+        ),
     )
     assert prs_c == []
 
@@ -716,8 +747,12 @@ def test_get_project_prs(clean_before_and_after, a_copr_build_for_pr):
 def test_get_project_branch(clean_before_and_after, a_copr_build_for_branch_push):
     branches_list = list(
         GitProjectModel.get_project_branches(
-            "github.com", "the-namespace", "the-repo-name"
-        )
+            0,
+            10,
+            "github.com",
+            "the-namespace",
+            "the-repo-name",
+        ),
     )
     assert len(branches_list) == 1
     assert branches_list[0].name == "build-branch"
@@ -726,8 +761,12 @@ def test_get_project_branch(clean_before_and_after, a_copr_build_for_branch_push
 def test_get_project_issues(clean_before_and_after, an_issue_model):
     issues_list = list(
         GitProjectModel.get_project_issues(
-            "github.com", "the-namespace", "the-repo-name"
-        )
+            0,
+            10,
+            "github.com",
+            "the-namespace",
+            "the-repo-name",
+        ),
     )
     assert len(issues_list) == 1
     assert issues_list[0].issue_id == 2020
@@ -736,8 +775,12 @@ def test_get_project_issues(clean_before_and_after, an_issue_model):
 def test_get_project_releases(clean_before_and_after, release_model):
     releases = list(
         GitProjectModel.get_project_releases(
-            "github.com", "the-namespace", "the-repo-name"
-        )
+            0,
+            10,
+            "github.com",
+            "the-namespace",
+            "the-repo-name",
+        ),
     )
     assert releases[0].tag_name == "v1.0.2"
     assert releases[0].commit_hash == "80201a74d96c"
@@ -757,7 +800,8 @@ def test_get_installations(clean_before_and_after, multiple_installation_entries
 
 
 def test_get_installation_by_account(
-    clean_before_and_after, multiple_installation_entries
+    clean_before_and_after,
+    multiple_installation_entries,
 ):
     assert GithubInstallationModel.get_by_account_login("teg").sender_login == "teg"
     assert GithubInstallationModel.get_by_account_login("Pac23").sender_login == "Pac23"
@@ -777,7 +821,9 @@ def test_pr_get_copr_builds(
 
 
 def test_pr_multiple_commits_copr_builds(
-    clean_before_and_after, a_copr_build_for_pr, a_copr_build_for_pr_different_commit
+    clean_before_and_after,
+    a_copr_build_for_pr,
+    a_copr_build_for_pr_different_commit,
 ):
     pr_model = a_copr_build_for_pr_different_commit.get_project_event_object()
     copr_builds = pr_model.get_copr_builds()
@@ -787,7 +833,9 @@ def test_pr_multiple_commits_copr_builds(
 
 
 def test_pr_get_koji_builds(
-    clean_before_and_after, a_koji_build_for_pr, different_pr_model
+    clean_before_and_after,
+    a_koji_build_for_pr,
+    different_pr_model,
 ):
     pr_model = a_koji_build_for_pr.get_project_event_object()
     assert a_koji_build_for_pr in pr_model.get_koji_builds()
@@ -795,7 +843,9 @@ def test_pr_get_koji_builds(
 
 
 def test_pr_get_srpm_builds(
-    clean_before_and_after, srpm_build_model_with_new_run_for_pr, a_copr_build_for_pr
+    clean_before_and_after,
+    srpm_build_model_with_new_run_for_pr,
+    a_copr_build_for_pr,
 ):
     srpm_build_model, _ = srpm_build_model_with_new_run_for_pr
     pr_model = a_copr_build_for_pr.get_project_event_object()
@@ -822,7 +872,7 @@ def test_project_token_model(clean_before_and_after):
 
 
 def test_merged_runs(clean_before_and_after, few_runs):
-    for i, run_id in enumerate(few_runs, 1):
+    for _i, run_id in enumerate(few_runs, 1):
         merged_run = PipelineModel.get_merged_run(run_id)
         srpm_build_id = merged_run.srpm_build_id
 
@@ -830,7 +880,7 @@ def test_merged_runs(clean_before_and_after, few_runs):
         assert len(merged_run.copr_build_group_id) == 1
         assert len(merged_run.copr_build_group_id[0]) == 1
         build_group = CoprBuildGroupModel.get_by_id(
-            merged_run.copr_build_group_id[0][0]
+            merged_run.copr_build_group_id[0][0],
         )
 
         for copr_build in build_group.grouped_targets:
@@ -840,7 +890,8 @@ def test_merged_runs(clean_before_and_after, few_runs):
 
 
 def test_merged_chroots_on_tests_without_build(
-    clean_before_and_after, runs_without_build
+    clean_before_and_after,
+    runs_without_build,
 ):
     result = list(PipelineModel.get_merged_chroots(0, 10))
     assert len(result) == 2
@@ -851,8 +902,9 @@ def test_merged_chroots_on_tests_without_build(
 def test_tf_get_all_by_commit_target(clean_before_and_after, multiple_new_test_runs):
     test_list = list(
         TFTTestRunTargetModel.get_all_by_commit_target(
-            commit_sha=SampleValues.commit_sha, target=SampleValues.target
-        )
+            commit_sha=SampleValues.commit_sha,
+            target=SampleValues.target,
+        ),
     )
     assert len(test_list) == 1
     assert test_list[0].commit_sha == SampleValues.commit_sha
@@ -861,7 +913,7 @@ def test_tf_get_all_by_commit_target(clean_before_and_after, multiple_new_test_r
     test_list = list(
         TFTTestRunTargetModel.get_all_by_commit_target(
             commit_sha=SampleValues.commit_sha,
-        )
+        ),
     )
     assert len(test_list) == 3
     assert (
@@ -904,7 +956,8 @@ def test_propose_model_get_by_id(clean_before_and_after, propose_model):
 
 
 def test_create_propose_downstream_model(
-    clean_before_and_after, propose_downstream_model_release
+    clean_before_and_after,
+    propose_downstream_model_release,
 ):
     assert propose_downstream_model_release.status == SyncReleaseStatus.running
     # test if submitted time is something - datetime
@@ -912,14 +965,16 @@ def test_create_propose_downstream_model(
 
 
 def test_set_propose_downstream_model_status(
-    clean_before_and_after, propose_downstream_model_release
+    clean_before_and_after,
+    propose_downstream_model_release,
 ):
     propose_downstream_model_release.set_status(SyncReleaseStatus.finished)
     assert propose_downstream_model_release.status == SyncReleaseStatus.finished
 
 
 def test_get_propose_downstream_model_by_id(
-    clean_before_and_after, propose_downstream_model_release
+    clean_before_and_after,
+    propose_downstream_model_release,
 ):
     assert propose_downstream_model_release.id
 
@@ -928,12 +983,13 @@ def test_get_propose_downstream_model_by_id(
 
 
 def test_get_propose_downstream_model_by_status(
-    clean_before_and_after, multiple_propose_downstream_runs_release_trigger
+    clean_before_and_after,
+    multiple_propose_downstream_runs_release_trigger,
 ):
     assert multiple_propose_downstream_runs_release_trigger
 
     propose_downstream_list = list(
-        SyncReleaseModel.get_all_by_status(status=SyncReleaseStatus.running)
+        SyncReleaseModel.get_all_by_status(status=SyncReleaseStatus.running),
     )
     assert len(propose_downstream_list) == 2
     assert (
@@ -944,14 +1000,17 @@ def test_get_propose_downstream_model_by_status(
 
 
 def test_get_propose_downstream_model_range(
-    clean_before_and_after, multiple_propose_downstream_runs_release_trigger
+    clean_before_and_after,
+    multiple_propose_downstream_runs_release_trigger,
 ):
     assert multiple_propose_downstream_runs_release_trigger
 
     propose_downstream_list = list(
         SyncReleaseModel.get_range(
-            first=0, last=10, job_type=SyncReleaseJobType.propose_downstream
-        )
+            first=0,
+            last=10,
+            job_type=SyncReleaseJobType.propose_downstream,
+        ),
     )
     assert len(propose_downstream_list) == 4
 
@@ -964,9 +1023,7 @@ def test_sourcegit_distgit_pr_relationship(clean_before_and_after):
     dist_git_pr_id = 31
     dist_git_namespace = "packit/rpms"
     dist_git_repo_name = "python-teamcity-messages"
-    dist_git_project_url = (
-        "https://src.fedoraproject.org/fork/packit/rpms/python-teamcity-messages"
-    )
+    dist_git_project_url = "https://src.fedoraproject.org/fork/packit/rpms/python-teamcity-messages"
 
     created = SourceGitPRDistGitPRModel.get_or_create(
         source_git_pr_id,
@@ -1006,27 +1063,113 @@ def test_sourcegit_distgit_pr_relationship(clean_before_and_after):
 
 
 def test_get_source_git_dist_git_pr_relationship(
-    clean_before_and_after, source_git_dist_git_pr_new_relationship
+    clean_before_and_after,
+    source_git_dist_git_pr_new_relationship,
 ):
     assert source_git_dist_git_pr_new_relationship.id
     assert SourceGitPRDistGitPRModel.get_by_id(
-        source_git_dist_git_pr_new_relationship.id
+        source_git_dist_git_pr_new_relationship.id,
     )
 
 
 def test_get_by_source_git_id(
-    clean_before_and_after, source_git_dist_git_pr_new_relationship
+    clean_before_and_after,
+    source_git_dist_git_pr_new_relationship,
 ):
     assert source_git_dist_git_pr_new_relationship.source_git_pull_request_id
     assert SourceGitPRDistGitPRModel.get_by_source_git_id(
-        source_git_dist_git_pr_new_relationship.source_git_pull_request_id
+        source_git_dist_git_pr_new_relationship.source_git_pull_request_id,
     )
 
 
 def test_get_by_dist_git_id(
-    clean_before_and_after, source_git_dist_git_pr_new_relationship
+    clean_before_and_after,
+    source_git_dist_git_pr_new_relationship,
 ):
     assert source_git_dist_git_pr_new_relationship.dist_git_pull_request_id
     assert SourceGitPRDistGitPRModel.get_by_dist_git_id(
-        source_git_dist_git_pr_new_relationship.dist_git_pull_request_id
+        source_git_dist_git_pr_new_relationship.dist_git_pull_request_id,
     )
+
+
+def test_get_all_downstream_projects(clean_before_and_after, propose_model_submitted):
+    projects = SyncReleaseTargetModel.get_all_downstream_projects()
+    assert len(projects) == 1
+    assert projects.pop().project_url == SampleValues.downstream_project_url
+
+
+def test_project_event_get_and_reset_older_than_with_packages_config(
+    clean_before_and_after,
+    branch_project_event_model,
+):
+    branch_project_event_model.set_packages_config({"key": "value"})
+    run1 = PipelineModel.create(project_event=branch_project_event_model)
+    run1.datetime = datetime(2024, 4, 8, 12, 0, 0)
+
+    assert (
+        len(
+            list(
+                ProjectEventModel.get_and_reset_older_than_with_packages_config(
+                    timedelta(days=1),
+                ),
+            ),
+        )
+        == 1
+    )
+
+    # default datetime = now
+    PipelineModel.create(project_event=branch_project_event_model)
+
+    assert (
+        len(
+            list(
+                ProjectEventModel.get_and_reset_older_than_with_packages_config(
+                    timedelta(days=1),
+                ),
+            ),
+        )
+        == 0
+    )
+
+
+def test_create_scan(clean_before_and_after, a_scan):
+    assert a_scan.task_id == 123
+    assert a_scan.status == "succeeded"
+    assert a_scan.url == "https://scan-url"
+    assert a_scan.issues_added_url == "https://issues-added-url"
+    assert a_scan.issues_fixed_url == "https://issues-fixed-url"
+    assert a_scan.scan_results_url == "https://scan-results-url"
+    assert a_scan.copr_build_target.build_id == "123456"
+
+
+def test_add_scan_to_copr_build(clean_before_and_after, a_copr_build_for_pr):
+    a_copr_build_for_pr.add_scan(123)
+    scan = OSHScanModel.get_by_task_id(123)
+    assert scan.task_id == 123
+
+
+def test_bodhi_model_get_last_successful_by_sidetag(
+    clean_before_and_after, successful_bodhi_update_model
+):
+    assert successful_bodhi_update_model.id
+
+    model = BodhiUpdateTargetModel.get_last_successful_by_sidetag(SampleValues.sidetag)
+    assert model.id == successful_bodhi_update_model.id
+
+
+def test_bodhi_model_get_all_successful_or_in_progress_by_nvrs(
+    clean_before_and_after, successful_bodhi_update_model
+):
+    assert successful_bodhi_update_model.id
+
+    [model] = BodhiUpdateTargetModel.get_all_successful_or_in_progress_by_nvrs(SampleValues.nvr)
+    assert model.id == successful_bodhi_update_model.id
+
+
+def test_create_koji_tag_request(clean_before_and_after, a_koji_tag_request):
+    assert a_koji_tag_request.task_id == SampleValues.build_id
+    assert a_koji_tag_request.web_url == SampleValues.koji_web_url
+    assert a_koji_tag_request.target == SampleValues.target
+    assert a_koji_tag_request.sidetag == SampleValues.sidetag
+    assert a_koji_tag_request.nvr == SampleValues.nvr
+    assert a_koji_tag_request.get_project().project_url == SampleValues.project_url

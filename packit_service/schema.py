@@ -4,9 +4,9 @@
 import typing
 
 from marshmallow import Schema, ValidationError, fields, post_load
-
 from packit.config.common_package_config import Deployment
 from packit.schema import UserConfigSchema
+
 from packit_service.config import MRTarget, ProjectToSync, ServiceConfig
 
 
@@ -83,6 +83,7 @@ class ServiceConfigSchema(UserConfigSchema):
     package_config_path_override = fields.String()
     command_handler_storage_class = fields.String(missing="gp2")
     appcode = fields.String()
+    enabled_projects_for_fedora_ci = fields.List(fields.String())
 
     @post_load
     def make_instance(self, data, **kwargs):

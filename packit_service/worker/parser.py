@@ -4,65 +4,77 @@
 """
 Parser is transforming github JSONs into `events` objects
 """
+
 import logging
 from datetime import datetime, timezone
 from os import getenv
-from typing import Optional, Type, Union, Dict, Any, Tuple
+from typing import Any, Callable, ClassVar, Optional, Union
 
 from ogr.parsing import parse_git_repo
 from packit.config import JobConfigTriggerType
-
 from packit.constants import DISTGIT_INSTANCES
 from packit.utils import nested_get
-from packit_service.config import ServiceConfig, Deployment
+
+from packit_service.config import Deployment, ServiceConfig
 from packit_service.constants import (
+    TESTING_FARM_INSTALLABILITY_TEST_URL,
     KojiBuildState,
     KojiTaskState,
-    TESTING_FARM_INSTALLABILITY_TEST_URL,
 )
 from packit_service.models import (
-    TFTTestRunTargetModel,
-    TestingFarmResult,
-    ProjectReleaseModel,
     GitBranchModel,
-    PullRequestModel,
     ProjectEventModel,
+    ProjectReleaseModel,
+    PullRequestModel,
+    TestingFarmResult,
+    TFTTestRunTargetModel,
 )
 from packit_service.worker.events import (
     AbstractCoprBuildEvent,
-    KojiTaskEvent,
-    CoprBuildStartEvent,
-    CoprBuildEndEvent,
-    PushPagureEvent,
-    IssueCommentGitlabEvent,
-    MergeRequestCommentGitlabEvent,
-    MergeRequestGitlabEvent,
-    PushGitlabEvent,
-    InstallationEvent,
-    IssueCommentEvent,
-    PullRequestCommentGithubEvent,
-    PullRequestGithubEvent,
-    PushGitHubEvent,
-    ReleaseEvent,
-    TestingFarmResultsEvent,
-    PullRequestCommentPagureEvent,
-    PipelineGitlabEvent,
     CheckRerunCommitEvent,
     CheckRerunPullRequestEvent,
     CheckRerunReleaseEvent,
+    CoprBuildEndEvent,
+    CoprBuildStartEvent,
+    InstallationEvent,
+    IssueCommentEvent,
+    IssueCommentGitlabEvent,
+    KojiTaskEvent,
+    MergeRequestCommentGitlabEvent,
+    MergeRequestGitlabEvent,
+    OpenScanHubTaskFinishedEvent,
+    OpenScanHubTaskStartedEvent,
+    PipelineGitlabEvent,
+    PullRequestCommentGithubEvent,
+    PullRequestCommentPagureEvent,
+    PullRequestGithubEvent,
+    PushGitHubEvent,
+    PushGitlabEvent,
+    PushPagureEvent,
+    ReleaseEvent,
     ReleaseGitlabEvent,
     TagPushGitlabEvent,
+    TestingFarmResultsEvent,
     VMImageBuildResultEvent,
 )
+from packit_service.worker.events.comment import CommitCommentEvent
 from packit_service.worker.events.enums import (
     GitlabEventAction,
     IssueCommentAction,
     PullRequestAction,
     PullRequestCommentAction,
 )
-from packit_service.worker.events.koji import KojiBuildEvent
-from packit_service.worker.events.new_hotness import NewHotnessUpdateEvent
-from packit_service.worker.events.pagure import PullRequestFlagPagureEvent
+from packit_service.worker.events.github import CommitCommentGithubEvent
+from packit_service.worker.events.gitlab import CommitCommentGitlabEvent
+from packit_service.worker.events.koji import KojiBuildEvent, KojiBuildTagEvent
+from packit_service.worker.events.new_hotness import (
+    AnityaVersionUpdateEvent,
+    NewHotnessUpdateEvent,
+)
+from packit_service.worker.events.pagure import (
+    PullRequestFlagPagureEvent,
+    PullRequestPagureEvent,
+)
 from packit_service.worker.handlers.abstract import MAP_CHECK_PREFIX_TO_HANDLER
 from packit_service.worker.helpers.build import CoprBuildJobHelper, KojiBuildJobHelper
 from packit_service.worker.helpers.testing_farm import TestingFarmJobHelper
@@ -96,12 +108,14 @@ class Parser:
             MergeRequestGitlabEvent,
             KojiTaskEvent,
             KojiBuildEvent,
+            KojiBuildTagEvent,
             MergeRequestCommentGitlabEvent,
             IssueCommentGitlabEvent,
             PushGitlabEvent,
             PipelineGitlabEvent,
             PullRequestFlagPagureEvent,
             PullRequestCommentPagureEvent,
+            PullRequestPagureEvent,
             PushPagureEvent,
             CheckRerunCommitEvent,
             CheckRerunPullRequestEvent,
@@ -110,6 +124,10 @@ class Parser:
             ReleaseGitlabEvent,
             TagPushGitlabEvent,
             VMImageBuildResultEvent,
+            AnityaVersionUpdateEvent,
+            OpenScanHubTaskFinishedEvent,
+            OpenScanHubTaskStartedEvent,
+            CommitCommentEvent,
         ]
     ]:
         """
@@ -128,9 +146,9 @@ class Parser:
             logger.warning("No event to process!")
             return None
 
-        for response in map(
-            lambda parser: parser(event),
-            (
+        for response in (
+            parser(event)
+            for parser in (
                 Parser.parse_pr_event,
                 Parser.parse_pull_request_comment_event,
                 Parser.parse_issue_comment_event,
@@ -143,8 +161,10 @@ class Parser:
                 Parser.parse_mr_event,
                 Parser.parse_koji_task_event,
                 Parser.parse_koji_build_event,
+                Parser.parse_koji_build_tag_event,
                 Parser.parse_merge_request_comment_event,
                 Parser.parse_gitlab_issue_comment_event,
+                Parser.parse_gitlab_commit_comment_event,
                 Parser.parse_gitlab_push_event,
                 Parser.parse_pipeline_event,
                 Parser.parse_pagure_push_event,
@@ -153,7 +173,12 @@ class Parser:
                 Parser.parse_new_hotness_update_event,
                 Parser.parse_gitlab_release_event,
                 Parser.parse_gitlab_tag_push_event,
-            ),
+                Parser.parse_anitya_version_update_event,
+                Parser.parse_openscanhub_task_finished_event,
+                Parser.parse_openscanhub_task_started_event,
+                Parser.parse_commit_comment_event,
+                Parser.parse_pagure_pull_request_event,
+            )
         ):
             if response:
                 return response
@@ -200,7 +225,7 @@ class Parser:
             f"url={source_project_url} "
             f"namespace={parsed_source_url.namespace} "
             f"repo={parsed_source_url.repo} "
-            f"branch={source_repo_branch}."
+            f"branch={source_repo_branch}.",
         )
 
         target_project_url = nested_get(event, "project", "web_url")
@@ -214,7 +239,7 @@ class Parser:
             f"url={target_project_url} "
             f"namespace={parsed_target_url.namespace} "
             f"repo={parsed_target_url.repo} "
-            f"branch={target_repo_branch}."
+            f"branch={target_repo_branch}.",
         )
 
         commit_sha = nested_get(event, "object_attributes", "last_commit", "id")
@@ -261,7 +286,12 @@ class Parser:
         # and not the fork, on the other hand, we don't process packit.yaml from
         # the PR but what's in the upstream
         base_repo_namespace = nested_get(
-            event, "pull_request", "head", "repo", "owner", "login"
+            event,
+            "pull_request",
+            "head",
+            "repo",
+            "owner",
+            "login",
         )
         base_repo_name = nested_get(event, "pull_request", "head", "repo", "name")
 
@@ -280,7 +310,12 @@ class Parser:
             return None
 
         target_repo_namespace = nested_get(
-            event, "pull_request", "base", "repo", "owner", "login"
+            event,
+            "pull_request",
+            "base",
+            "repo",
+            "owner",
+            "login",
         )
         target_repo_name = nested_get(event, "pull_request", "base", "repo", "name")
         logger.info(f"Target repo: {target_repo_namespace}/{target_repo_name}.")
@@ -324,7 +359,7 @@ class Parser:
             f"Gitlab release with tag {tag_name} event on Project: "
             f"repo={parsed_url.repo} "
             f"namespace={parsed_url.namespace} "
-            f"url={project_url}."
+            f"url={project_url}.",
         )
         commit_sha = nested_get(event, "commit", "id")
 
@@ -352,7 +387,8 @@ class Parser:
 
         if not (ref and event.get("commits") and event.get("before") and actor):
             return False
-        elif event.get("after").startswith("0000000"):
+
+        if event.get("after").startswith("0000000"):
             logger.info(f"GitLab push event on '{ref}' by {actor} to delete branch/tag")
             return False
 
@@ -378,7 +414,7 @@ class Parser:
 
         if not Parser.is_gitlab_push_a_create_event(event):
             raise PackitParserException(
-                "Event is not a push create event, stop parsing"
+                "Event is not a push create event, stop parsing",
             )
 
         # The first item in the list should be the head (newest) commit,
@@ -388,19 +424,19 @@ class Parser:
         logger.info(
             f"Gitlab push event on '{raw_ref}': {before[:8]} -> {checkout_sha[:8]} "
             f"by {actor} "
-            f"({number_of_commits} {'commit' if number_of_commits == 1 else 'commits'})"
+            f"({number_of_commits} {'commit' if number_of_commits == 1 else 'commits'})",
         )
 
         if not (project_url := nested_get(event, "project", "web_url")):
             raise PackitParserException(
-                "Target project url not found in the event, stop parsing"
+                "Target project url not found in the event, stop parsing",
             )
         parsed_url = parse_git_repo(potential_url=project_url)
         logger.info(
             f"Project: "
             f"repo={parsed_url.repo} "
             f"namespace={parsed_url.namespace} "
-            f"url={project_url}."
+            f"url={project_url}.",
         )
         ref = raw_ref.split("/", maxsplit=2)[-1]
 
@@ -433,7 +469,7 @@ class Parser:
             f"by actor {actor} on Project: "
             f"repo={parsed_url.repo} "
             f"namespace={parsed_url.namespace} "
-            f"url={project_url}."
+            f"url={project_url}.",
         )
 
         return TagPushGitlabEvent(
@@ -489,15 +525,14 @@ class Parser:
         # https://developer.github.com/v3/activity/events/types/#pushevent
         # > Note: The webhook payload example following the table differs
         # > significantly from the Events API payload described in the table.
-        head_commit = (
-            event.get("head") or event.get("after") or event.get("head_commit")
-        )
+        head_commit = event.get("head") or event.get("after") or event.get("head_commit")
 
         if not (raw_ref and head_commit and before and pusher):
             return None
-        elif event.get("deleted"):
+
+        if event.get("deleted"):
             logger.info(
-                f"GitHub push event on '{raw_ref}' by {pusher} to delete branch"
+                f"GitHub push event on '{raw_ref}' by {pusher} to delete branch",
             )
             return None
 
@@ -510,7 +545,7 @@ class Parser:
         logger.info(
             f"GitHub push event on '{raw_ref}': {before[:8]} -> {head_commit[:8]} "
             f"by {pusher} "
-            f"({number_of_commits} {'commit' if number_of_commits == 1 else 'commits'})"
+            f"({number_of_commits} {'commit' if number_of_commits == 1 else 'commits'})",
         )
 
         repo_namespace = nested_get(event, "repository", "owner", "login")
@@ -539,8 +574,7 @@ class Parser:
         """
         if nested_get(event, "issue", "pull_request"):
             return Parser.parse_pull_request_comment_event(event)
-        else:
-            return Parser.parse_issue_comment_event(event)
+        return Parser.parse_issue_comment_event(event)
 
     @staticmethod
     def parse_pull_request_comment_event(
@@ -560,7 +594,7 @@ class Parser:
         comment = nested_get(event, "comment", "body")
         comment_id = nested_get(event, "comment", "id")
         logger.info(
-            f"Github PR#{pr_id} comment: {comment!r} id#{comment_id} {action!r} event."
+            f"Github PR#{pr_id} comment: {comment!r} id#{comment_id} {action!r} event.",
         )
 
         base_repo_namespace = nested_get(event, "issue", "user", "login")
@@ -643,16 +677,62 @@ class Parser:
         )
 
     @staticmethod
+    def parse_commit_comment_event(
+        event,
+    ) -> Optional[CommitCommentEvent]:
+        """Look into the provided event and see if it is Github commit comment event."""
+        if not (commit_sha := nested_get(event, "comment", "commit_id")):
+            return None
+
+        comment = nested_get(event, "comment", "body")
+        comment_id = nested_get(event, "comment", "id")
+        logger.info(
+            f"Github commit comment on #{commit_sha}: {comment!r} id#{comment_id} event.",
+        )
+
+        user_login = nested_get(event, "comment", "user", "login")
+        if not user_login:
+            logger.warning("No GitHub login name from event.")
+            return None
+        if user_login in {"packit-as-a-service[bot]", "packit-as-a-service-stg[bot]"}:
+            logger.debug("Our own comment.")
+            return None
+
+        repo_namespace = nested_get(event, "repository", "owner", "login")
+        repo_name = nested_get(event, "repository", "name")
+
+        logger.info(f"Repo: {repo_namespace}/{repo_name}.")
+        https_url = event["repository"]["html_url"]
+        return CommitCommentGithubEvent(
+            commit_sha=commit_sha,
+            repo_namespace=repo_namespace,
+            repo_name=repo_name,
+            project_url=https_url,
+            actor=user_login,
+            comment=comment,
+            comment_id=comment_id,
+        )
+
+    @staticmethod
     def parse_gitlab_comment_event(
         event,
-    ) -> Optional[Union[MergeRequestCommentGitlabEvent, IssueCommentGitlabEvent]]:
+    ) -> Optional[
+        Union[
+            CommitCommentEvent,
+            MergeRequestCommentGitlabEvent,
+            IssueCommentGitlabEvent,
+        ]
+    ]:
         """Check whether the comment event from Gitlab comes from an MR or issue,
         and parse accordingly.
         """
         if event.get("merge_request"):
             return Parser.parse_merge_request_comment_event(event)
-        else:
-            return Parser.parse_gitlab_issue_comment_event(event)
+
+        if event.get("commit"):
+            return Parser.parse_gitlab_commit_comment_event(event)
+
+        return Parser.parse_gitlab_issue_comment_event(event)
 
     @staticmethod
     def parse_gitlab_issue_comment_event(event) -> Optional[IssueCommentGitlabEvent]:
@@ -685,7 +765,7 @@ class Parser:
             action = state
 
         logger.info(
-            f"Gitlab issue ID: {issue_id} comment: {comment!r} {action!r} event."
+            f"Gitlab issue ID: {issue_id} comment: {comment!r} {action!r} event.",
         )
 
         project_url = nested_get(event, "project", "web_url")
@@ -697,7 +777,7 @@ class Parser:
             f"Project: "
             f"repo={parsed_url.repo} "
             f"namespace={parsed_url.namespace} "
-            f"url={project_url}."
+            f"url={project_url}.",
         )
 
         actor = nested_get(event, "user", "username")
@@ -748,7 +828,7 @@ class Parser:
         comment_id = nested_get(event, "object_attributes", "id")
         logger.info(
             f"Gitlab MR id#{object_id} iid#{object_iid} comment: {comment!r} id#{comment_id} "
-            f"{action!r} event."
+            f"{action!r} event.",
         )
 
         source_project_url = nested_get(event, "merge_request", "source", "web_url")
@@ -760,7 +840,7 @@ class Parser:
             f"Source: "
             f"repo={parsed_source_url.repo} "
             f"namespace={parsed_source_url.namespace} "
-            f"url={source_project_url}."
+            f"url={source_project_url}.",
         )
 
         target_project_url = nested_get(event, "project", "web_url")
@@ -772,7 +852,7 @@ class Parser:
             f"Target: "
             f"repo={parsed_target_url.repo} "
             f"namespace={parsed_target_url.namespace} "
-            f"url={target_project_url}."
+            f"url={target_project_url}.",
         )
 
         actor = nested_get(event, "user", "username")
@@ -805,9 +885,62 @@ class Parser:
         )
 
     @staticmethod
+    def parse_gitlab_commit_comment_event(
+        event,
+    ) -> Optional[CommitCommentEvent]:
+        """Look into the provided event and see if it is Gitlab commit comment event."""
+        if event.get("object_kind") != "note":
+            return None
+
+        commit = event.get("commit")
+        if not commit:
+            return None
+
+        commit_sha = nested_get(event, "commit", "id")
+
+        comment = nested_get(event, "object_attributes", "note")
+        comment_id = nested_get(event, "object_attributes", "id")
+        logger.info(
+            f"Gitlab commit comment on #{commit_sha}: {comment!r} id#{comment_id} " " event.",
+        )
+
+        project_url = nested_get(event, "project", "web_url")
+        if not project_url:
+            logger.warning("Project url not found in the event.")
+            return None
+
+        parsed_url = parse_git_repo(potential_url=project_url)
+        logger.info(
+            f"Project: "
+            f"repo={parsed_url.repo} "
+            f"namespace={parsed_url.namespace} "
+            f"url={project_url}.",
+        )
+
+        actor = nested_get(event, "user", "username")
+        if not actor:
+            logger.warning("No Gitlab username from event.")
+            return None
+
+        if actor in {"packit-as-a-service", "packit-as-a-service-stg"}:
+            logger.debug("Our own comment.")
+            return None
+
+        return CommitCommentGitlabEvent(
+            commit_sha=commit_sha,
+            repo_namespace=parsed_url.namespace,
+            repo_name=parsed_url.repo,
+            project_url=project_url,
+            actor=actor,
+            comment=comment,
+            comment_id=comment_id,
+        )
+
+    @staticmethod
     def parse_check_name(
-        check_name: str, db_project_event: ProjectEventModel
-    ) -> Optional[Tuple[str, str, str]]:
+        check_name: str,
+        db_project_event: ProjectEventModel,
+    ) -> Optional[tuple[str, str, str]]:
         """
         Parse the given name of the check run.
 
@@ -833,7 +966,7 @@ class Parser:
 
         if check_name_job not in MAP_CHECK_PREFIX_TO_HANDLER:
             logger.warning(
-                f"{check_name_job} not in {list(MAP_CHECK_PREFIX_TO_HANDLER.keys())}"
+                f"{check_name_job} not in {list(MAP_CHECK_PREFIX_TO_HANDLER.keys())}",
             )
             return None
 
@@ -881,13 +1014,13 @@ class Parser:
         if not (check_name_job and check_name_target):
             logger.warning(
                 f"We were not able to parse the job and target "
-                f"from the check run name {check_name}."
+                f"from the check run name {check_name}.",
             )
             return None
 
         logger.info(
             f"Check name job: {check_name_job}, check name target: {check_name_target}, "
-            f"check name identifier: {check_name_identifier}"
+            f"check name identifier: {check_name_identifier}",
         )
 
         return check_name_job, check_name_target, check_name_identifier
@@ -895,14 +1028,9 @@ class Parser:
     @staticmethod
     def parse_check_rerun_event(
         event,
-    ) -> Optional[
-        Union[CheckRerunCommitEvent, CheckRerunPullRequestEvent, CheckRerunReleaseEvent]
-    ]:
+    ) -> Optional[Union[CheckRerunCommitEvent, CheckRerunPullRequestEvent, CheckRerunReleaseEvent]]:
         """Look into the provided event and see if it is Github check rerun event."""
-        if not (
-            nested_get(event, "check_run")
-            and nested_get(event, "action") == "rerequested"
-        ):
+        if not (nested_get(event, "check_run") and nested_get(event, "action") == "rerequested"):
             return None
 
         check_name = nested_get(event, "check_run", "name")
@@ -920,7 +1048,7 @@ class Parser:
 
         if not external_id:
             logger.warning(
-                "No external_id to identify the original project event provided."
+                "No external_id to identify the original project event provided.",
             )
             return None
 
@@ -1015,7 +1143,7 @@ class Parser:
         logger.info(f"Github App installation {action!r} event. id: {installation_id}")
         logger.debug(
             f"account: {event['installation']['account']}, "
-            f"repositories: {repo_names}, sender: {event['sender']}"
+            f"repositories: {repo_names}, sender: {event['sender']}",
         )
 
         # namespace (user/organization) into which the app has been installed
@@ -1069,7 +1197,7 @@ class Parser:
             return None
 
         logger.info(
-            f"New release event {release_ref!r} for repo {repo_namespace}/{repo_name}."
+            f"New release event {release_ref!r} for repo {repo_namespace}/{repo_name}.",
         )
         https_url = event["repository"]["html_url"]
         return ReleaseEvent(repo_namespace, repo_name, release_ref, https_url)
@@ -1078,33 +1206,35 @@ class Parser:
     def parse_pagure_push_event(event) -> Optional[PushPagureEvent]:
         """this corresponds to dist-git event when someone pushes new commits"""
         topic = event.get("topic")
-        if topic != "org.fedoraproject.prod.git.receive":
+        if topic != "org.fedoraproject.prod.pagure.git.receive":
             return None
 
         logger.info(f"Dist-git commit event, topic: {topic}")
 
-        dg_repo_namespace = nested_get(event, "commit", "namespace")
-        dg_repo_name = nested_get(event, "commit", "repo")
+        dg_repo_namespace = nested_get(event, "repo", "namespace")
+        dg_repo_name = nested_get(event, "repo", "name")
 
         if not (dg_repo_namespace and dg_repo_name):
             logger.warning("No full name of the repository.")
             return None
 
-        dg_branch = nested_get(event, "commit", "branch")
-        dg_commit = nested_get(event, "commit", "rev")
+        dg_branch = nested_get(event, "branch")
+        dg_commit = nested_get(event, "end_commit")
         if not (dg_branch and dg_commit):
             logger.warning("Target branch/rev for the new commits is not set.")
             return None
 
-        username = nested_get(event, "commit", "username")
+        username = nested_get(event, "agent")
 
         logger.info(
             f"New commits added to dist-git repo {dg_repo_namespace}/{dg_repo_name},"
-            f"rev: {dg_commit}, branch: {dg_branch}"
+            f"rev: {dg_commit}, branch: {dg_branch}",
         )
 
         dg_base_url = getenv("DISTGIT_URL", DISTGIT_INSTANCES["fedpkg"].url)
         dg_project_url = f"{dg_base_url}{dg_repo_namespace}/{dg_repo_name}"
+
+        dg_pr_id = nested_get(event, "pull_request_id")
 
         return PushPagureEvent(
             repo_namespace=dg_repo_namespace,
@@ -1113,13 +1243,24 @@ class Parser:
             project_url=dg_project_url,
             commit_sha=dg_commit,
             committer=username,
+            pr_id=dg_pr_id,
         )
 
     @staticmethod
     def parse_data_from_testing_farm(
-        tft_test_run: TFTTestRunTargetModel, event: Dict[Any, Any]
-    ) -> Tuple[
-        str, str, TestingFarmResult, str, str, str, str, str, datetime, Optional[str]
+        tft_test_run: TFTTestRunTargetModel,
+        event: dict[Any, Any],
+    ) -> tuple[
+        str,
+        str,
+        TestingFarmResult,
+        str,
+        str,
+        str,
+        str,
+        str,
+        datetime,
+        Optional[str],
     ]:
         """Parses common data from testing farm response.
 
@@ -1140,9 +1281,9 @@ class Parser:
 
         # error and complete are the end states
         if tf_state not in ("complete", "error"):
-            result = TestingFarmResult(tf_state or "unknown")
+            result = TestingFarmResult.from_string(tf_state or "unknown")
         else:
-            result = TestingFarmResult(tf_result or tf_state or "unknown")
+            result = TestingFarmResult.from_string(tf_result or tf_state or "unknown")
 
         summary: str = nested_get(event, "result", "summary") or ""
         env: dict = nested_get(event, "environments_requested", 0, default={})
@@ -1185,16 +1326,10 @@ class Parser:
 
         # ["test"]["fmf"]["url"] contains PR's source/fork url or TF's install test url.
         # We need the original/base project url stored in db.
-        if (
-            tft_test_run
-            and tft_test_run.data
-            and "base_project_url" in tft_test_run.data
-        ):
+        if tft_test_run and tft_test_run.data and "base_project_url" in tft_test_run.data:
             project_url = tft_test_run.data["base_project_url"]
         else:
-            project_url = (
-                fmf_url if fmf_url != TESTING_FARM_INSTALLABILITY_TEST_URL else None
-            )
+            project_url = fmf_url if fmf_url != TESTING_FARM_INSTALLABILITY_TEST_URL else None
 
         log_url: str = nested_get(event, "run", "artifacts")
 
@@ -1250,7 +1385,7 @@ class Parser:
         logger.debug(
             f"project_url: {project_url}, ref: {ref}, result: {result}, "
             f"summary: {summary!r}, copr-build: {copr_build_id}:{copr_chroot},\n"
-            f"log_url: {log_url}"
+            f"log_url: {log_url}",
         )
 
         return TestingFarmResultsEvent(
@@ -1272,7 +1407,7 @@ class Parser:
         """this corresponds to copr build event e.g:"""
         topic = event.get("topic")
 
-        copr_build_cls: Type["AbstractCoprBuildEvent"]
+        copr_build_cls: type[AbstractCoprBuildEvent]
         if topic == "org.fedoraproject.prod.copr.build.start":
             copr_build_cls = CoprBuildStartEvent
         elif topic == "org.fedoraproject.prod.copr.build.end":
@@ -1292,7 +1427,14 @@ class Parser:
         timestamp = event.get("timestamp")
 
         return copr_build_cls.from_build_id(
-            topic, build_id, chroot, status, owner, project_name, pkg, timestamp
+            topic,
+            build_id,
+            chroot,
+            status,
+            owner,
+            project_name,
+            pkg,
+            timestamp,
         )
 
     @staticmethod
@@ -1336,13 +1478,18 @@ class Parser:
 
         build_id = event.get("build_id")
         task_id = event.get("task_id")
-        logger.info(f"Koji event: build_id={build_id} task_id={task_id}")
+        owner = event.get("owner")
+        logger.info(f"Koji event: build_id={build_id} task_id={task_id} owner={owner}")
 
         new_state = (
             KojiBuildState.from_number(raw_new)
             if (raw_new := event.get("new")) is not None
             else None
         )
+        if new_state == KojiBuildState.deleted:
+            logger.debug("We are not interested in deleted builds.")
+            return None
+
         old_state = (
             KojiBuildState.from_number(raw_old)
             if (raw_old := event.get("old")) is not None
@@ -1364,9 +1511,7 @@ class Parser:
         #       {}
         #     ],
         raw_git_ref, fedora_target, _ = event.get("request")
-        project_url = (
-            raw_git_ref.split("#")[0].removeprefix("git+").removesuffix(".git")
-        )
+        project_url = raw_git_ref.split("#")[0].removeprefix("git+").removesuffix(".git")
         package_name, commit_hash = raw_git_ref.split("/")[-1].split(".git#")
         branch_name = fedora_target.removesuffix("-candidate")
 
@@ -1396,6 +1541,41 @@ class Parser:
             old_state=old_state,
             start_time=start_time,
             completion_time=completion_time,
+            owner=owner,
+        )
+
+    @staticmethod
+    def parse_koji_build_tag_event(event) -> Optional[KojiBuildTagEvent]:
+        if event.get("topic") != "org.fedoraproject.prod.buildsys.tag":
+            return None
+
+        build_id = event.get("build_id")
+        tag_name = event.get("tag")
+        tag_id = event.get("tag_id")
+        owner = event.get("owner")
+
+        logger.info(
+            f"Koji build tag event: build_id={build_id} tag={tag_name} owner={owner}",
+        )
+
+        package_name = event.get("name")
+        epoch = event.get("epoch")
+        version = event.get("version")
+        release = event.get("release")
+
+        dg_base_url = getenv("DISTGIT_URL", DISTGIT_INSTANCES["fedpkg"].url)
+        distgit_project_url = f"{dg_base_url}rpms/{package_name}"
+
+        return KojiBuildTagEvent(
+            build_id=build_id,
+            tag_name=tag_name,
+            tag_id=tag_id,
+            project_url=distgit_project_url,
+            package_name=package_name,
+            epoch=epoch,
+            version=version,
+            release=release,
+            owner=owner,
         )
 
     @staticmethod
@@ -1510,7 +1690,7 @@ class Parser:
             comment_id = event["pullrequest"]["comments"][-1]["id"]
         else:
             raise ValueError(
-                f"Unknown comment location in response for {event['topic']}"
+                f"Unknown comment location in response for {event['topic']}",
             )
 
         return PullRequestCommentPagureEvent(
@@ -1526,6 +1706,50 @@ class Parser:
             user_login=pagure_login,
             comment=comment,
             comment_id=comment_id,
+        )
+
+    @staticmethod
+    def parse_pagure_pull_request_event(
+        event,
+    ) -> Optional[PullRequestPagureEvent]:
+        if (topic := event.get("topic", "")) not in (
+            "org.fedoraproject.prod.pagure.pull-request.new",
+            "org.fedoraproject.prod.pagure.pull-request.updated",
+            "org.fedoraproject.prod.pagure.pull-request.rebased",
+        ):
+            return None
+
+        logger.info(f"Pagure PR event, topic: {topic}")
+
+        action = (
+            PullRequestAction.opened.value
+            if topic.endswith("new")
+            else PullRequestAction.synchronize.value
+        )
+        pr_id = event["pullrequest"]["id"]
+        pagure_login = event["agent"]
+
+        base_repo_namespace = event["pullrequest"]["project"]["namespace"]
+        base_repo_name = event["pullrequest"]["project"]["name"]
+        repo_from = event["pullrequest"]["repo_from"]
+        base_repo_owner = repo_from["user"]["name"] if repo_from else pagure_login
+        target_repo = repo_from["name"] if repo_from else base_repo_name
+        https_url = event["pullrequest"]["project"]["full_url"]
+        commit_sha = event["pullrequest"]["commit_stop"]
+        target_branch = event["pullrequest"]["branch"]
+
+        return PullRequestPagureEvent(
+            action=PullRequestAction[action],
+            pr_id=pr_id,
+            base_repo_namespace=base_repo_namespace,
+            base_repo_name=base_repo_name,
+            base_repo_owner=base_repo_owner,
+            base_ref=None,
+            target_repo=target_repo,
+            project_url=https_url,
+            commit_sha=commit_sha,
+            user_login=pagure_login,
+            target_branch=target_branch,
         )
 
     @staticmethod
@@ -1551,10 +1775,12 @@ class Parser:
         version = nested_get(event, "trigger", "msg", "project", "version")
 
         bug_id = nested_get(event, "bug", "bug_id")
+        anitya_project_id = nested_get(event, "trigger", "msg", "project", "id")
+        anitya_project_name = nested_get(event, "trigger", "msg", "project", "name")
 
         logger.info(
             f"New hotness update event for package: {package_name}, version: {version},"
-            f" bug ID: {bug_id}"
+            f" bug ID: {bug_id}",
         )
 
         return NewHotnessUpdateEvent(
@@ -1562,10 +1788,93 @@ class Parser:
             version=version,
             distgit_project_url=distgit_project_url,
             bug_id=bug_id,
+            anitya_project_id=anitya_project_id,
+            anitya_project_name=anitya_project_name,
         )
 
+    @staticmethod
+    def parse_anitya_version_update_event(event) -> Optional[AnityaVersionUpdateEvent]:
+        if "anitya.project.version.update.v2" not in event.get("topic", ""):
+            return None
+
+        # FIXME: Handle Fedora too in case we want to support multiple releases
+        # such as for Go.
+        package_name = next(
+            package["package_name"]
+            for package in event["message"]["packages"]
+            if package["distro"] == "CentOS"
+        )
+        distgit_project_url = DISTGIT_INSTANCES["centpkg"].distgit_project_url(
+            package_name,
+        )
+
+        # ‹upstream_versions› contain the new releases
+        versions = nested_get(event, "message", "upstream_versions")
+
+        anitya_project_id = nested_get(event, "message", "project", "id")
+        anitya_project_name = nested_get(event, "message", "project", "name")
+
+        logger.info(
+            f"Anitya version update event for package: {package_name}, versions: {versions}",
+        )
+        return AnityaVersionUpdateEvent(
+            package_name=package_name,
+            versions=versions,
+            distgit_project_url=distgit_project_url,
+            anitya_project_id=anitya_project_id,
+            anitya_project_name=anitya_project_name,
+        )
+
+    @staticmethod
+    def parse_openscanhub_task_finished_event(
+        event,
+    ) -> Optional[OpenScanHubTaskFinishedEvent]:
+        if "openscanhub.task.finished" not in event.get("topic", ""):
+            return None
+
+        task_id = event.get("task_id")
+        status = event.get("status")
+        logger.info(f"OpenScanHub task: {task_id} finished with status {status}.")
+
+        event = OpenScanHubTaskFinishedEvent(
+            task_id=task_id,
+            status=status,
+            issues_added_url=event.get("added.js", ""),
+            issues_fixed_url=event.get("fixed.js", ""),
+            scan_results_url=event.get("scan-results.js", ""),
+        )
+
+        if not event.build:
+            logger.warning(
+                "OpenScanHub task.finished is missing association with build. "
+                "Package config can not be resolved without it. "
+                "Skipping the event.",
+            )
+            return None
+        return event
+
+    @staticmethod
+    def parse_openscanhub_task_started_event(
+        event,
+    ) -> Optional[OpenScanHubTaskStartedEvent]:
+        if "openscanhub.task.started" not in event.get("topic", ""):
+            return None
+
+        task_id = event.get("task_id")
+        logger.info(f"OpenScanHub task: {task_id} started.")
+
+        event = OpenScanHubTaskStartedEvent(task_id=task_id)
+        if not event.build:
+            logger.warning(
+                "OpenScanHub task.started is missing association with build. "
+                "Package config can not be resolved without it. "
+                "Skipping the event.",
+            )
+            return None
+        return event
+
     # The .__func__ are needed for Python < 3.10
-    MAPPING = {
+    MAPPING: ClassVar[dict[str, dict[str, Callable]]] = {
         "github": {
             "check_run": parse_check_rerun_event.__func__,  # type: ignore
             "pull_request": parse_pr_event.__func__,  # type: ignore
@@ -1573,6 +1882,7 @@ class Parser:
             "release": parse_release_event.__func__,  # type: ignore
             "push": parse_github_push_event.__func__,  # type: ignore
             "installation": parse_installation_event.__func__,  # type: ignore
+            "commit_comment": parse_commit_comment_event.__func__,  # type: ignore
         },
         # https://docs.gitlab.com/ee/user/project/integrations/webhook_events.html
         "gitlab": {
@@ -1586,13 +1896,26 @@ class Parser:
         "fedora-messaging": {
             "pagure.pull-request.flag.added": parse_pagure_pr_flag_event.__func__,  # type: ignore
             "pagure.pull-request.flag.updated": parse_pagure_pr_flag_event.__func__,  # type: ignore
-            "pagure.pull-request.comment.added": parse_pagure_pull_request_comment_event.__func__,  # type: ignore # noqa: E501
-            "git.receive": parse_pagure_push_event.__func__,  # type: ignore
+            "pagure.pull-request.comment.added": parse_pagure_pull_request_comment_event.__func__,  # type: ignore
+            "pagure.pull-request.new": parse_pagure_pull_request_event.__func__,  # type: ignore
+            "pagure.pull-request.updated": parse_pagure_pull_request_event.__func__,  # type: ignore
+            "pagure.pull-request.rebased": parse_pagure_pull_request_event.__func__,  # type: ignore
+            "pagure.git.receive": parse_pagure_push_event.__func__,  # type: ignore
             "copr.build.start": parse_copr_event.__func__,  # type: ignore
             "copr.build.end": parse_copr_event.__func__,  # type: ignore
             "buildsys.task.state.change": parse_koji_task_event.__func__,  # type: ignore
             "buildsys.build.state.change": parse_koji_build_event.__func__,  # type: ignore
+            "buildsys.tag": parse_koji_build_tag_event.__func__,  # type: ignore
             "hotness.update.bug.file": parse_new_hotness_update_event.__func__,  # type: ignore
+            "org.release-monitoring.prod.anitya.project.version.update.v2": (
+                parse_anitya_version_update_event.__func__  # type: ignore
+            ),
+            "openscanhub.task.started": (
+                parse_openscanhub_task_started_event.__func__  # type: ignore
+            ),
+            "openscanhub.task.finished": (
+                parse_openscanhub_task_finished_event.__func__  # type: ignore
+            ),
         },
         "testing-farm": {
             "results": parse_testing_farm_results_event.__func__,  # type: ignore

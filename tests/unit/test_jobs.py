@@ -1,15 +1,12 @@
 # Copyright Contributors to the Packit project.
 # SPDX-License-Identifier: MIT
 
-from typing import Type
-
 import copy
+
 import celery
 import pytest
 from flexmock import flexmock
-
 from ogr.exceptions import GithubAppNotInstalledError
-
 from packit.config import (
     CommonPackageConfig,
     JobConfig,
@@ -22,8 +19,13 @@ from packit_service.config import ServiceConfig
 from packit_service.constants import COMMENT_REACTION
 from packit_service.worker.allowlist import Allowlist
 from packit_service.worker.events import (
+    AbstractCoprBuildEvent,
     AbstractIssueCommentEvent,
     AbstractPRCommentEvent,
+    CheckRerunCommitEvent,
+    CheckRerunEvent,
+    CheckRerunPullRequestEvent,
+    CheckRerunReleaseEvent,
     CoprBuildEndEvent,
     CoprBuildStartEvent,
     IssueCommentEvent,
@@ -37,30 +39,32 @@ from packit_service.worker.events import (
     PushGitlabEvent,
     PushPagureEvent,
     ReleaseEvent,
-    TestingFarmResultsEvent,
-    CheckRerunCommitEvent,
-    CheckRerunPullRequestEvent,
-    CheckRerunReleaseEvent,
     ReleaseGitlabEvent,
-    CheckRerunEvent,
+    TestingFarmResultsEvent,
     VMImageBuildResultEvent,
-    AbstractCoprBuildEvent,
 )
-from packit_service.worker.events.koji import KojiBuildEvent, AbstractKojiEvent
+from packit_service.worker.events.koji import (
+    AbstractKojiEvent,
+    KojiBuildEvent,
+    KojiBuildTagEvent,
+)
 from packit_service.worker.handlers import (
     CoprBuildEndHandler,
+    CoprBuildHandler,
     CoprBuildStartHandler,
     JobHandler,
-    TestingFarmHandler,
-    TestingFarmResultsHandler,
-    CoprBuildHandler,
     KojiBuildHandler,
     KojiTaskReportHandler,
     ProposeDownstreamHandler,
+    TestingFarmHandler,
+    TestingFarmResultsHandler,
 )
 from packit_service.worker.handlers.bodhi import CreateBodhiUpdateHandler
 from packit_service.worker.handlers.distgit import DownstreamKojiBuildHandler
-from packit_service.worker.handlers.koji import KojiBuildReportHandler
+from packit_service.worker.handlers.koji import (
+    KojiBuildReportHandler,
+    KojiBuildTagHandler,
+)
 from packit_service.worker.jobs import SteveJobs, get_handlers_for_check_rerun
 from packit_service.worker.result import TaskResults
 
@@ -74,7 +78,7 @@ from packit_service.worker.result import TaskResults
             flexmock(job_config_trigger_type=JobConfigTriggerType.pull_request),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
@@ -114,7 +118,7 @@ from packit_service.worker.result import TaskResults
             flexmock(job_config_trigger_type=JobConfigTriggerType.pull_request),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.commit,
                     packages={"package": CommonPackageConfig()},
                 ),
@@ -128,7 +132,7 @@ from packit_service.worker.result import TaskResults
             flexmock(job_config_trigger_type=JobConfigTriggerType.pull_request),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
@@ -141,7 +145,7 @@ from packit_service.worker.result import TaskResults
             flexmock(job_config_trigger_type=JobConfigTriggerType.commit),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.commit,
                     packages={"package": CommonPackageConfig()},
                 ),
@@ -154,7 +158,7 @@ from packit_service.worker.result import TaskResults
             flexmock(job_config_trigger_type=JobConfigTriggerType.commit),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.commit,
                     packages={"package": CommonPackageConfig()},
                 ),
@@ -167,7 +171,7 @@ from packit_service.worker.result import TaskResults
             flexmock(job_config_trigger_type=JobConfigTriggerType.release),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.release,
                     packages={"package": CommonPackageConfig()},
                 ),
@@ -175,13 +179,39 @@ from packit_service.worker.result import TaskResults
             {CoprBuildHandler},
             id="config=build_for_release&release&ReleaseEvent",
         ),
+        pytest.param(
+            ReleaseEvent,
+            flexmock(job_config_trigger_type=JobConfigTriggerType.release),
+            [
+                JobConfig(
+                    type=JobType.tests,
+                    trigger=JobConfigTriggerType.release,
+                    packages={"package": CommonPackageConfig()},
+                ),
+            ],
+            {TestingFarmHandler},
+            id="config=test_for_release&release&ReleaseEvent",
+        ),
+        pytest.param(
+            ReleaseGitlabEvent,
+            flexmock(job_config_trigger_type=JobConfigTriggerType.release),
+            [
+                JobConfig(
+                    type=JobType.tests,
+                    trigger=JobConfigTriggerType.release,
+                    packages={"package": CommonPackageConfig()},
+                ),
+            ],
+            {TestingFarmHandler},
+            id="config=test_for_release&release&ReleaseGitlabEvent",
+        ),
         # Copr results for build:
         pytest.param(
             CoprBuildStartEvent,
             flexmock(job_config_trigger_type=JobConfigTriggerType.pull_request),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
@@ -194,7 +224,7 @@ from packit_service.worker.result import TaskResults
             flexmock(job_config_trigger_type=JobConfigTriggerType.pull_request),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
@@ -222,78 +252,78 @@ from packit_service.worker.result import TaskResults
             flexmock(job_config_trigger_type=JobConfigTriggerType.pull_request),
             [
                 JobConfig(
-                    type=JobType.production_build,
+                    type=JobType.upstream_koji_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
             ],
             {KojiBuildHandler},
-            id="config=production_build_for_pr&pull_request&PullRequestGithubEvent",
+            id="config=upstream_koji_build_for_pr&pull_request&PullRequestGithubEvent",
         ),
         pytest.param(
             MergeRequestGitlabEvent,
             flexmock(job_config_trigger_type=JobConfigTriggerType.pull_request),
             [
                 JobConfig(
-                    type=JobType.production_build,
+                    type=JobType.upstream_koji_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
             ],
             {KojiBuildHandler},
-            id="config=production_build_for_pr&pull_request&MergeRequestGitlabEvent",
+            id="config=upstream_koji_build_for_pr&pull_request&MergeRequestGitlabEvent",
         ),
         pytest.param(
             PushGitHubEvent,
             flexmock(job_config_trigger_type=JobConfigTriggerType.commit),
             [
                 JobConfig(
-                    type=JobType.production_build,
+                    type=JobType.upstream_koji_build,
                     trigger=JobConfigTriggerType.commit,
                     packages={"package": CommonPackageConfig()},
                 ),
             ],
             {KojiBuildHandler},
-            id="config=production_build_for_commit&commit&PushGitHubEvent",
+            id="config=upstream_koji_build_for_commit&commit&PushGitHubEvent",
         ),
         pytest.param(
             PushGitlabEvent,
             flexmock(job_config_trigger_type=JobConfigTriggerType.commit),
             [
                 JobConfig(
-                    type=JobType.production_build,
+                    type=JobType.upstream_koji_build,
                     trigger=JobConfigTriggerType.commit,
                     packages={"package": CommonPackageConfig()},
                 ),
             ],
             {KojiBuildHandler},
-            id="config=production_build_for_commit&commit&PushGitlabEvent",
+            id="config=upstream_koji_build_for_commit&commit&PushGitlabEvent",
         ),
         pytest.param(
             ReleaseEvent,
             flexmock(job_config_trigger_type=JobConfigTriggerType.release),
             [
                 JobConfig(
-                    type=JobType.production_build,
+                    type=JobType.upstream_koji_build,
                     trigger=JobConfigTriggerType.release,
                     packages={"package": CommonPackageConfig()},
                 ),
             ],
             {KojiBuildHandler},
-            id="config=production_build_for_release&commit&ReleaseEvent",
+            id="config=upstream_koji_build_for_release&commit&ReleaseEvent",
         ),
         pytest.param(
             KojiTaskEvent,
             flexmock(job_config_trigger_type=JobConfigTriggerType.pull_request),
             [
                 JobConfig(
-                    type=JobType.production_build,
+                    type=JobType.upstream_koji_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
             ],
             {KojiTaskReportHandler},
-            id="config=production_build_for_pr&pull_request&KojiBuildEvent",
+            id="config=upstream_koji_build_for_pr&pull_request&KojiBuildEvent",
         ),
         # Build and test:
         pytest.param(
@@ -301,7 +331,7 @@ from packit_service.worker.result import TaskResults
             flexmock(job_config_trigger_type=JobConfigTriggerType.pull_request),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
@@ -319,7 +349,7 @@ from packit_service.worker.result import TaskResults
             flexmock(job_config_trigger_type=JobConfigTriggerType.pull_request),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
@@ -337,7 +367,7 @@ from packit_service.worker.result import TaskResults
             flexmock(job_config_trigger_type=JobConfigTriggerType.pull_request),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
@@ -355,7 +385,7 @@ from packit_service.worker.result import TaskResults
             flexmock(job_config_trigger_type=JobConfigTriggerType.pull_request),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
@@ -374,17 +404,17 @@ from packit_service.worker.result import TaskResults
             flexmock(job_config_trigger_type=JobConfigTriggerType.pull_request),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.commit,
                     packages={"package": CommonPackageConfig()},
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.release,
                     packages={"package": CommonPackageConfig()},
                 ),
@@ -398,17 +428,17 @@ from packit_service.worker.result import TaskResults
             flexmock(job_config_trigger_type=JobConfigTriggerType.commit),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.commit,
                     packages={"package": CommonPackageConfig()},
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.release,
                     packages={"package": CommonPackageConfig()},
                 ),
@@ -421,17 +451,17 @@ from packit_service.worker.result import TaskResults
             flexmock(job_config_trigger_type=JobConfigTriggerType.release),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.commit,
                     packages={"package": CommonPackageConfig()},
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.release,
                     packages={"package": CommonPackageConfig()},
                 ),
@@ -445,12 +475,12 @@ from packit_service.worker.result import TaskResults
             flexmock(job_config_trigger_type=JobConfigTriggerType.release),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.commit,
                     packages={"package": CommonPackageConfig()},
                 ),
@@ -464,7 +494,7 @@ from packit_service.worker.result import TaskResults
             flexmock(job_config_trigger_type=JobConfigTriggerType.pull_request),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
@@ -474,12 +504,12 @@ from packit_service.worker.result import TaskResults
                     packages={"package": CommonPackageConfig()},
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.commit,
                     packages={"package": CommonPackageConfig()},
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.release,
                     packages={"package": CommonPackageConfig()},
                 ),
@@ -498,7 +528,7 @@ from packit_service.worker.result import TaskResults
                     packages={
                         "package": CommonPackageConfig(
                             skip_build=True,
-                        )
+                        ),
                     },
                 ),
             ],
@@ -520,7 +550,7 @@ from packit_service.worker.result import TaskResults
                     packages={
                         "package": CommonPackageConfig(
                             skip_build=True,
-                        )
+                        ),
                     },
                 ),
             ],
@@ -533,7 +563,7 @@ from packit_service.worker.result import TaskResults
             flexmock(job_config_trigger_type=JobConfigTriggerType.commit),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
@@ -543,12 +573,12 @@ from packit_service.worker.result import TaskResults
                     packages={"package": CommonPackageConfig()},
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.commit,
                     packages={"package": CommonPackageConfig()},
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.release,
                     packages={"package": CommonPackageConfig()},
                 ),
@@ -562,7 +592,7 @@ from packit_service.worker.result import TaskResults
             flexmock(job_config_trigger_type=JobConfigTriggerType.pull_request),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
@@ -572,12 +602,12 @@ from packit_service.worker.result import TaskResults
                     packages={"package": CommonPackageConfig()},
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.commit,
                     packages={"package": CommonPackageConfig()},
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.release,
                     packages={"package": CommonPackageConfig()},
                 ),
@@ -591,7 +621,7 @@ from packit_service.worker.result import TaskResults
             flexmock(job_config_trigger_type=JobConfigTriggerType.pull_request),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
@@ -601,12 +631,12 @@ from packit_service.worker.result import TaskResults
                     packages={"package": CommonPackageConfig()},
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.commit,
                     packages={"package": CommonPackageConfig()},
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.release,
                     packages={"package": CommonPackageConfig()},
                 ),
@@ -620,7 +650,7 @@ from packit_service.worker.result import TaskResults
             flexmock(job_config_trigger_type=JobConfigTriggerType.pull_request),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
@@ -630,12 +660,12 @@ from packit_service.worker.result import TaskResults
                     packages={"package": CommonPackageConfig()},
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.commit,
                     packages={"package": CommonPackageConfig()},
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.release,
                     packages={"package": CommonPackageConfig()},
                 ),
@@ -649,7 +679,7 @@ from packit_service.worker.result import TaskResults
             flexmock(job_config_trigger_type=JobConfigTriggerType.commit),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
@@ -659,12 +689,12 @@ from packit_service.worker.result import TaskResults
                     packages={"package": CommonPackageConfig()},
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.commit,
                     packages={"package": CommonPackageConfig()},
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.release,
                     packages={"package": CommonPackageConfig()},
                 ),
@@ -684,12 +714,12 @@ from packit_service.worker.result import TaskResults
                     packages={"package": CommonPackageConfig()},
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.commit,
                     packages={"package": CommonPackageConfig()},
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.release,
                     packages={"package": CommonPackageConfig()},
                 ),
@@ -708,19 +738,18 @@ from packit_service.worker.result import TaskResults
                     packages={"package": CommonPackageConfig()},
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.commit,
                     packages={"package": CommonPackageConfig()},
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.release,
                     packages={"package": CommonPackageConfig()},
                 ),
             ],
             {CoprBuildHandler},
-            id="config=test_for_pr+build_for_commit+build_for_release"
-            "&commit&PushGitHubEvent",
+            id="config=test_for_pr+build_for_commit+build_for_release" "&commit&PushGitHubEvent",
         ),
         pytest.param(
             TestingFarmResultsEvent,
@@ -732,12 +761,12 @@ from packit_service.worker.result import TaskResults
                     packages={"package": CommonPackageConfig()},
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.commit,
                     packages={"package": CommonPackageConfig()},
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.release,
                     packages={"package": CommonPackageConfig()},
                 ),
@@ -756,12 +785,12 @@ from packit_service.worker.result import TaskResults
                     packages={"package": CommonPackageConfig()},
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.commit,
                     packages={"package": CommonPackageConfig()},
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.release,
                     packages={"package": CommonPackageConfig()},
                 ),
@@ -776,18 +805,18 @@ from packit_service.worker.result import TaskResults
             flexmock(job_config_trigger_type=JobConfigTriggerType.pull_request),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
                 JobConfig(
-                    type=JobType.production_build,
+                    type=JobType.upstream_koji_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
             ],
             {CoprBuildHandler, KojiBuildHandler},
-            id="config=build_for_pr+production_build_for_pr"
+            id="config=build_for_pr+upstream_koji_build_for_pr"
             "&pull_request&PullRequestGithubEvent",
         ),
         pytest.param(
@@ -795,38 +824,36 @@ from packit_service.worker.result import TaskResults
             flexmock(job_config_trigger_type=JobConfigTriggerType.pull_request),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
                 JobConfig(
-                    type=JobType.production_build,
+                    type=JobType.upstream_koji_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
             ],
             {CoprBuildStartHandler},
-            id="config=build_for_pr+production_build_for_pr"
-            "&pull_request&CoprBuildStartEvent",
+            id="config=build_for_pr+upstream_koji_build_for_pr" "&pull_request&CoprBuildStartEvent",
         ),
         pytest.param(
             KojiTaskEvent,
             flexmock(job_config_trigger_type=JobConfigTriggerType.pull_request),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
                 JobConfig(
-                    type=JobType.production_build,
+                    type=JobType.upstream_koji_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
             ],
             {KojiTaskReportHandler},
-            id="config=build_for_pr+production_build_for_pr"
-            "&pull_request&KojiBuildEvent",
+            id="config=build_for_pr+upstream_koji_build_for_pr" "&pull_request&KojiBuildEvent",
         ),
         pytest.param(
             PushPagureEvent,
@@ -885,13 +912,26 @@ from packit_service.worker.result import TaskResults
             flexmock(job_config_trigger_type=JobConfigTriggerType.release),
             [
                 JobConfig(
-                    type=JobType.production_build,
+                    type=JobType.upstream_koji_build,
                     trigger=JobConfigTriggerType.release,
                     packages={"package": CommonPackageConfig()},
                 ),
             ],
             {KojiBuildHandler},
             id="Upstream Koji build on release on GitLab",
+        ),
+        pytest.param(
+            KojiBuildTagEvent,
+            flexmock(job_config_trigger_type=JobConfigTriggerType.koji_build),
+            [
+                JobConfig(
+                    type=JobType.koji_build_tag,
+                    trigger=JobConfigTriggerType.koji_build,
+                    packages={"package": CommonPackageConfig()},
+                ),
+            ],
+            {KojiBuildTagHandler},
+            id="Koji build tagged",
         ),
     ],
 )
@@ -901,7 +941,7 @@ def test_get_handlers_for_event(event_cls, db_project_object, jobs, result):
     # (And real event classes have a lot of __init__ arguments.)
     class Event(event_cls):
         def __init__(self):
-            pass
+            self.package_name = "test"
 
         @property
         def db_project_object(self):
@@ -909,11 +949,14 @@ def test_get_handlers_for_event(event_cls, db_project_object, jobs, result):
 
         @property
         def packages_config(self):
-            return flexmock(get_job_views=lambda: jobs)
+            return flexmock(
+                get_job_views=lambda: jobs,
+                packages={"package": CommonPackageConfig()},
+            )
 
     event = Event()
     flexmock(ServiceConfig).should_receive("get_service_config").and_return(
-        ServiceConfig(packit_comment_command_prefix="/packit")
+        ServiceConfig(packit_comment_command_prefix="/packit"),
     )
 
     event_handlers = set(SteveJobs(event).get_handlers_for_event())
@@ -930,14 +973,13 @@ def test_get_handlers_for_event(event_cls, db_project_object, jobs, result):
             flexmock(job_config_trigger_type=JobConfigTriggerType.pull_request),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
             ],
             set(),
-            id="config=build_for_pr&pull_request&PullRequestCommentGithubEvent"
-            "&empty_comment",
+            id="config=build_for_pr&pull_request&PullRequestCommentGithubEvent" "&empty_comment",
         ),
         pytest.param(
             PullRequestCommentGithubEvent,
@@ -946,7 +988,7 @@ def test_get_handlers_for_event(event_cls, db_project_object, jobs, result):
             flexmock(job_config_trigger_type=JobConfigTriggerType.pull_request),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
@@ -962,14 +1004,13 @@ def test_get_handlers_for_event(event_cls, db_project_object, jobs, result):
             flexmock(job_config_trigger_type=JobConfigTriggerType.pull_request),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
             ],
             {CoprBuildHandler},
-            id="config=build_for_pr&pull_request&PullRequestCommentGithubEvent"
-            "&packit_build",
+            id="config=build_for_pr&pull_request&PullRequestCommentGithubEvent" "&packit_build",
         ),
         pytest.param(
             PullRequestCommentGithubEvent,
@@ -994,7 +1035,7 @@ def test_get_handlers_for_event(event_cls, db_project_object, jobs, result):
             flexmock(job_config_trigger_type=JobConfigTriggerType.pull_request),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
@@ -1016,8 +1057,7 @@ def test_get_handlers_for_event(event_cls, db_project_object, jobs, result):
                 ),
             ],
             {TestingFarmHandler},
-            id="config=test_for_pr&pull_request&PullRequestCommentGithubEvent"
-            "&packit_build",
+            id="config=test_for_pr&pull_request&PullRequestCommentGithubEvent" "&packit_build",
         ),
         pytest.param(
             PullRequestCommentGithubEvent,
@@ -1032,23 +1072,22 @@ def test_get_handlers_for_event(event_cls, db_project_object, jobs, result):
                 ),
             ],
             {TestingFarmHandler},
-            id="config=test_for_pr&pull_request&PullRequestCommentGithubEvent"
-            "&packit_test",
+            id="config=test_for_pr&pull_request&PullRequestCommentGithubEvent" "&packit_test",
         ),
         pytest.param(
             PullRequestCommentGithubEvent,
-            "/packit production-build",
+            "/packit upstream-koji-build",
             "/packit",
             flexmock(job_config_trigger_type=JobConfigTriggerType.pull_request),
             [
                 JobConfig(
-                    type=JobType.production_build,
+                    type=JobType.upstream_koji_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
             ],
             {KojiBuildHandler},
-            id="config=production_build_for_pr&pull_request&PullRequestCommentGithubEvent"
+            id="config=upstream_koji_build_for_pr&pull_request&PullRequestCommentGithubEvent"
             "&packit_production-build",
         ),
         pytest.param(
@@ -1063,7 +1102,7 @@ def test_get_handlers_for_event(event_cls, db_project_object, jobs, result):
                     packages={
                         "package": CommonPackageConfig(
                             skip_build=True,
-                        )
+                        ),
                     },
                 ),
             ],
@@ -1083,7 +1122,7 @@ def test_get_handlers_for_event(event_cls, db_project_object, jobs, result):
                     packages={
                         "package": CommonPackageConfig(
                             skip_build=True,
-                        )
+                        ),
                     },
                 ),
             ],
@@ -1098,14 +1137,13 @@ def test_get_handlers_for_event(event_cls, db_project_object, jobs, result):
             flexmock(job_config_trigger_type=JobConfigTriggerType.pull_request),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
             ],
             set(),
-            id="config=build_for_pr&pull_request&PullRequestCommentGithubEvent"
-            "&packit_build&stg",
+            id="config=build_for_pr&pull_request&PullRequestCommentGithubEvent" "&packit_build&stg",
         ),
         pytest.param(
             PullRequestCommentGithubEvent,
@@ -1114,7 +1152,7 @@ def test_get_handlers_for_event(event_cls, db_project_object, jobs, result):
             flexmock(job_config_trigger_type=JobConfigTriggerType.pull_request),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
@@ -1126,7 +1164,12 @@ def test_get_handlers_for_event(event_cls, db_project_object, jobs, result):
     ],
 )
 def test_get_handlers_for_comment_event(
-    event_cls, comment, packit_comment_command_prefix, db_project_object, jobs, result
+    event_cls,
+    comment,
+    packit_comment_command_prefix,
+    db_project_object,
+    jobs,
+    result,
 ):
     # We are using isinstance for matching event to handlers
     # and flexmock can't do this for us so we need a subclass to test it.
@@ -1144,7 +1187,7 @@ def test_get_handlers_for_comment_event(
             return flexmock(get_job_views=lambda: jobs)
 
     flexmock(ServiceConfig).should_receive("get_service_config").and_return(
-        ServiceConfig(comment_command_prefix=packit_comment_command_prefix)
+        ServiceConfig(comment_command_prefix=packit_comment_command_prefix),
     )
 
     event = Event()
@@ -1152,7 +1195,7 @@ def test_get_handlers_for_comment_event(
         comment_object = flexmock()
         event._comment_object = comment_object
         flexmock(comment_object).should_receive("add_reaction").with_args(
-            COMMENT_REACTION
+            COMMENT_REACTION,
         ).once()
 
     event_handlers = set(SteveJobs(event).get_handlers_for_event())
@@ -1169,7 +1212,7 @@ def test_get_handlers_for_comment_event(
             None,
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
@@ -1184,18 +1227,17 @@ def test_get_handlers_for_comment_event(
             "the-identifier",
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={
                         "package": CommonPackageConfig(
                             identifier="the-identifier",
-                        )
+                        ),
                     },
                 ),
             ],
             {CoprBuildHandler},
-            id="config=build_for_pr&pull_request&CheckRerunPullRequestEvent"
-            "&identifier_match",
+            id="config=build_for_pr&pull_request&CheckRerunPullRequestEvent" "&identifier_match",
         ),
         pytest.param(
             CheckRerunPullRequestEvent,
@@ -1204,12 +1246,12 @@ def test_get_handlers_for_comment_event(
             None,
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={
                         "package": CommonPackageConfig(
                             identifier="the-identifier",
-                        )
+                        ),
                     },
                 ),
             ],
@@ -1224,7 +1266,7 @@ def test_get_handlers_for_comment_event(
             "the-identifier",
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
@@ -1250,18 +1292,18 @@ def test_get_handlers_for_comment_event(
         ),
         pytest.param(
             CheckRerunPullRequestEvent,
-            "production-build",
+            "koji-build",
             flexmock(job_config_trigger_type=JobConfigTriggerType.pull_request),
             None,
             [
                 JobConfig(
-                    type=JobType.production_build,
+                    type=JobType.upstream_koji_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
             ],
             {KojiBuildHandler},
-            id="config=production_build_for_pr&pull_request&CheckRerunPullRequestEvent",
+            id="config=upstream_koji_build_for_pr&pull_request&CheckRerunPullRequestEvent",
         ),
         pytest.param(
             CheckRerunCommitEvent,
@@ -1270,7 +1312,7 @@ def test_get_handlers_for_comment_event(
             None,
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.commit,
                     packages={"package": CommonPackageConfig()},
                 ),
@@ -1295,38 +1337,43 @@ def test_get_handlers_for_comment_event(
         ),
         pytest.param(
             CheckRerunReleaseEvent,
-            "production-build",
+            "koji-build",
             flexmock(job_config_trigger_type=JobConfigTriggerType.release),
             None,
             [
                 JobConfig(
-                    type=JobType.production_build,
+                    type=JobType.upstream_koji_build,
                     trigger=JobConfigTriggerType.release,
                     packages={"package": CommonPackageConfig()},
                 ),
             ],
             {KojiBuildHandler},
-            id="config=production_build_for_release&pull_request&CheckRerunCommitEvent",
+            id="config=upstream_koji_build_for_release&pull_request&CheckRerunCommitEvent",
         ),
         pytest.param(
             CheckRerunReleaseEvent,
-            "production-build",
+            "koji-build",
             flexmock(job_config_trigger_type=JobConfigTriggerType.release),
             None,
             [
                 JobConfig(
-                    type=JobType.production_build,
+                    type=JobType.upstream_koji_build,
                     trigger=JobConfigTriggerType.release,
                     packages={"package": CommonPackageConfig()},
                 ),
             ],
             {KojiBuildHandler},
-            id="config=production_build_for_release&pull_request&CheckRerunCommitEvent",
+            id="config=upstream_koji_build_for_release&pull_request&CheckRerunCommitEvent",
         ),
     ],
 )
 def test_get_handlers_for_check_rerun_event(
-    event_cls, check_name_job, job_identifier, db_project_object, jobs, result
+    event_cls,
+    check_name_job,
+    job_identifier,
+    db_project_object,
+    jobs,
+    result,
 ):
     # We are using isinstance for matching event to handlers
     # and flexmock can't do this for us so we need a subclass to test it.
@@ -1345,7 +1392,7 @@ def test_get_handlers_for_check_rerun_event(
             return flexmock(get_job_views=lambda: jobs)
 
     flexmock(ServiceConfig).should_receive("get_service_config").and_return(
-        ServiceConfig(packit_comment_command_prefix="/packit")
+        ServiceConfig(packit_comment_command_prefix="/packit"),
     )
     event = Event()
 
@@ -1363,17 +1410,17 @@ def test_get_handlers_for_check_rerun_event(
             flexmock(job_config_trigger_type=JobConfigTriggerType.pull_request),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
-                )
+                ),
             ],
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
-                )
+                ),
             ],
             id="build_for_pr&CoprBuildHandler&PullRequestGithubEvent",
         ),
@@ -1383,17 +1430,17 @@ def test_get_handlers_for_check_rerun_event(
             flexmock(job_config_trigger_type=JobConfigTriggerType.pull_request),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
-                )
+                ),
             ],
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
-                )
+                ),
             ],
             id="build_for_pr&CoprBuildStartHandler&CoprBuildStartEvent",
         ),
@@ -1403,17 +1450,17 @@ def test_get_handlers_for_check_rerun_event(
             flexmock(job_config_trigger_type=JobConfigTriggerType.pull_request),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
-                )
+                ),
             ],
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
-                )
+                ),
             ],
             id="build_for_pr&CoprBuildEndHandler&CoprBuildEndEvent",
         ),
@@ -1427,7 +1474,7 @@ def test_get_handlers_for_check_rerun_event(
                     type=JobType.tests,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
-                )
+                ),
             ],
             [],
             id="tests_for_pr&CoprBuildHandler&PullRequestGithubEvent",
@@ -1439,7 +1486,7 @@ def test_get_handlers_for_check_rerun_event(
             flexmock(job_config_trigger_type=JobConfigTriggerType.pull_request),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
@@ -1451,10 +1498,10 @@ def test_get_handlers_for_check_rerun_event(
             ],
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
-                )
+                ),
             ],
             id="build_for_pr+tests_for_pr&CoprBuildHandler&PullRequestGithubEvent",
         ),
@@ -1470,17 +1517,17 @@ def test_get_handlers_for_check_rerun_event(
                     packages={"package": CommonPackageConfig()},
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
             ],
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
-                )
+                ),
             ],
             id="test_for_pr+build_for_pr&CoprBuildHandler&PullRequestGithubEvent",
         ),
@@ -1491,41 +1538,41 @@ def test_get_handlers_for_check_rerun_event(
             flexmock(job_config_trigger_type=JobConfigTriggerType.pull_request),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={
                         "package": CommonPackageConfig(
                             project="project1",
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={
                         "package": CommonPackageConfig(
                             project="project2",
-                        )
+                        ),
                     },
                 ),
             ],
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={
                         "package": CommonPackageConfig(
                             project="project1",
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={
                         "package": CommonPackageConfig(
                             project="project2",
-                        )
+                        ),
                     },
                 ),
             ],
@@ -1538,43 +1585,43 @@ def test_get_handlers_for_check_rerun_event(
             flexmock(job_config_trigger_type=JobConfigTriggerType.pull_request),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={
                         "package": CommonPackageConfig(
                             project="project1",
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.commit,
                     packages={
                         "package": CommonPackageConfig(
                             project="project2",
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.release,
                     packages={
                         "package": CommonPackageConfig(
                             project="project3",
-                        )
+                        ),
                     },
                 ),
             ],
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={
                         "package": CommonPackageConfig(
                             project="project1",
-                        )
+                        ),
                     },
-                )
+                ),
             ],
             id="build_for_pr+build_for_commit+build_for_release"
             "&CoprBuildHandler&PullRequestGithubEvent",
@@ -1585,41 +1632,41 @@ def test_get_handlers_for_check_rerun_event(
             flexmock(job_config_trigger_type=JobConfigTriggerType.commit),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={
                         "package": CommonPackageConfig(
                             project="project1",
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.commit,
                     packages={
                         "package": CommonPackageConfig(
                             project="project2",
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.release,
                     packages={
                         "package": CommonPackageConfig(
                             project="project3",
-                        )
+                        ),
                     },
                 ),
             ],
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.commit,
                     packages={
                         "package": CommonPackageConfig(
                             project="project2",
-                        )
+                        ),
                     },
                 ),
             ],
@@ -1632,46 +1679,45 @@ def test_get_handlers_for_check_rerun_event(
             flexmock(job_config_trigger_type=JobConfigTriggerType.release),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={
                         "package": CommonPackageConfig(
                             project="project1",
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.commit,
                     packages={
                         "package": CommonPackageConfig(
                             project="project2",
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.release,
                     packages={
                         "package": CommonPackageConfig(
                             project="project3",
-                        )
+                        ),
                     },
                 ),
             ],
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.release,
                     packages={
                         "package": CommonPackageConfig(
                             project="project3",
-                        )
+                        ),
                     },
                 ),
             ],
-            id="build_for_pr+build_for_commit+build_for_release"
-            "&CoprBuildHandler&ReleaseEvent",
+            id="build_for_pr+build_for_commit+build_for_release" "&CoprBuildHandler&ReleaseEvent",
         ),
         # Build for commit and release, test for pr
         pytest.param(
@@ -1685,25 +1731,25 @@ def test_get_handlers_for_check_rerun_event(
                     packages={
                         "package": CommonPackageConfig(
                             project="project1",
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.commit,
                     packages={
                         "package": CommonPackageConfig(
                             project="project2",
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.release,
                     packages={
                         "package": CommonPackageConfig(
                             project="project3",
-                        )
+                        ),
                     },
                 ),
             ],
@@ -1722,36 +1768,36 @@ def test_get_handlers_for_check_rerun_event(
                     packages={
                         "package": CommonPackageConfig(
                             project="project1",
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.commit,
                     packages={
                         "package": CommonPackageConfig(
                             project="project2",
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.release,
                     packages={
                         "package": CommonPackageConfig(
                             project="project3",
-                        )
+                        ),
                     },
                 ),
             ],
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.commit,
                     packages={
                         "package": CommonPackageConfig(
                             project="project2",
-                        )
+                        ),
                     },
                 ),
             ],
@@ -1769,41 +1815,40 @@ def test_get_handlers_for_check_rerun_event(
                     packages={
                         "package": CommonPackageConfig(
                             project="project1",
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.commit,
                     packages={
                         "package": CommonPackageConfig(
                             project="project2",
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.release,
                     packages={
                         "package": CommonPackageConfig(
                             project="project3",
-                        )
+                        ),
                     },
                 ),
             ],
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.release,
                     packages={
                         "package": CommonPackageConfig(
                             project="project3",
-                        )
+                        ),
                     },
                 ),
             ],
-            id="tests_for_pr+build_for_commit+build_for_release"
-            "&CoprBuildHandler&ReleaseEvent",
+            id="tests_for_pr+build_for_commit+build_for_release" "&CoprBuildHandler&ReleaseEvent",
         ),
         pytest.param(
             TestingFarmResultsHandler,
@@ -1816,25 +1861,25 @@ def test_get_handlers_for_check_rerun_event(
                     packages={
                         "package": CommonPackageConfig(
                             project="project1",
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.commit,
                     packages={
                         "package": CommonPackageConfig(
                             project="project2",
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.release,
                     packages={
                         "package": CommonPackageConfig(
                             project="project3",
-                        )
+                        ),
                     },
                 ),
             ],
@@ -1845,7 +1890,7 @@ def test_get_handlers_for_check_rerun_event(
                     packages={
                         "package": CommonPackageConfig(
                             project="project1",
-                        )
+                        ),
                     },
                 ),
             ],
@@ -1859,12 +1904,12 @@ def test_get_handlers_for_check_rerun_event(
             flexmock(job_config_trigger_type=JobConfigTriggerType.pull_request),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={
                         "package": CommonPackageConfig(
                             project="project0",
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
@@ -1873,36 +1918,36 @@ def test_get_handlers_for_check_rerun_event(
                     packages={
                         "package": CommonPackageConfig(
                             project="project1",
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.commit,
                     packages={
                         "package": CommonPackageConfig(
                             project="project2",
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.release,
                     packages={
                         "package": CommonPackageConfig(
                             project="project3",
-                        )
+                        ),
                     },
                 ),
             ],
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={
                         "package": CommonPackageConfig(
                             project="project0",
-                        )
+                        ),
                     },
                 ),
             ],
@@ -1915,12 +1960,12 @@ def test_get_handlers_for_check_rerun_event(
             flexmock(job_config_trigger_type=JobConfigTriggerType.commit),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={
                         "package": CommonPackageConfig(
                             project="project0",
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
@@ -1929,36 +1974,36 @@ def test_get_handlers_for_check_rerun_event(
                     packages={
                         "package": CommonPackageConfig(
                             project="project1",
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.commit,
                     packages={
                         "package": CommonPackageConfig(
                             project="project2",
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.release,
                     packages={
                         "package": CommonPackageConfig(
                             project="project3",
-                        )
+                        ),
                     },
                 ),
             ],
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.commit,
                     packages={
                         "package": CommonPackageConfig(
                             project="project2",
-                        )
+                        ),
                     },
                 ),
             ],
@@ -1971,12 +2016,12 @@ def test_get_handlers_for_check_rerun_event(
             flexmock(job_config_trigger_type=JobConfigTriggerType.release),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={
                         "package": CommonPackageConfig(
                             project="project0",
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
@@ -1985,36 +2030,36 @@ def test_get_handlers_for_check_rerun_event(
                     packages={
                         "package": CommonPackageConfig(
                             project="project1",
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.commit,
                     packages={
                         "package": CommonPackageConfig(
                             project="project2",
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.release,
                     packages={
                         "package": CommonPackageConfig(
                             project="project3",
-                        )
+                        ),
                     },
                 ),
             ],
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.release,
                     packages={
                         "package": CommonPackageConfig(
                             project="project3",
-                        )
+                        ),
                     },
                 ),
             ],
@@ -2027,12 +2072,12 @@ def test_get_handlers_for_check_rerun_event(
             flexmock(job_config_trigger_type=JobConfigTriggerType.pull_request),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={
                         "package": CommonPackageConfig(
                             project="project0",
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
@@ -2041,36 +2086,36 @@ def test_get_handlers_for_check_rerun_event(
                     packages={
                         "package": CommonPackageConfig(
                             project="project1",
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.commit,
                     packages={
                         "package": CommonPackageConfig(
                             project="project2",
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.release,
                     packages={
                         "package": CommonPackageConfig(
                             project="project3",
-                        )
+                        ),
                     },
                 ),
             ],
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={
                         "package": CommonPackageConfig(
                             project="project0",
-                        )
+                        ),
                     },
                 ),
             ],
@@ -2083,12 +2128,12 @@ def test_get_handlers_for_check_rerun_event(
             flexmock(job_config_trigger_type=JobConfigTriggerType.pull_request),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={
                         "package": CommonPackageConfig(
                             project="project0",
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
@@ -2097,36 +2142,36 @@ def test_get_handlers_for_check_rerun_event(
                     packages={
                         "package": CommonPackageConfig(
                             project="project1",
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.commit,
                     packages={
                         "package": CommonPackageConfig(
                             project="project2",
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.release,
                     packages={
                         "package": CommonPackageConfig(
                             project="project3",
-                        )
+                        ),
                     },
                 ),
             ],
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={
                         "package": CommonPackageConfig(
                             project="project0",
-                        )
+                        ),
                     },
                 ),
             ],
@@ -2139,12 +2184,12 @@ def test_get_handlers_for_check_rerun_event(
             flexmock(job_config_trigger_type=JobConfigTriggerType.pull_request),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={
                         "package": CommonPackageConfig(
                             project="project0",
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
@@ -2153,25 +2198,25 @@ def test_get_handlers_for_check_rerun_event(
                     packages={
                         "package": CommonPackageConfig(
                             project="project1",
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.commit,
                     packages={
                         "package": CommonPackageConfig(
                             project="project2",
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.release,
                     packages={
                         "package": CommonPackageConfig(
                             project="project3",
-                        )
+                        ),
                     },
                 ),
             ],
@@ -2182,7 +2227,7 @@ def test_get_handlers_for_check_rerun_event(
                     packages={
                         "package": CommonPackageConfig(
                             project="project1",
-                        )
+                        ),
                     },
                 ),
             ],
@@ -2196,24 +2241,24 @@ def test_get_handlers_for_check_rerun_event(
             flexmock(job_config_trigger_type=JobConfigTriggerType.pull_request),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
                 JobConfig(
-                    type=JobType.production_build,
+                    type=JobType.upstream_koji_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
             ],
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
-                )
+                ),
             ],
-            id="build_for_pr+production_build_for_pr&CoprBuildHandler&PullRequestGithubEvent",
+            id="build_for_pr+upstream_koji_build_for_pr&CoprBuildHandler&PullRequestGithubEvent",
         ),
         pytest.param(
             KojiBuildHandler,
@@ -2221,24 +2266,24 @@ def test_get_handlers_for_check_rerun_event(
             flexmock(job_config_trigger_type=JobConfigTriggerType.pull_request),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
                 JobConfig(
-                    type=JobType.production_build,
+                    type=JobType.upstream_koji_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
             ],
             [
                 JobConfig(
-                    type=JobType.production_build,
+                    type=JobType.upstream_koji_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
-                )
+                ),
             ],
-            id="build_for_pr+production_build_for_pr&KojiBuildHandler&PullRequestGithubEvent",
+            id="build_for_pr+upstream_koji_build_for_pr&KojiBuildHandler&PullRequestGithubEvent",
         ),
         pytest.param(
             KojiTaskReportHandler,
@@ -2246,24 +2291,24 @@ def test_get_handlers_for_check_rerun_event(
             flexmock(job_config_trigger_type=JobConfigTriggerType.pull_request),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
                 JobConfig(
-                    type=JobType.production_build,
+                    type=JobType.upstream_koji_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
             ],
             [
                 JobConfig(
-                    type=JobType.production_build,
+                    type=JobType.upstream_koji_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
-                )
+                ),
             ],
-            id="build_for_pr+production_build_for_pr&KojiBuildReportHandler&KojiBuildEvent",
+            id="build_for_pr+upstream_koji_build_for_pr&KojiBuildReportHandler&KojiBuildEvent",
         ),
         # comments:
         pytest.param(
@@ -2272,17 +2317,17 @@ def test_get_handlers_for_check_rerun_event(
             flexmock(job_config_trigger_type=JobConfigTriggerType.pull_request),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
-                )
+                ),
             ],
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
-                )
+                ),
             ],
             id="build_for_pr&CoprBuildHandler&PullRequestCommentGithubEvent",
         ),
@@ -2292,17 +2337,17 @@ def test_get_handlers_for_check_rerun_event(
             flexmock(job_config_trigger_type=JobConfigTriggerType.pull_request),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
-                )
+                ),
             ],
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
-                )
+                ),
             ],
             id="build_for_pr&CoprBuildHandler&MergeRequestCommentGitlabEvent",
         ),
@@ -2312,17 +2357,17 @@ def test_get_handlers_for_check_rerun_event(
             flexmock(job_config_trigger_type=JobConfigTriggerType.pull_request),
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
-                )
+                ),
             ],
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
-                )
+                ),
             ],
             id="build_for_pr&CoprBuildHandler&PullRequestCommentPagureEvent",
         ),
@@ -2336,7 +2381,7 @@ def test_get_handlers_for_check_rerun_event(
                     type=JobType.tests,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
-                )
+                ),
             ],
             [],
             id="tests_for_pr&CoprBuildHandler&PullRequestCommentGithubEvent",
@@ -2351,14 +2396,14 @@ def test_get_handlers_for_check_rerun_event(
                     type=JobType.tests,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
-                )
+                ),
             ],
             [
                 JobConfig(
                     type=JobType.tests,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
-                )
+                ),
             ],
             id="tests_for_pr&TestingFarmHandler&PullRequestCommentGithubEvent",
         ),
@@ -2372,14 +2417,14 @@ def test_get_handlers_for_check_rerun_event(
                     type=JobType.propose_downstream,
                     trigger=JobConfigTriggerType.release,
                     packages={"package": CommonPackageConfig()},
-                )
+                ),
             ],
             [
                 JobConfig(
                     type=JobType.propose_downstream,
                     trigger=JobConfigTriggerType.release,
                     packages={"package": CommonPackageConfig()},
-                )
+                ),
             ],
             id="propose_downstream_for_release&TestingFarmHandler&PullRequestCommentGithubEvent",
         ),
@@ -2392,14 +2437,14 @@ def test_get_handlers_for_check_rerun_event(
                     type=JobType.koji_build,
                     trigger=JobConfigTriggerType.commit,
                     packages={"package": CommonPackageConfig()},
-                )
+                ),
             ],
             [
                 JobConfig(
                     type=JobType.koji_build,
                     trigger=JobConfigTriggerType.commit,
                     packages={"package": CommonPackageConfig()},
-                )
+                ),
             ],
             id="koji_build_for_commit&DownstreamKojiBuildHandler&PushPagureEvent",
         ),
@@ -2412,14 +2457,14 @@ def test_get_handlers_for_check_rerun_event(
                     type=JobType.koji_build,
                     trigger=JobConfigTriggerType.commit,
                     packages={"package": CommonPackageConfig()},
-                )
+                ),
             ],
             [
                 JobConfig(
                     type=JobType.koji_build,
                     trigger=JobConfigTriggerType.commit,
                     packages={"package": CommonPackageConfig()},
-                )
+                ),
             ],
             id="koji_build_for_commit&KojiBuildReportHandler&KojiBuildEvent",
         ),
@@ -2432,14 +2477,14 @@ def test_get_handlers_for_check_rerun_event(
                     type=JobType.bodhi_update,
                     trigger=JobConfigTriggerType.commit,
                     packages={"package": CommonPackageConfig()},
-                )
+                ),
             ],
             [
                 JobConfig(
                     type=JobType.bodhi_update,
                     trigger=JobConfigTriggerType.commit,
                     packages={"package": CommonPackageConfig()},
-                )
+                ),
             ],
             id="bodhi_update_for_commit&CreateBodhiUpdateHandler&KojiBuildEvent",
         ),
@@ -2452,21 +2497,25 @@ def test_get_handlers_for_check_rerun_event(
                     type=JobType.bodhi_update,
                     trigger=JobConfigTriggerType.commit,
                     packages={"package": CommonPackageConfig()},
-                )
+                ),
             ],
             [
                 JobConfig(
                     type=JobType.bodhi_update,
                     trigger=JobConfigTriggerType.commit,
                     packages={"package": CommonPackageConfig()},
-                )
+                ),
             ],
             id="bodhi_update_for_commit&KojiBuildReportHandler&KojiBuildEvent",
         ),
     ],
 )
 def test_get_config_for_handler_kls(
-    handler_kls: Type[JobHandler], event_cls, db_project_object, jobs, result_job_config
+    handler_kls: type[JobHandler],
+    event_cls,
+    db_project_object,
+    jobs,
+    result_job_config,
 ):
     class Event(event_cls):  # type: ignore
         def __init__(self):
@@ -2529,20 +2578,23 @@ def test_get_config_for_handler_kls(
         ),
         pytest.param(
             PullRequestCommentGithubEvent,
-            "/packit production-build",
+            "/packit upstream-koji-build",
             "/packit",
             {KojiBuildHandler},
         ),
         pytest.param(
             PullRequestCommentGithubEvent,
-            "/packit-stg production-build",
+            "/packit-stg upstream-koji-build",
             "/packit-stg",
             {KojiBuildHandler},
         ),
     ],
 )
 def test_get_handlers_triggered_by_comment(
-    event_kls, comment, packit_comment_command_prefix, result
+    event_kls,
+    comment,
+    packit_comment_command_prefix,
+    result,
 ):
     class Event(event_kls):
         def __init__(self):
@@ -2552,11 +2604,11 @@ def test_get_handlers_triggered_by_comment(
     comment_object = flexmock()
     event._comment_object = comment_object
     flexmock(comment_object).should_receive("add_reaction").with_args(
-        COMMENT_REACTION
+        COMMENT_REACTION,
     ).once()
 
     flexmock(ServiceConfig).should_receive("get_service_config").and_return(
-        ServiceConfig(comment_command_prefix=packit_comment_command_prefix)
+        ServiceConfig(comment_command_prefix=packit_comment_command_prefix),
     )
     event_handlers = SteveJobs(event).get_handlers_for_comment_and_rerun_event()
     assert event_handlers == result
@@ -2577,7 +2629,7 @@ def test_get_handlers_triggered_by_comment(
         ),
         pytest.param(
             CheckRerunPullRequestEvent,
-            "production-build",
+            "koji-build",
             {KojiBuildHandler},
         ),
     ],
@@ -2588,7 +2640,7 @@ def test_get_handlers_triggered_by_check_rerun(event_kls, check_name_job, result
             self.check_name_job = check_name_job
 
     flexmock(ServiceConfig).should_receive("get_service_config").and_return(
-        ServiceConfig(packit_comment_command_prefix="/packit")
+        ServiceConfig(packit_comment_command_prefix="/packit"),
     )
     event = Event()
     event_handlers = SteveJobs(event).get_handlers_for_comment_and_rerun_event()
@@ -2615,7 +2667,7 @@ def test_get_handlers_triggered_by_check_rerun(event_kls, check_name_job, result
         ),
     ],
 )
-def test_handler_matches_to_job(event_kls, handler: Type[JobHandler], allowed_handlers):
+def test_handler_matches_to_job(event_kls, handler: type[JobHandler], allowed_handlers):
     class Event(event_kls):  # type: ignore
         def __init__(self):
             pass
@@ -2640,7 +2692,9 @@ def test_handler_matches_to_job(event_kls, handler: Type[JobHandler], allowed_ha
     ],
 )
 def test_handler_doesnt_match_to_job(
-    event_kls, handler: Type[JobHandler], allowed_handlers
+    event_kls,
+    handler: type[JobHandler],
+    allowed_handlers,
 ):
     class Event(event_kls):  # type: ignore
         def __init__(self):
@@ -2659,7 +2713,7 @@ def test_handler_doesnt_match_to_job(
             JobConfigTriggerType.pull_request,
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
@@ -2671,32 +2725,8 @@ def test_handler_doesnt_match_to_job(
             ],
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
-                    packages={"package": CommonPackageConfig()},
-                ),
-            ],
-            {},
-        ),
-        pytest.param(
-            PullRequestCommentGithubEvent,
-            JobConfigTriggerType.release,
-            [
-                JobConfig(
-                    type=JobType.build,
-                    trigger=JobConfigTriggerType.pull_request,
-                    packages={"package": CommonPackageConfig()},
-                ),
-                JobConfig(
-                    type=JobType.propose_downstream,
-                    trigger=JobConfigTriggerType.release,
-                    packages={"package": CommonPackageConfig()},
-                ),
-            ],
-            [
-                JobConfig(
-                    type=JobType.propose_downstream,
-                    trigger=JobConfigTriggerType.release,
                     packages={"package": CommonPackageConfig()},
                 ),
             ],
@@ -2707,13 +2737,8 @@ def test_handler_doesnt_match_to_job(
             JobConfigTriggerType.release,
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
-                    packages={"package": CommonPackageConfig()},
-                ),
-                JobConfig(
-                    type=JobType.propose_downstream,
-                    trigger=JobConfigTriggerType.release,
                     packages={"package": CommonPackageConfig()},
                 ),
                 JobConfig(
@@ -2736,7 +2761,36 @@ def test_handler_doesnt_match_to_job(
             JobConfigTriggerType.release,
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
+                    trigger=JobConfigTriggerType.pull_request,
+                    packages={"package": CommonPackageConfig()},
+                ),
+                JobConfig(
+                    type=JobType.propose_downstream,
+                    trigger=JobConfigTriggerType.release,
+                    packages={"package": CommonPackageConfig()},
+                ),
+                JobConfig(
+                    type=JobType.propose_downstream,
+                    trigger=JobConfigTriggerType.release,
+                    packages={"package": CommonPackageConfig()},
+                ),
+            ],
+            [
+                JobConfig(
+                    type=JobType.propose_downstream,
+                    trigger=JobConfigTriggerType.release,
+                    packages={"package": CommonPackageConfig()},
+                ),
+            ],
+            {},
+        ),
+        pytest.param(
+            PullRequestCommentGithubEvent,
+            JobConfigTriggerType.release,
+            [
+                JobConfig(
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={"package": CommonPackageConfig()},
                 ),
@@ -3012,7 +3066,7 @@ def test_handler_doesnt_match_to_job(
                     packages={"package": CommonPackageConfig()},
                 ),
             ],
-            {},
+            {"comment": "test"},
         ),
         pytest.param(
             PullRequestCommentPagureEvent,
@@ -3041,39 +3095,39 @@ def test_handler_doesnt_match_to_job(
                     packages={"package": CommonPackageConfig()},
                 ),
             ],
-            {},
+            {"comment": "test"},
         ),
         pytest.param(
             CheckRerunPullRequestEvent,
             JobConfigTriggerType.pull_request,
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={
                         "package": CommonPackageConfig(
                             identifier="first",
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={
                         "package": CommonPackageConfig(
                             identifier="second",
-                        )
+                        ),
                     },
                 ),
             ],
             [
                 JobConfig(
-                    type=JobType.build,
+                    type=JobType.copr_build,
                     trigger=JobConfigTriggerType.pull_request,
                     packages={
                         "package": CommonPackageConfig(
                             identifier="first",
-                        )
+                        ),
                     },
                 ),
             ],
@@ -3089,7 +3143,7 @@ def test_handler_doesnt_match_to_job(
                     packages={
                         "package": CommonPackageConfig(
                             identifier="first",
-                        )
+                        ),
                     },
                     manual_trigger=True,
                 ),
@@ -3101,7 +3155,7 @@ def test_handler_doesnt_match_to_job(
                     packages={
                         "package": CommonPackageConfig(
                             identifier="first",
-                        )
+                        ),
                     },
                     manual_trigger=True,
                 ),
@@ -3157,7 +3211,7 @@ def test_handler_doesnt_match_to_job(
                     packages={
                         "package": CommonPackageConfig(
                             identifier="first",
-                        )
+                        ),
                     },
                     manual_trigger=True,
                 ),
@@ -3167,7 +3221,7 @@ def test_handler_doesnt_match_to_job(
                     packages={
                         "package": CommonPackageConfig(
                             identifier="first",
-                        )
+                        ),
                     },
                     manual_trigger=False,
                 ),
@@ -3179,7 +3233,7 @@ def test_handler_doesnt_match_to_job(
                     packages={
                         "package": CommonPackageConfig(
                             identifier="first",
-                        )
+                        ),
                     },
                     manual_trigger=True,
                 ),
@@ -3189,7 +3243,7 @@ def test_handler_doesnt_match_to_job(
                     packages={
                         "package": CommonPackageConfig(
                             identifier="first",
-                        )
+                        ),
                     },
                     manual_trigger=False,
                 ),
@@ -3280,10 +3334,53 @@ def test_handler_doesnt_match_to_job(
             ],
             {},
         ),
+        pytest.param(
+            PullRequestCommentPagureEvent,
+            JobConfigTriggerType.pull_request,
+            [
+                JobConfig(
+                    type=JobType.koji_build,
+                    trigger=JobConfigTriggerType.commit,
+                    sidetag_group="test",
+                    packages={"package": CommonPackageConfig()},
+                ),
+                JobConfig(
+                    type=JobType.koji_build,
+                    trigger=JobConfigTriggerType.koji_build,
+                    sidetag_group="test",
+                    packages={"package": CommonPackageConfig()},
+                ),
+                JobConfig(
+                    type=JobType.bodhi_update,
+                    trigger=JobConfigTriggerType.koji_build,
+                    sidetag_group="test",
+                    packages={"package": CommonPackageConfig()},
+                ),
+            ],
+            [
+                JobConfig(
+                    type=JobType.koji_build,
+                    trigger=JobConfigTriggerType.commit,
+                    sidetag_group="test",
+                    packages={"package": CommonPackageConfig()},
+                ),
+                JobConfig(
+                    type=JobType.bodhi_update,
+                    trigger=JobConfigTriggerType.koji_build,
+                    sidetag_group="test",
+                    packages={"package": CommonPackageConfig()},
+                ),
+            ],
+            {"comment": "test"},
+        ),
     ],
 )
 def test_get_jobs_matching_trigger(
-    event_kls, job_config_trigger_type, jobs, result, kwargs
+    event_kls,
+    job_config_trigger_type,
+    jobs,
+    result,
+    kwargs,
 ):
     class Event(event_kls):
         def __init__(self, **kwargs):
@@ -3313,7 +3410,7 @@ def test_get_jobs_matching_trigger(
                     packages={
                         "package": CommonPackageConfig(
                             identifier="foo",
-                        )
+                        ),
                     },
                 ),
                 JobConfig(
@@ -3322,7 +3419,7 @@ def test_get_jobs_matching_trigger(
                     packages={
                         "package": CommonPackageConfig(
                             identifier="bar",
-                        )
+                        ),
                     },
                 ),
             ],
@@ -3351,7 +3448,11 @@ def test_get_jobs_matching_trigger(
     ],
 )
 def test_create_tasks_tf_identifier(
-    event_kls, jobs, handler_kls, tasks_created, identifier
+    event_kls,
+    jobs,
+    handler_kls,
+    tasks_created,
+    identifier,
 ):
     class Event(event_kls):
         def __init__(self):
@@ -3360,7 +3461,8 @@ def test_create_tasks_tf_identifier(
         @property
         def packages_config(self):
             return flexmock(
-                jobs=jobs, get_package_config_for=lambda job_config: flexmock()
+                jobs=jobs,
+                get_package_config_for=lambda job_config: flexmock(),
             )
 
         def get_dict(self, *args, **kwargs):
@@ -3380,9 +3482,12 @@ def test_create_tasks_tf_identifier(
     flexmock(handler_kls).should_receive("get_signature").and_return(None)
     flexmock(TaskResults, create_from=lambda *args, **kwargs: object())
     flexmock(celery).should_receive("group").with_args(
-        tasks_created * [None]
+        tasks_created * [None],
     ).and_return(flexmock().should_receive("apply_async").mock())
-    assert tasks_created == len(SteveJobs(event).create_tasks(jobs, handler_kls))
+    statuses_check_feedback = flexmock()
+    assert tasks_created == len(
+        SteveJobs(event).create_tasks(jobs, handler_kls, statuses_check_feedback),
+    )
 
 
 def test_monorepo_jobs_matching_event():
@@ -3447,7 +3552,7 @@ def test_monorepo_jobs_matching_event():
             trigger=JobConfigTriggerType.release,
             skip_build=False,
             packages={
-                "python-teamcity-messages-double": python_teamcity_messages_double
+                "python-teamcity-messages-double": python_teamcity_messages_double,
             },
         ),
     ]
@@ -3500,7 +3605,7 @@ def test_github_app_not_installed():
     jobs = SteveJobs(event)
 
     flexmock(jobs).should_receive("is_project_public_or_enabled_private").and_raise(
-        GithubAppNotInstalledError
+        GithubAppNotInstalledError,
     )
 
     assert not jobs.process()
@@ -3509,7 +3614,7 @@ def test_github_app_not_installed():
 def test_search_for_dg_config_in_issue_on_pr_comment():
     assert (
         SteveJobs(
-            AbstractPRCommentEvent(None, None, None, None)
+            AbstractPRCommentEvent(None, None, None, None),
         ).search_distgit_config_in_issue()
         is None
     )
@@ -3543,7 +3648,7 @@ def test_invalid_packit_deployment():
 def test_unapproved_jobs():
     event = flexmock(project=None, packages_config=[])
     event.should_receive("get_dict").and_return(
-        {"project": None, "packages_config": []}
+        {"project": None, "packages_config": []},
     )
     jobs = SteveJobs(event)
 
@@ -3553,7 +3658,7 @@ def test_unapproved_jobs():
     flexmock(jobs).should_receive("is_packit_config_present").and_return(True)
     flexmock(jobs).should_receive("get_handlers_for_event").and_return([None])
     flexmock(jobs).should_receive("get_config_for_handler_kls").and_return(
-        [None, None, None]
+        [None, None, None],
     )
     # TODO: »do not« mock the ‹Allowlist› directly!!!
     flexmock(Allowlist).should_receive("check_and_report").and_return(False)

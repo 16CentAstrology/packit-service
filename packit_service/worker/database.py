@@ -3,17 +3,20 @@
 
 from datetime import timedelta
 from gzip import open as gzip_open
-from logging import getLogger, DEBUG, INFO
+from logging import DEBUG, INFO, getLogger
 from os import getenv
 from pathlib import Path
 from shutil import copyfileobj
 
 from boto3 import client as boto3_client
 from botocore.exceptions import ClientError
-
 from packit.utils.commands import run_command
-from packit_service.constants import SRPMBUILDS_OUTDATED_AFTER_DAYS
-from packit_service.models import get_pg_url, SRPMBuildModel
+
+from packit_service.constants import (
+    PACKAGE_CONFIGS_OUTDATED_AFTER_DAYS,
+    SRPMBUILDS_OUTDATED_AFTER_DAYS,
+)
+from packit_service.models import ProjectEventModel, SRPMBuildModel, get_pg_url
 
 logger = getLogger(__name__)
 
@@ -24,16 +27,33 @@ def discard_old_srpm_build_logs():
     """Called periodically (see celery_config.py) to discard logs of old SRPM builds."""
     logger.info("About to discard old SRPM build logs & artifact urls.")
     outdated_after_days = getenv(
-        "SRPMBUILDS_OUTDATED_AFTER_DAYS", SRPMBUILDS_OUTDATED_AFTER_DAYS
+        "SRPMBUILDS_OUTDATED_AFTER_DAYS",
+        SRPMBUILDS_OUTDATED_AFTER_DAYS,
     )
     ago = timedelta(days=int(outdated_after_days))
     for build in SRPMBuildModel.get_older_than(ago):
         logger.debug(
-            f"SRPM build {build.id} is older than '{ago}'. "
-            "Discarding log and artifact url."
+            f"SRPM build {build.id} is older than '{ago}'. " "Discarding log and artifact url.",
         )
         build.set_logs(None)
         build.set_url(None)
+
+
+def discard_old_package_configs():
+    """Called periodically (see celery_config.py) to discard package configs of old events."""
+    logger.info("About to discard old package configs.")
+    outdated_after_days = getenv(
+        "PACKAGE_CONFIGS_OUTDATED_AFTER_DAYS",
+        PACKAGE_CONFIGS_OUTDATED_AFTER_DAYS,
+    )
+    ago = timedelta(days=int(outdated_after_days))
+    events = ProjectEventModel.get_and_reset_older_than_with_packages_config(ago)
+    event_ids = "".join([" " + str(event.id) for event in events])
+
+    logger.debug(
+        f"ProjectEventModels with ids [{event_ids}] have all runs older than '{ago}'. "
+        "Discarded package configs.",
+    )
 
 
 def gzip_file(file: Path) -> Path:
@@ -48,10 +68,15 @@ def gzip_file(file: Path) -> Path:
     """
     compressed_file = Path(f"{file}.gz")
     try:
-        with file.open(mode="rb") as f_in:
-            with gzip_open(compressed_file, mode="wb") as f_out:
-                logger.info(f"Compressing {file} into {compressed_file}")
-                copyfileobj(f_in, f_out)
+        with (
+            file.open(mode="rb") as f_in,
+            gzip_open(
+                compressed_file,
+                mode="wb",
+            ) as f_out,
+        ):
+            logger.info(f"Compressing {file} into {compressed_file}")
+            copyfileobj(f_in, f_out)
     except OSError as e:
         logger.error(e)
         raise
@@ -59,7 +84,8 @@ def gzip_file(file: Path) -> Path:
 
 
 def upload_to_s3(
-    file: Path, bucket: str = f"arr-packit-{getenv('DEPLOYMENT', 'dev')}"
+    file: Path,
+    bucket: str = f"arr-packit-{getenv('DEPLOYMENT', 'dev')}",
 ) -> None:
     """Upload a file to an S3 bucket.
 

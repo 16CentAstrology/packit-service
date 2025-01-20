@@ -2,15 +2,19 @@
 # SPDX-License-Identifier: MIT
 
 import logging
-from typing import Optional, List, Set
+from typing import Optional
 
 from ogr.abstract import GitProject
+from packit.config import (
+    JobConfig,
+    JobConfigTriggerType,
+    JobType,
+    PackageConfig,
+    aliases,
+)
 
-from packit.config import JobType, PackageConfig, JobConfig, JobConfigTriggerType
-from packit.config.aliases import get_branches
 from packit_service.config import ServiceConfig
 from packit_service.models import ProjectEventModel
-from packit_service.trigger_mapping import are_job_types_same
 from packit_service.worker.events import EventData
 from packit_service.worker.helpers.job_helper import BaseJobHelper
 
@@ -29,7 +33,7 @@ class SyncReleaseHelper(BaseJobHelper):
         metadata: EventData,
         db_project_event: ProjectEventModel,
         job_config: JobConfig,
-        branches_override: Optional[Set[str]] = None,
+        branches_override: Optional[set[str]] = None,
     ):
         super().__init__(
             service_config=service_config,
@@ -40,7 +44,7 @@ class SyncReleaseHelper(BaseJobHelper):
             job_config=job_config,
         )
         self.branches_override = branches_override
-        self._check_names: Optional[List[str]] = None
+        self._check_names: Optional[list[str]] = None
         self._default_dg_branch: Optional[str] = None
         self._job: Optional[JobConfig] = None
 
@@ -51,21 +55,43 @@ class SyncReleaseHelper(BaseJobHelper):
         """
         raise NotImplementedError("Use subclass.")
 
+    def _filter_override_branches(self, branches: set[str]) -> set[str]:
+        """
+        If a branch has been overriden filter it out.
+        If we re-run the job in a subset of branches
+        the overriden branches are those where the job
+        has not to be run again.
+        """
+        if self.branches_override:
+            logger.debug(f"Branches override: {self.branches_override}")
+            branches = branches & self.branches_override
+        return branches
+
     @property
-    def branches(self) -> Set[str]:
+    def branches(self) -> set[str]:
         """
         Return all valid branches from config.
         """
-        branches = get_branches(
+        branches = aliases.get_branches(
             *self.job.dist_git_branches,
             default_dg_branch=self.default_dg_branch,
             default=self.default_dg_branch,
         )
-        if self.branches_override:
-            logger.debug(f"Branches override: {self.branches_override}")
-            branches = branches & self.branches_override
+        return self._filter_override_branches(branches)
 
-        return branches
+    def get_fast_forward_merge_branches_for(self, source_branch: str) -> set[str]:
+        """
+        Returns a list of branches that can be fast forwarded merging
+        the specified source_branch. They are listed in the config.
+
+        source_branch: source branch
+        """
+        return aliases.get_fast_forward_merge_branches_for(
+            self.job.dist_git_branches,
+            source_branch,
+            default=self.default_dg_branch,
+            default_dg_branch=self.default_dg_branch,
+        )
 
     @property
     def job(self) -> Optional[JobConfig]:
@@ -74,17 +100,19 @@ class SyncReleaseHelper(BaseJobHelper):
         :return: JobConfig or None
         """
         if not self._job:
-            for job in [self.job_config] + self.package_config.jobs:
-                if are_job_types_same(job.type, self.job_type) and (
+            for job in [self.job_config, *self.package_config.jobs]:
+                if job.type == self.job_type and (
                     self._db_project_object
                     and (
                         self._db_project_object.job_config_trigger_type == job.trigger
                         # pull-from-upstream can be retriggered by a dist-git PR comment,
                         # in which case the trigger types don't match
-                        or job.type == JobType.pull_from_upstream
-                        and self._db_project_object.job_config_trigger_type
-                        == JobConfigTriggerType.pull_request
-                        and job.trigger == JobConfigTriggerType.release
+                        or (
+                            job.type == JobType.pull_from_upstream
+                            and self._db_project_object.job_config_trigger_type
+                            == JobConfigTriggerType.pull_request
+                            and job.trigger == JobConfigTriggerType.release
+                        )
                     )
                 ):
                     self._job = job
