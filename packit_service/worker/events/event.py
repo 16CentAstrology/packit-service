@@ -4,20 +4,22 @@
 """
 Generic/abstract event classes.
 """
+
 import copy
 from datetime import datetime, timezone
 from logging import getLogger
-from typing import Dict, Optional, Type, Union, Set, List
+from typing import Optional, Union
 
-from ogr.abstract import GitProject
+from ogr.abstract import GitProject, PullRequest
 from ogr.parsing import RepoUrl
-
 from packit.config import JobConfigTriggerType, PackageConfig
+
 from packit_service.config import PackageConfigGetter, ServiceConfig
 from packit_service.models import (
     AbstractProjectObjectDbType,
-    ProjectEventModel,
+    AnityaProjectModel,
     CoprBuildTargetModel,
+    ProjectEventModel,
     TFTTestRunTargetModel,
     filter_most_recent_target_names_by_status,
 )
@@ -25,7 +27,7 @@ from packit_service.models import (
 logger = getLogger(__name__)
 
 
-MAP_EVENT_TO_JOB_CONFIG_TRIGGER_TYPE: Dict[Type["Event"], JobConfigTriggerType] = {}
+MAP_EVENT_TO_JOB_CONFIG_TRIGGER_TYPE: dict[type["Event"], JobConfigTriggerType] = {}
 
 
 def use_for_job_config_trigger(trigger_type: JobConfigTriggerType):
@@ -44,7 +46,7 @@ def use_for_job_config_trigger(trigger_type: JobConfigTriggerType):
     ```
     """
 
-    def _add_to_mapping(kls: Type["Event"]):
+    def _add_to_mapping(kls: type["Event"]):
         MAP_EVENT_TO_JOB_CONFIG_TRIGGER_TYPE[kls] = trigger_type
         return kls
 
@@ -70,9 +72,9 @@ class EventData:
         event_dict: Optional[dict],
         issue_id: Optional[int],
         task_accepted_time: Optional[datetime],
-        build_targets_override: Optional[List[str]],
-        tests_targets_override: Optional[List[str]],
-        branches_override: Optional[List[str]],
+        build_targets_override: Optional[set[tuple[str, str]]],
+        tests_targets_override: Optional[set[tuple[str, str]]],
+        branches_override: Optional[list[str]],
     ):
         self.event_type = event_type
         self.actor = actor
@@ -113,13 +115,20 @@ class EventData:
         commit_sha = event.get("commit_sha")
         identifier = event.get("identifier")
         issue_id = event.get("issue_id")
-        task_accepted_time = (
-            datetime.fromtimestamp(event.get("task_accepted_time"), timezone.utc)
-            if event.get("task_accepted_time")
-            else None
+
+        time = event.get("task_accepted_time")
+        task_accepted_time = datetime.fromtimestamp(time, timezone.utc) if time else None
+
+        build_targets_override = (
+            {(target, identifier_) for [target, identifier_] in event.get("build_targets_override")}
+            if event.get("build_targets_override")
+            else set()
         )
-        build_targets_override = event.get("build_targets_override")
-        tests_targets_override = event.get("tests_targets_override")
+        tests_targets_override = (
+            {(target, identifier_) for [target, identifier_] in event.get("tests_targets_override")}
+            if event.get("tests_targets_override")
+            else set()
+        )
         branches_override = event.get("branches_override")
 
         return EventData(
@@ -139,6 +148,24 @@ class EventData:
             tests_targets_override=tests_targets_override,
             branches_override=branches_override,
         )
+
+    def to_event(self) -> "Event":
+        """
+        Create an instance of Event class from the data in this class.
+        """
+        mod = __import__("packit_service.worker.events", fromlist=[self.event_type])
+        kls = getattr(mod, self.event_type)
+        kwargs = copy.copy(self.event_dict)
+        # The following data should be reconstructed by the Event instance (when needed)
+        kwargs.pop("event_type", None)
+        kwargs.pop("event_id", None)
+        kwargs.pop("task_accepted_time", None)
+        kwargs.pop("build_targets_override", None)
+        kwargs.pop("tests_targets_override", None)
+        kwargs.pop("branches_override", None)
+        pr_id = kwargs.pop("_pr_id", None)
+        kwargs["pr_id"] = pr_id
+        return kls(**kwargs)
 
     @property
     def project(self):
@@ -204,6 +231,18 @@ class EventData:
         elif self.event_type in {
             "NewHotnessUpdateEvent",
         }:
+            if not self.project_url:
+                (
+                    self._db_project_object,
+                    self._db_project_event,
+                ) = ProjectEventModel.add_anitya_version_event(
+                    version=self.event_dict.get("version"),
+                    project_name=self.event_dict.get("anitya_project_name"),
+                    project_id=self.event_dict.get("anitya_project_id"),
+                    package=self.event_dict.get("package_name"),
+                )
+                return
+
             if self.project:
                 namespace = self.project.namespace
                 repo_name = self.project.repo
@@ -234,9 +273,62 @@ class EventData:
                 repo_name=self.project.repo,
                 project_url=self.project_url,
             )
+        elif self.event_type in {
+            "KojiBuildTagEvent",
+        }:
+            (
+                self._db_project_object,
+                self._db_project_event,
+            ) = ProjectEventModel.add_koji_build_tag_event(
+                task_id=str(self.event_dict.get("task_id")),
+                koji_tag_name=self.tag_name,
+                namespace=self.project.namespace,
+                repo_name=self.project.repo,
+                project_url=self.project_url,
+            )
+        elif self.event_type in {
+            "KojiBuildEvent",
+        }:
+            (
+                self._db_project_object,
+                self._db_project_event,
+            ) = ProjectEventModel.add_branch_push_event(
+                branch_name=self.event_dict.get("branch_name"),
+                namespace=self.project.namespace,
+                repo_name=self.project.repo,
+                project_url=self.project_url,
+                commit_sha=self.event_dict.get("commit_sha"),
+            )
+        elif self.event_type in {
+            "CommitCommentGithubEvent",
+            "CommitCommentGitlabEvent",
+        }:
+            if self.tag_name:
+                (
+                    self._db_project_object,
+                    self._db_project_event,
+                ) = ProjectEventModel.add_release_event(
+                    tag_name=self.tag_name,
+                    namespace=self.project.namespace,
+                    repo_name=self.project.repo,
+                    project_url=self.project_url,
+                    commit_hash=self.commit_sha,
+                )
+            else:
+                (
+                    self._db_project_object,
+                    self._db_project_event,
+                ) = ProjectEventModel.add_branch_push_event(
+                    branch_name=self.git_ref,
+                    namespace=self.project.namespace,
+                    repo_name=self.project.repo,
+                    project_url=self.project_url,
+                    commit_sha=self.commit_sha,
+                )
+
         else:
             logger.warning(
-                "We don't know, what to search in the database for this event data."
+                "We don't know, what to search in the database for this event data.",
             )
 
     @property
@@ -282,7 +374,7 @@ class Event:
     task_accepted_time: Optional[datetime] = None
     actor: Optional[str]
 
-    def __init__(self, created_at: Union[int, float, str] = None):
+    def __init__(self, created_at: Optional[Union[int, float, str]] = None):
         self.created_at: datetime
         if created_at:
             if isinstance(created_at, (int, float)):
@@ -303,23 +395,44 @@ class Event:
         self._db_project_event: Optional[ProjectEventModel] = None
 
     @staticmethod
-    def make_serializable(d: dict, skip: List) -> dict:
+    def make_serializable(d: dict, skip: list) -> dict:
         """We need a JSON serializable dict (because of redis and celery tasks)
         This method will copy everything from dict except the specified
         non serializable keys.
         """
         return {k: copy.deepcopy(v) for k, v in d.items() if k not in skip}
 
+    def store_packages_config(self):
+        """
+        For events starting pipeline for Koji/Copr builds/tests, we
+        want to store the packages config to limit
+        getting it via API (reduce API calls).
+        """
+        if not self.db_project_event:
+            return
+
+        package_config_dict = (
+            self.packages_config.get_raw_dict_with_defaults() if self.packages_config else None
+        )
+        if package_config_dict:
+            logger.debug("Storing packages config in DB.")
+            self.db_project_event.set_packages_config(package_config_dict)
+
     def get_non_serializable_attributes(self):
+        """List here both non serializable attributes and attributes that
+        we want to skip from the dict because are not needed to re-create
+        the event.
+        """
         return [
             "_db_project_object",
             "_db_project_event",
             "_project",
             "_base_project",
             "_package_config",
+            "_package_config_searched",
         ]
 
-    def get_dict(self, default_dict: Optional[Dict] = None) -> dict:
+    def get_dict(self, default_dict: Optional[dict] = None) -> dict:
         d = default_dict or self.__dict__
         # whole dict has to be JSON serializable because of redis
         d = self.make_serializable(d, self.get_non_serializable_attributes())
@@ -335,7 +448,10 @@ class Event:
         )
         d["project_url"] = d.get("project_url") or (
             self.db_project_object.project.project_url
-            if self.db_project_object
+            if (
+                self.db_project_object
+                and not isinstance(self.db_project_object.project, AnityaProjectModel)
+            )
             else None
         )
         if self.build_targets_override:
@@ -382,7 +498,7 @@ class Event:
                 return job_config_trigger_type
         if not self.db_project_object:
             logger.warning(
-                f"Event {self} does not have a matching object in the database."
+                f"Event {self} does not have a matching object in the database.",
             )
             return None
         return self.db_project_object.job_config_trigger_type
@@ -400,23 +516,25 @@ class Event:
         raise NotImplementedError("Please implement me!")
 
     @property
-    def build_targets_override(self) -> Optional[Set[str]]:
+    def build_targets_override(self) -> Optional[set[tuple[str, str]]]:
         """
-        Return the targets to use for building of the all targets from config
+        Return the targets and identifiers to use for building
+        of the all targets from config
         for the relevant events (e.g.rerunning of a single check).
         """
         return None
 
     @property
-    def tests_targets_override(self) -> Optional[Set[str]]:
+    def tests_targets_override(self) -> Optional[set[tuple[str, str]]]:
         """
-        Return the targets to use for testing of the all targets from config
+        Return the targets and identifiers to use for testing
+        of the all targets from config
         for the relevant events (e.g.rerunning of a single check).
         """
         return None
 
     @property
-    def branches_override(self) -> Optional[Set[str]]:
+    def branches_override(self) -> Optional[set[str]]:
         """
         Return the branches to use for propose-downstream of the all branches from config
         for the relevant events (e.g.rerunning of a single check).
@@ -451,7 +569,7 @@ class AbstractForgeIndependentEvent(Event):
 
     def __init__(
         self,
-        created_at: Union[int, float, str] = None,
+        created_at: Optional[Union[int, float, str]] = None,
         project_url=None,
         pr_id: Optional[int] = None,
         actor: Optional[str] = None,
@@ -461,6 +579,7 @@ class AbstractForgeIndependentEvent(Event):
         self._pr_id = pr_id
         self.fail_when_config_file_missing = False
         self.actor = actor
+        self._pull_request_object = None
 
     @property
     def project(self):
@@ -491,12 +610,18 @@ class AbstractForgeIndependentEvent(Event):
     def pr_id(self) -> Optional[int]:
         return self._pr_id
 
+    @property
+    def pull_request_object(self) -> Optional[PullRequest]:
+        if not self._pull_request_object and self.pr_id:
+            self._pull_request_object = self.project.get_pr(self.pr_id)
+        return self._pull_request_object
+
     def get_project(self) -> Optional[GitProject]:
         if not (self.project_url or self.db_project_object):
             return None
 
         return ServiceConfig.get_service_config().get_project(
-            url=self.project_url or self.db_project_object.project.project_url
+            url=self.project_url or self.db_project_object.project.project_url,
         )
 
     def get_base_project(self) -> Optional[GitProject]:
@@ -509,10 +634,10 @@ class AbstractForgeIndependentEvent(Event):
             f"\tproject: {self.project}\n"
             f"\tbase_project: {self.base_project}\n"
             f"\treference: {self.commit_sha}\n"
-            f"\tpr_id: {self.pr_id}"
+            f"\tpr_id: {self.pr_id}",
         )
 
-        packages_config = PackageConfigGetter.get_package_config_from_repo(
+        return PackageConfigGetter.get_package_config_from_repo(
             base_project=self.base_project,
             project=self.project,
             reference=self.commit_sha,
@@ -520,37 +645,54 @@ class AbstractForgeIndependentEvent(Event):
             fail_when_missing=self.fail_when_config_file_missing,
         )
 
-        return packages_config
-
     def get_all_tf_targets_by_status(
-        self, statuses_to_filter_with: List[str]
-    ) -> Optional[Set[str]]:
+        self,
+        statuses_to_filter_with: list[str],
+    ) -> Optional[set[tuple[str, str]]]:
         if self.commit_sha is None:
             return None
 
         logger.debug(
-            f"Getting failed Testing Farm targets for commit sha: {self.commit_sha}"
+            f"Getting Testing Farm targets for commit sha {self.commit_sha} "
+            f"and statuses {statuses_to_filter_with}",
         )
-        return filter_most_recent_target_names_by_status(
+        found_targets = filter_most_recent_target_names_by_status(
             models=TFTTestRunTargetModel.get_all_by_commit_target(
-                commit_sha=self.commit_sha
+                commit_sha=self.commit_sha,
             ),
             statuses_to_filter_with=statuses_to_filter_with,
         )
+        logger.debug(
+            f"Testing Farm found targets {found_targets}",
+        )
+        return found_targets
 
     def get_all_build_targets_by_status(
-        self, statuses_to_filter_with: List[str]
-    ) -> Optional[Set[str]]:
+        self,
+        statuses_to_filter_with: list[str],
+    ) -> Optional[set[tuple[str, str]]]:
         if self.commit_sha is None or self.project.repo is None:
             return None
 
         logger.debug(
-            f"Getting failed COPR build targets for commit sha: {self.commit_sha}"
+            f"Getting COPR build targets for commit sha {self.commit_sha} "
+            f"and statuses {statuses_to_filter_with}",
         )
-        return filter_most_recent_target_names_by_status(
+        found_targets = filter_most_recent_target_names_by_status(
             models=CoprBuildTargetModel.get_all_by_commit(commit_sha=self.commit_sha),
             statuses_to_filter_with=statuses_to_filter_with,
         )
+        logger.debug(
+            f"Builds found targets {found_targets}",
+        )
+        return found_targets
+
+    def get_non_serializable_attributes(self):
+        return [
+            *super().get_non_serializable_attributes(),
+            "fail_when_config_file_missing",
+            "_pull_request_object",
+        ]
 
 
 class AbstractResultEvent(AbstractForgeIndependentEvent):
@@ -559,4 +701,8 @@ class AbstractResultEvent(AbstractForgeIndependentEvent):
     allow Steve properly filter jobs with manual trigger.
     """
 
-    pass
+    def get_packages_config(self) -> Optional[PackageConfig]:
+        if self.db_project_event and (db_config := self.db_project_event.packages_config):
+            logger.debug("Getting packages config from DB.")
+            return PackageConfig.get_from_dict_without_setting_defaults(db_config)
+        return super().get_packages_config()

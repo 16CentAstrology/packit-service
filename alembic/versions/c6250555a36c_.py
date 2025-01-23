@@ -5,29 +5,30 @@ Revises: d7c2f99cd14d
 Create Date: 2020-04-06 09:34:50.929724
 
 """
+
 import enum
 import json
 import logging
 from datetime import datetime, timezone
 from os import getenv
-from typing import TYPE_CHECKING, Union, List
+from typing import TYPE_CHECKING, Union
 
-from alembic import op
 from celery.backends.database import Task
 from redis import Redis
 from sqlalchemy import (
     Column,
+    DateTime,
+    Enum,
+    ForeignKey,
     Integer,
     String,
-    DateTime,
-    ForeignKey,
-    Enum,
     orm,
 )
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Session, relationship
 from sqlalchemy.types import PickleType
 
+from alembic import op
 from packit_service.constants import ALLOWLIST_CONSTANTS
 from packit_service.worker.events import InstallationEvent
 
@@ -238,7 +239,7 @@ class RedisCoprBuild(RedisBuild):
     table_name = "copr-builds"
     project: str
     owner: str
-    chroots: List[str]
+    chroots: list[str]
 
 
 # Postgres models
@@ -291,11 +292,7 @@ class WhitelistUpgradeModel(Base):
 
     @classmethod
     def get_account(cls, session: Session, account_name: str):
-        return (
-            session.query(WhitelistUpgradeModel)
-            .filter_by(account_name=account_name)
-            .first()
-        )
+        return session.query(WhitelistUpgradeModel).filter_by(account_name=account_name).first()
 
 
 class InstallationUpgradeModel(Base):
@@ -312,9 +309,7 @@ class InstallationUpgradeModel(Base):
     @classmethod
     def get_by_account_login(cls, session: Session, account_login: str):
         return (
-            session.query(InstallationUpgradeModel)
-            .filter_by(account_login=account_login)
-            .first()
+            session.query(InstallationUpgradeModel).filter_by(account_login=account_login).first()
         )
 
     @classmethod
@@ -363,9 +358,7 @@ class CoprBuildUpgradeModel(Base):
     @classmethod
     def get_by_build_id(cls, session: Session, build_id: str, target: str):
         return (
-            session.query(CoprBuildUpgradeModel)
-            .filter_by(build_id=build_id, target=target)
-            .first()
+            session.query(CoprBuildUpgradeModel).filter_by(build_id=build_id, target=target).first()
         )
 
     @classmethod
@@ -416,7 +409,10 @@ class JobTriggerUpgradeModel(Base):
 
     @classmethod
     def get_or_create(
-        cls, session: Session, type: JobTriggerModelType, trigger_id: int
+        cls,
+        session: Session,
+        type: JobTriggerModelType,
+        trigger_id: int,
     ) -> "JobTriggerUpgradeModel":
         trigger = (
             session.query(JobTriggerUpgradeModel)
@@ -470,7 +466,9 @@ def upgrade():
 
         # our table
         TaskResultUpgradeModel.add_task_result(
-            session=session, task_id=task_id, task_result_dict=result
+            session=session,
+            task_id=task_id,
+            task_result_dict=result,
         )
         # celery table
         add_task_to_celery_table(
@@ -491,7 +489,9 @@ def upgrade():
         status = data.get("status")
         logger.info(f"Adding account {account} into WhitelistModel")
         WhitelistUpgradeModel.add_account(
-            session=session, account_name=account, status=status
+            session=session,
+            account_name=account,
+            status=status,
         )
 
     # installations
@@ -548,8 +548,7 @@ def upgrade():
 
         status = copr_build.get("status")
         web_url = (
-            f"https://copr.fedorainfracloud.org/coprs/{owner}/{project_name}/"
-            f"build/{build_id}/"
+            f"https://copr.fedorainfracloud.org/coprs/{owner}/{project_name}/build/{build_id}/"
         )
 
         try:

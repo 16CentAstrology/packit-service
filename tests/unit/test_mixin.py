@@ -1,29 +1,30 @@
 # Copyright Contributors to the Packit project.
 # SPDX-License-Identifier: MIT
 
-import pytest
-
-from flexmock import flexmock
 from typing import Optional
 
-from packit.vm_image_build import ImageBuilder
+import pytest
+from flexmock import flexmock
 from ogr.abstract import GitProject
-from packit_service.config import ServiceConfig
-from packit_service.worker.mixin import (
-    GetBranchesFromIssueMixin,
-    ConfigFromDistGitUrlMixin,
-    GetVMImageBuilderMixin,
-    ConfigFromEventMixin,
-    GetVMImageDataMixin,
-)
+from packit.vm_image_build import ImageBuilder
 
+from packit_service.config import ServiceConfig
 from packit_service.worker.events import EventData
 from packit_service.worker.events.comment import AbstractIssueCommentEvent
+from packit_service.worker.handlers.mixin import (
+    GetCoprBuildJobHelperMixin,
+    GetVMImageBuilderMixin,
+    GetVMImageDataMixin,
+)
+from packit_service.worker.mixin import (
+    ConfigFromDistGitUrlMixin,
+    ConfigFromEventMixin,
+    GetBranchesFromIssueMixin,
+)
 
 
 def test_GetVMImageBuilderMixin():
-    class Test(ConfigFromEventMixin, GetVMImageBuilderMixin):
-        ...
+    class Test(ConfigFromEventMixin, GetVMImageBuilderMixin): ...
 
     flexmock(ImageBuilder).should_receive("_get_access_token").and_return("token")
     mixin = Test()
@@ -31,7 +32,7 @@ def test_GetVMImageBuilderMixin():
 
 
 def test_GetVMImageDataMixin(fake_package_config_job_config_project_db_trigger):
-    class Test(ConfigFromEventMixin, GetVMImageDataMixin):
+    class Test(ConfigFromEventMixin, GetCoprBuildJobHelperMixin, GetVMImageDataMixin):
         def __init__(self) -> None:
             super().__init__()
             (
@@ -114,7 +115,7 @@ def test_GetBranchesFromIssueMixin(desc, comments, branches):
                     flexmock(
                         description=desc,
                         get_comments=lambda: [flexmock(body=c) for c in comments],
-                    )
+                    ),
                 )
                 .mock()
             )
@@ -149,7 +150,7 @@ def test_ConfigFromDistGitUrlMixin():
             )
             event.dist_git_project_url = "url to distgit"
             self.data = EventData.from_event_dict(
-                flexmock(event, tag_name="a tag", commit_sha="aebdf").get_dict()
+                flexmock(event, tag_name="a tag", commit_sha="aebdf").get_dict(),
             )
 
     mixin = Test()

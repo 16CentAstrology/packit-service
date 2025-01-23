@@ -1,49 +1,59 @@
 # Copyright Contributors to the Packit project.
 # SPDX-License-Identifier: MIT
+
+from abc import abstractmethod
+from functools import cached_property
 from logging import getLogger
-from typing import Optional, Dict
+from typing import Optional
 
 from ogr.abstract import GitProject
 from ogr.parsing import RepoUrl
+from packit.config import JobConfigTriggerType, PackageConfig
 
-from packit.config import PackageConfig, JobConfigTriggerType
-from packit_service.config import ServiceConfig, PackageConfigGetter
-from packit_service.models import ProjectReleaseModel, ProjectEventModel
+from packit_service.config import PackageConfigGetter, ServiceConfig
+from packit_service.models import ProjectEventModel, ProjectReleaseModel
 from packit_service.worker.events import Event
 from packit_service.worker.events.event import use_for_job_config_trigger
 
 logger = getLogger(__name__)
 
 
-# the decorator is needed in case the DB project event is not created (not valid arguments)
-# but we still want to report from pre_check of the PullFromUpstreamHandler
-@use_for_job_config_trigger(trigger_type=JobConfigTriggerType.release)
-class NewHotnessUpdateEvent(Event):
+class AnityaUpdateEvent(Event):
     def __init__(
-        self, package_name: str, version: str, distgit_project_url: str, bug_id: int
+        self,
+        package_name: str,
+        distgit_project_url: str,
+        anitya_project_id: int,
+        anitya_project_name: str,
     ):
         super().__init__()
+
         self.package_name = package_name
-        self.version = version
         self.distgit_project_url = distgit_project_url
-        self.bug_id = bug_id
+        self.anitya_project_id = anitya_project_id
+        self.anitya_project_name = anitya_project_name
 
         self._repo_url: Optional[RepoUrl] = None
-        self._db_project_object: Optional[ProjectReleaseModel]
-        self._db_project_event: Optional[ProjectEventModel]
+        self._db_project_object: Optional[ProjectReleaseModel] = None
+        self._db_project_event: Optional[ProjectEventModel] = None
+
+        self._package_config_searched = False
+        self._package_config: Optional[PackageConfig] = None
 
     @property
-    def project(self):
-        if not self._project:
-            self._project = self.get_project()
-        return self._project
+    @abstractmethod
+    def version(self) -> str: ...
+
+    @cached_property
+    def project(self) -> Optional[GitProject]:
+        return self.get_project()
 
     def get_project(self) -> Optional[GitProject]:
         if not self.distgit_project_url:
             return None
 
         return ServiceConfig.get_service_config().get_project(
-            url=self.distgit_project_url
+            url=self.distgit_project_url,
         )
 
     @property
@@ -52,16 +62,23 @@ class NewHotnessUpdateEvent(Event):
 
     def _add_release_and_event(self):
         if not self._db_project_object or not self._db_project_event:
-            if not (
-                self.tag_name
-                and self.repo_name
-                and self.repo_namespace
-                and self.project_url
-            ):
-                logger.info(
-                    "Not going to create the DB project event, not valid arguments."
+            if not self.project_url:
+                (
+                    self._db_project_object,
+                    self._db_project_event,
+                ) = ProjectEventModel.add_anitya_version_event(
+                    version=self.version,
+                    project_name=self.anitya_project_name,
+                    project_id=self.anitya_project_id,
+                    package=self.package_name,
                 )
-                return None
+                return
+
+            if not (self.tag_name and self.repo_name and self.repo_namespace and self.project_url):
+                logger.info(
+                    "Not going to create the DB project event, not valid arguments.",
+                )
+                return
 
             (
                 self._db_project_object,
@@ -94,9 +111,9 @@ class NewHotnessUpdateEvent(Event):
         return self._package_config
 
     def get_packages_config(self) -> Optional[PackageConfig]:
-        logger.debug(f"Getting package_config:\n" f"\tproject: {self.project}\n")
+        logger.debug(f"Getting package_config:\n\tproject: {self.project}\n")
 
-        package_config = PackageConfigGetter.get_package_config_from_repo(
+        return PackageConfigGetter.get_package_config_from_repo(
             base_project=None,
             project=self.project,
             pr_id=None,
@@ -104,19 +121,13 @@ class NewHotnessUpdateEvent(Event):
             fail_when_missing=False,
         )
 
-        return package_config
-
     @property
     def project_url(self) -> Optional[str]:
-        return (
-            self.packages_config.upstream_project_url if self.packages_config else None
-        )
+        return self.packages_config.upstream_project_url if self.packages_config else None
 
-    @property
+    @cached_property
     def repo_url(self) -> Optional[RepoUrl]:
-        if not self._repo_url:
-            self._repo_url = RepoUrl.parse(self.project_url)
-        return self._repo_url
+        return RepoUrl.parse(self.project_url)
 
     @property
     def repo_namespace(self) -> Optional[str]:
@@ -133,12 +144,82 @@ class NewHotnessUpdateEvent(Event):
 
         return self.packages_config.upstream_tag_template.format(version=self.version)
 
-    def get_dict(self, default_dict: Optional[Dict] = None) -> dict:
+    def get_dict(self, default_dict: Optional[dict] = None) -> dict:
         d = self.__dict__
         d["project_url"] = self.project_url
         d["tag_name"] = self.tag_name
         d["repo_name"] = self.repo_name
         d["repo_namespace"] = self.repo_namespace
+        d["version"] = self.version
         result = super().get_dict(d)
-        result.pop("_repo_url")
+        result.pop("project")
+        result.pop("repo_url")
         return result
+
+
+# the decorator is needed in case the DB project event is not created (not valid arguments)
+# but we still want to report from pre_check of the PullFromUpstreamHandler
+@use_for_job_config_trigger(trigger_type=JobConfigTriggerType.release)
+class NewHotnessUpdateEvent(AnityaUpdateEvent):
+    def __init__(
+        self,
+        package_name: str,
+        version: str,
+        distgit_project_url: str,
+        bug_id: int,
+        anitya_project_id: int,
+        anitya_project_name: str,
+    ):
+        super().__init__(
+            package_name=package_name,
+            distgit_project_url=distgit_project_url,
+            anitya_project_id=anitya_project_id,
+            anitya_project_name=anitya_project_name,
+        )
+        self._version = version
+        self.bug_id = bug_id
+
+    @property
+    def version(self) -> str:
+        return self._version
+
+
+# TODO: Uncomment once it is possible to deduce the version for the sync-release
+# action.
+# @use_for_job_config_trigger(trigger_type=JobConfigTriggerType.release)
+class AnityaVersionUpdateEvent(AnityaUpdateEvent):
+    def __init__(
+        self,
+        package_name: str,
+        versions: list[str],
+        distgit_project_url: str,
+        anitya_project_id: int,
+        anitya_project_name: str,
+    ):
+        super().__init__(
+            package_name=package_name,
+            distgit_project_url=distgit_project_url,
+            anitya_project_id=anitya_project_id,
+            anitya_project_name=anitya_project_name,
+        )
+
+        self._versions = versions
+
+    @property
+    def version(self) -> Optional[str]:
+        # we will decide the version just when syncing release
+        # (for the particular branch etc.),
+        # until that we work with all the new versions
+        return None
+
+    def _add_release_and_event(self):
+        if not self._db_project_object or not self._db_project_event:
+            (
+                self._db_project_object,
+                self._db_project_event,
+            ) = ProjectEventModel.add_anitya_multiple_versions_event(
+                versions=self._versions,
+                project_name=self.anitya_project_name,
+                project_id=self.anitya_project_id,
+                package=self.package_name,
+            )

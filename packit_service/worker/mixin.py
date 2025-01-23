@@ -1,36 +1,28 @@
 # Copyright Contributors to the Packit project.
 # SPDX-License-Identifier: MIT
 
-from abc import abstractmethod
 import logging
 import re
+from abc import abstractmethod
 from pathlib import Path
-from typing import Optional, Protocol, Union, List
+from typing import Optional, Protocol, Union
 
 from fasjson_client import Client
 from fasjson_client.errors import APIError
-
-from ogr.abstract import Issue
-
+from ogr.abstract import GitProject, Issue, PullRequest
 from packit.api import PackitAPI
-from packit.local_project import LocalProject
+from packit.local_project import CALCULATE, LocalProject, LocalProjectBuilder
 from packit.utils.repo import RepositoryCache
-from packit.config.job_config import JobConfig
-from packit.vm_image_build import ImageBuilder
-
-from ogr.abstract import GitProject, PullRequest, PRStatus
 
 from packit_service.config import ServiceConfig
-from packit_service.models import CoprBuildTargetModel, BuildStatus
-from packit_service.worker.reporting import BaseCommitStatus
-from packit_service.worker.events import EventData
-from packit_service.worker.helpers.job_helper import BaseJobHelper
-
 from packit_service.constants import (
     FASJSON_URL,
-    SANDCASTLE_LOCAL_PROJECT_DIR,
     SANDCASTLE_DG_REPO_DIR,
+    SANDCASTLE_LOCAL_PROJECT_DIR,
 )
+from packit_service.worker.events import EventData
+from packit_service.worker.helpers.job_helper import BaseJobHelper
+from packit_service.worker.reporting import BaseCommitStatus
 
 logger = logging.getLogger(__name__)
 
@@ -40,18 +32,15 @@ class Config(Protocol):
 
     @property
     @abstractmethod
-    def project(self) -> Optional[GitProject]:
-        ...
+    def project(self) -> Optional[GitProject]: ...
 
     @property
     @abstractmethod
-    def service_config(self) -> Optional[ServiceConfig]:
-        ...
+    def service_config(self) -> Optional[ServiceConfig]: ...
 
     @property
     @abstractmethod
-    def project_url(self) -> str:
-        ...
+    def project_url(self) -> str: ...
 
 
 class ConfigFromEventMixin(Config):
@@ -93,7 +82,8 @@ class ConfigFromUrlMixin(Config):
     def project(self) -> Optional[GitProject]:
         if not self._project and self.project_url:
             self._project = self.service_config.get_project(
-                url=self.project_url, required=self._project_required
+                url=self.project_url,
+                required=self._project_required,
             )
         return self._project
 
@@ -130,12 +120,10 @@ class PackitAPIProtocol(Config):
 
     @property
     @abstractmethod
-    def packit_api(self) -> PackitAPI:
-        ...
+    def packit_api(self) -> PackitAPI: ...
 
     @abstractmethod
-    def clean_api(self) -> None:
-        ...
+    def clean_api(self) -> None: ...
 
 
 class PackitAPIWithDownstreamProtocol(PackitAPIProtocol):
@@ -181,7 +169,6 @@ class PackitAPIWithDownstreamMixin(PackitAPIWithDownstreamProtocol):
         """TODO: probably we should clean something even here
         but for now let it do the same as before the refactoring
         """
-        pass
 
 
 class PackitAPIWithUpstreamMixin(PackitAPIProtocol):
@@ -196,8 +183,13 @@ class PackitAPIWithUpstreamMixin(PackitAPIProtocol):
                 upstream_local_project=self.local_project,
                 dist_git_clone_path=Path(self.service_config.command_handler_work_dir)
                 / SANDCASTLE_DG_REPO_DIR,
+                non_git_upstream=self.non_git_upstream,
             )
         return self._packit_api
+
+    @property
+    def non_git_upstream(self):
+        return self.check_for_non_git_upstreams and self.job_config.upstream_project_url is None
 
     def clean_api(self) -> None:
         if self._packit_api:
@@ -210,7 +202,7 @@ class GetSyncReleaseTagMixin(PackitAPIWithUpstreamMixin):
     @property
     def tag(self) -> Optional[str]:
         self._tag = self.data.tag_name
-        if not self._tag:
+        if not self._tag and not self.non_git_upstream:
             # there is no tag information when retriggering pull-from-upstream
             # from dist-git PR
             self._tag = self.packit_api.up.get_last_tag()
@@ -223,33 +215,44 @@ class LocalProjectMixin(Config):
     @property
     def local_project(self) -> LocalProject:
         if not self._local_project:
-            kwargs = dict(
-                working_dir=Path(self.service_config.command_handler_work_dir)
-                / SANDCASTLE_LOCAL_PROJECT_DIR,
-                cache=RepositoryCache(
-                    cache_path=self.service_config.repository_cache,
-                    add_new=self.service_config.add_repositories_to_repository_cache,
-                )
-                if self.service_config.repository_cache
-                else None,
+            builder = LocalProjectBuilder(
+                cache=(
+                    RepositoryCache(
+                        cache_path=self.service_config.repository_cache,
+                        add_new=self.service_config.add_repositories_to_repository_cache,
+                    )
+                    if self.service_config.repository_cache
+                    else None
+                ),
             )
+            working_dir = Path(
+                Path(self.service_config.command_handler_work_dir) / SANDCASTLE_LOCAL_PROJECT_DIR,
+            )
+            kwargs = {
+                "repo_name": CALCULATE,
+                "full_name": CALCULATE,
+                "namespace": CALCULATE,
+                "working_dir": working_dir,
+                "git_repo": CALCULATE,
+            }
+
             if self.project:
                 kwargs["git_project"] = self.project
             else:
                 kwargs["git_url"] = self.project_url
-            self._local_project = LocalProject(**kwargs)
+
+            self._local_project = builder.build(**kwargs)
+
         return self._local_project
 
 
 class GetPagurePullRequest(Protocol):
     @property
     @abstractmethod
-    def pull_request(self) -> PullRequest:
-        ...
+    def pull_request(self) -> PullRequest: ...
 
     @abstractmethod
-    def get_pr_author(self) -> Optional[str]:
-        ...
+    def get_pr_author(self) -> Optional[str]: ...
 
 
 class GetPagurePullRequestMixin(GetPagurePullRequest):
@@ -257,18 +260,12 @@ class GetPagurePullRequestMixin(GetPagurePullRequest):
 
     @property
     def pull_request(self):
-        if not self._pull_request and self.data.event_dict["committer"] == "pagure":
+        if not self._pull_request and self.data.pr_id is not None:
             logger.debug(
-                f"Getting pull request with head commit {self.data.commit_sha}"
-                f"for repo {self.project.namespace}/{self.project.repo}"
+                f"Getting pull request #{self.data.pr_id}"
+                f"for repo {self.project.namespace}/{self.project.repo}",
             )
-            prs = [
-                pr
-                for pr in self.project.get_pr_list(status=PRStatus.all)
-                if pr.head_commit == self.data.commit_sha
-            ]
-            if prs:
-                self._pull_request = prs[0]
+            self._pull_request = self.project.get_pr(self.data.pr_id)
         return self._pull_request
 
     def get_pr_author(self):
@@ -279,8 +276,7 @@ class GetPagurePullRequestMixin(GetPagurePullRequest):
 class GetIssue(Protocol):
     @property
     @abstractmethod
-    def issue(self) -> Issue:
-        ...
+    def issue(self) -> Issue: ...
 
 
 class GetIssueMixin(GetIssue, ConfigFromEventMixin):
@@ -296,24 +292,26 @@ class GetIssueMixin(GetIssue, ConfigFromEventMixin):
 class GetBranches(Protocol):
     @property
     @abstractmethod
-    def branches(self) -> List[str]:
-        ...
+    def branches(self) -> list[str]: ...
 
 
 class GetBranchesFromIssueMixin(Config, GetBranches):
     @property
-    def branches(self) -> List[str]:
+    def branches(self) -> list[str]:
         """Get branches names from an issue comment like the following:
 
-
-        Packit failed on creating pull-requests in dist-git (https://src.fedoraproject.org/rpms/python-teamcity-messages): # noqa
+        ```
+        Packit failed on creating pull-requests in dist-git
+            (https://src.fedoraproject.org/rpms/python-teamcity-messages):
 
         | dist-git branch | error |
         | --------------- | ----- |
         | `f37` | `` |
 
 
-        You can retrigger the update by adding a comment (`/packit propose-downstream`) into this issue.
+        You can retrigger the update by adding a comment
+            (`/packit propose-downstream`) into this issue.
+        ```
         """
         branches = set()
         branch_regex = re.compile(r"\s*\| `(\S+)` \|")
@@ -328,127 +326,6 @@ class GetBranchesFromIssueMixin(Config, GetBranches):
         return list(branches)
 
 
-class GetVMImageBuilder(Protocol):
-    @property
-    @abstractmethod
-    def vm_image_builder(self):
-        ...
-
-
-class GetVMImageData(Protocol):
-    @property
-    @abstractmethod
-    def build_id(self) -> str:
-        ...
-
-    @property
-    @abstractmethod
-    def chroot(self) -> str:
-        ...
-
-    @property
-    @abstractmethod
-    def identifier(self) -> str:
-        ...
-
-    @property
-    @abstractmethod
-    def owner(self) -> str:
-        ...
-
-    @property
-    @abstractmethod
-    def project_name(self) -> str:
-        ...
-
-    @property
-    @abstractmethod
-    def image_distribution(self) -> str:
-        ...
-
-    @property
-    @abstractmethod
-    def image_request(self) -> dict:
-        ...
-
-    @property
-    @abstractmethod
-    def image_customizations(self) -> dict:
-        ...
-
-
-class GetVMImageBuilderMixin(Config):
-    _vm_image_builder: Optional[ImageBuilder] = None
-
-    @property
-    def vm_image_builder(self):
-        if not self._vm_image_builder:
-            self._vm_image_builder = ImageBuilder(
-                self.service_config.redhat_api_refresh_token
-            )
-        return self._vm_image_builder
-
-
-class GetVMImageDataMixin(Config):
-    job_config: JobConfig
-    _copr_build: Optional[CoprBuildTargetModel] = None
-
-    @property
-    def chroot(self) -> str:
-        return self.job_config.copr_chroot
-
-    @property
-    def identifier(self) -> str:
-        return self.job_config.identifier
-
-    @property
-    def owner(self) -> str:
-        return self.job_config.owner or (
-            self.copr_build.owner if self.copr_build else None
-        )
-
-    @property
-    def project_name(self) -> str:
-        return self.job_config.project or (
-            self.copr_build.project_name if self.copr_build else None
-        )
-
-    @property
-    def image_name(self) -> str:
-        return f"{self.owner}/" f"{self.project_name}/{self.data.pr_id}"
-
-    @property
-    def image_distribution(self) -> str:
-        return self.job_config.image_distribution
-
-    @property
-    def image_request(self) -> dict:
-        return self.job_config.image_request
-
-    @property
-    def image_customizations(self) -> dict:
-        return self.job_config.image_customizations
-
-    @property
-    def copr_build(self) -> Optional[CoprBuildTargetModel]:
-        if not self._copr_build:
-            copr_builds = CoprBuildTargetModel.get_all_by(
-                project_name=self.job_config.project,
-                commit_sha=self.data.commit_sha,
-                owner=self.job_config.owner,
-                target=self.job_config.copr_chroot,
-                status=BuildStatus.success,
-            )
-
-            for copr_build in copr_builds:
-                project_event_object = copr_build.get_project_event_object()
-                # check whether the event trigger matches
-                if project_event_object.id == self.data.db_project_object.id:
-                    self._copr_build = copr_build
-                    break
-        return self._copr_build
-
-
 class GetReporter(Protocol):
     @abstractmethod
     def report(
@@ -457,9 +334,8 @@ class GetReporter(Protocol):
         description: str,
         url: str = "",
         check_names: Union[str, list, None] = None,
-        markdown_content: str = None,
-    ) -> None:
-        ...
+        markdown_content: Optional[str] = None,
+    ) -> None: ...
 
 
 class GetReporterFromJobHelperMixin(Config):
@@ -485,6 +361,6 @@ class GetReporterFromJobHelperMixin(Config):
         description: str,
         url: str = "",
         check_names: Union[str, list, None] = None,
-        markdown_content: str = None,
+        markdown_content: Optional[str] = None,
     ) -> None:
         self.job_helper._report(state, description, url, check_names, markdown_content)

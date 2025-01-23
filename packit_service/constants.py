@@ -1,7 +1,7 @@
 # Copyright Contributors to the Packit project.
 # SPDX-License-Identifier: MIT
+from datetime import datetime, timedelta
 from enum import Enum
-from typing import List
 
 CONTACTS_URL = "https://packit.dev/#contact"
 DOCS_URL = "https://packit.dev/docs"
@@ -14,6 +14,8 @@ DOCS_HOW_TO_CONFIGURE_URL = f"{DOCS_URL}/guide/#3-configuration"
 DOCS_APPROVAL_URL = f"{DOCS_URL}/guide/#2-approval"
 DOCS_VM_IMAGE_BUILD = f"{DOCS_URL}/cli/build/in-image-builder/"
 DOCS_TESTING_FARM = f"{DOCS_URL}/configuration/upstream/tests"
+DOCS_VALIDATE_CONFIG = f"{DOCS_URL}/cli/validate-config"
+DOCS_VALIDATE_HOOKS = "https://packit.dev/posts/pre-commit-hooks#validate-config"
 
 KOJI_PRODUCTION_BUILDS_ISSUE = "https://pagure.io/releng/issue/9801"
 
@@ -37,18 +39,29 @@ TESTING_FARM_ARTIFACTS_KEY = "artifacts"
 MSG_DOWNSTREAM_JOB_ERROR_HEADER = (
     "Packit failed on creating {object} in dist-git "
     "({dist_git_url}):\n\n"
-    "| dist-git branch | error |\n"
-    "| --------------- | ----- |\n"
+    "<table>"
+    "<tr>"
+    "<th>dist-git branch</th>"
+    "<th>error</th>"
+    "</tr>"
 )
 
-MSG_GET_IN_TOUCH = (
-    f"\n\n---\n\n*Get in [touch with us]({CONTACTS_URL}) if you need some help.*"
+MSG_DOWNSTREAM_JOB_ERROR_ROW = (
+    '<tr><td><code>{branch}</code></td><td>See <a href="{url}">{url}</a></td></tr>\n'
 )
+
+MSG_GET_IN_TOUCH = f"\n\n---\n\n*Get in [touch with us]({CONTACTS_URL}) if you need some help.*"
 
 MSG_RETRIGGER = (
     "You can retrigger the {job} by adding a comment (`{packit_comment_command_prefix} {command}`) "
     "into this {place}."
 )
+
+MSG_RETRIGGER_DISTGIT = (
+    "You can retrigger the {job} by adding a comment (`{packit_comment_command_prefix} {command}`) "
+    "into any open open pull request in dist-git."
+)
+
 COPR_CHROOT_CHANGE_MSG = (
     "Settings of a Copr project {owner}/{project} need to be updated, "
     "but Packit can't do that when there are previous builds still in progress.\n"
@@ -77,14 +90,14 @@ NAMESPACE_NOT_ALLOWED_MARKDOWN_ISSUE_INSTRUCTIONS = (
 NOTIFICATION_REPO = "https://github.com/packit/notifications"
 
 PERMISSIONS_ERROR_WRITE_OR_ADMIN = (
-    "Only users with write or admin permissions to the repository "
-    "can trigger Packit-as-a-Service"
+    "Only users with write or admin permissions to the repository can trigger Packit-as-a-Service"
 )
 
 TASK_ACCEPTED = "The task was accepted."
 
 COPR_SRPM_CHROOT = "srpm-builds"
 COPR_SUCC_STATE = "succeeded"
+COPR_FAIL_STATE = "failed"
 COPR_API_SUCC_STATE = 1
 COPR_API_FAIL_STATE = 2
 
@@ -95,6 +108,9 @@ DEFAULT_RETRY_LIMIT_OUTAGE = 5
 # retry in 0-7s, 0-14s, 0-28s, 0-48s, 0-96s
 # because jitter is enabled by default, celery makes these retries random:
 # https://docs.celeryq.dev/en/latest/userguide/tasks.html#Task.retry_jitter
+
+RETRY_LIMIT_RELEASE_ARCHIVE_DOWNLOAD_ERROR = 6
+
 DEFAULT_RETRY_BACKOFF = 7
 BASE_RETRY_INTERVAL_IN_MINUTES_FOR_OUTAGES = 1
 BASE_RETRY_INTERVAL_IN_SECONDS_FOR_INTERNAL_ERRORS = 10
@@ -107,6 +123,8 @@ DEFAULT_JOB_TIMEOUT = 7 * 24 * 3600
 # outdated and their logs can be discarded.
 SRPMBUILDS_OUTDATED_AFTER_DAYS = 30
 
+PACKAGE_CONFIGS_OUTDATED_AFTER_DAYS = 1
+
 ALLOWLIST_CONSTANTS = {
     "approved_automatically": "approved_automatically",
     "waiting": "waiting",
@@ -118,13 +136,14 @@ CELERY_TASK_DEFAULT_QUEUE = "short-running"
 
 CELERY_DEFAULT_MAIN_TASK_NAME = "task.steve_jobs.process_message"
 
-MSG_TABLE_HEADER_WITH_DETAILS = "| Name/Job | URL |\n" "| --- | --- |\n"
+MSG_TABLE_HEADER_WITH_DETAILS = "| Name/Job | URL |\n| --- | --- |\n"
 
 DEFAULT_MAPPING_TF = {
     "epel-6": "centos-6",
     "epel-7": "centos-7",
     "epel-8": "centos-stream-8",
     "epel-9": "centos-stream-9",
+    "epel-10": "centos-stream-10",
 }
 
 DEFAULT_MAPPING_INTERNAL_TF = {
@@ -132,6 +151,7 @@ DEFAULT_MAPPING_INTERNAL_TF = {
     "epel-7": "rhel-7",
     "epel-8": "rhel-8",
     "epel-9": "centos-stream-9",
+    "epel-10": "centos-stream-10",
 }
 
 COMMENT_REACTION = "eyes"
@@ -200,9 +220,7 @@ INTERNAL_TF_BUILDS_AND_TESTS_NOT_ALLOWED = (
     "or only test job via `{packit_comment_command_prefix} test` comment.*",
 )
 
-CUSTOM_COPR_PROJECT_NOT_ALLOWED_STATUS = (
-    "Not allowed to build in {copr_project} Copr project."
-)
+CUSTOM_COPR_PROJECT_NOT_ALLOWED_STATUS = "Not allowed to build in {copr_project} Copr project."
 CUSTOM_COPR_PROJECT_NOT_ALLOWED_CONTENT = (
     "Your git-forge project is not allowed to use "
     "the configured `{copr_project}` Copr project.\n\n"
@@ -215,9 +233,7 @@ FASJSON_URL = "https://fasjson.fedoraproject.org"
 
 PACKIT_VERIFY_FAS_COMMAND = "verify-fas"
 
-MISSING_PERMISSIONS_TO_BUILD_IN_COPR = (
-    "You don't have permissions to build in this copr."
-)
+MISSING_PERMISSIONS_TO_BUILD_IN_COPR = "You don't have permissions to build in this copr."
 NOT_ALLOWED_TO_BUILD_IN_COPR = "is not allowed to build in the copr"
 GIT_FORGE_PROJECT_NOT_ALLOWED_TO_BUILD_IN_COPR = "can't build in this Copr via Packit."
 
@@ -240,12 +256,12 @@ GITLAB_ISSUE = (
 DASHBOARD_JOBS_TESTING_FARM_PATH = "/jobs/testing-farm-runs"
 
 # https://docs.testing-farm.io/general/0.1/test-environment.html#_supported_architectures
-PUBLIC_TF_ARCHITECTURE_LIST: List[str] = [
+PUBLIC_TF_ARCHITECTURE_LIST: list[str] = [
     "aarch64",
     "x86_64",
 ]
 
-INTERNAL_TF_ARCHITECTURE_LIST: List[str] = [
+INTERNAL_TF_ARCHITECTURE_LIST: list[str] = [
     "aarch64",
     "ppc64le",
     "s390x",
@@ -274,3 +290,19 @@ FAILURE_COMMENT_MESSAGE_VARIABLES = {
         "logs_url",
     )
 }
+
+USAGE_CURRENT_DATE = datetime.now().replace(minute=0, second=0, microsecond=0)
+USAGE_PAST_DAY_DATE_STR = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+USAGE_PAST_WEEK_DATE_STR = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+USAGE_PAST_MONTH_DATE_STR = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+USAGE_PAST_YEAR_DATE_STR = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
+USAGE_DATE_IN_THE_PAST = USAGE_CURRENT_DATE.replace(year=USAGE_CURRENT_DATE.year - 100)
+USAGE_DATE_IN_THE_PAST_STR = USAGE_DATE_IN_THE_PAST.strftime("%Y-%m-%d")
+
+OPEN_SCAN_HUB_FEATURE_DESCRIPTION = (
+    ":warning: You can see the list of known issues and also provide your feedback"
+    " [here](https://github.com/packit/packit/discussions/2371). \n\n"
+    "You can disable the scanning in your configuration by "
+    "setting `osh_diff_scan_after_copr_build` to `false`. For more information, "
+    f"see [docs]({DOCS_URL}/configuration#osh_diff_scan_after_copr_build)."
+)
