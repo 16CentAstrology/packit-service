@@ -5,16 +5,17 @@ Revises: a5c06aa9ef30
 Create Date: 2021-03-25 10:43:00.679552
 
 """
-import enum
-from typing import TYPE_CHECKING, Dict
 
-from alembic import op
+import enum
+from typing import TYPE_CHECKING
+
 import sqlalchemy as sa
-from sqlalchemy import Column, Integer, String, Enum, orm
+from sqlalchemy import Column, Enum, Integer, String, orm
 
 # from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.declarative import declarative_base
 
+from alembic import op
 
 # revision identifiers, used by Alembic.
 revision = "800abbbb23c9"
@@ -51,7 +52,7 @@ class AllowlistModel(Base):
     status = Column(Enum(AllowlistStatus))
     fas_account = Column(String)
 
-    def to_dict(self) -> Dict[str, str]:
+    def to_dict(self) -> dict[str, str]:
         return {
             "namespace": self.namespace,
             "status": self.status,

@@ -1,45 +1,41 @@
 # Copyright Contributors to the Packit project.
 # SPDX-License-Identifier: MIT
-import gitlab
+
 import pytest
 from flexmock import flexmock
+from gitlab.exceptions import GitlabError
 from ogr import PagureService
 from ogr.abstract import CommitStatus
 from ogr.exceptions import GithubAPIException, GitlabAPIException
 from ogr.services.github import GithubProject
 from ogr.services.github.check_run import (
-    create_github_check_run_output,
-    GithubCheckRunStatus,
     GithubCheckRunResult,
+    GithubCheckRunStatus,
+    create_github_check_run_output,
 )
 from ogr.services.gitlab import GitlabProject
 from ogr.services.pagure import PagureProject
 from packit.config.notifications import (
-    NotificationsConfig,
     FailureCommentNotificationsConfig,
+    NotificationsConfig,
 )
-from packit_service.worker import reporting
 
 from packit_service.worker.reporting import (
-    StatusReporter,
     BaseCommitStatus,
+    DuplicateCheckMode,
+    StatusReporter,
+    StatusReporterGithubChecks,
     StatusReporterGithubStatuses,
     StatusReporterGitlab,
-    StatusReporterGithubChecks,
-    DuplicateCheckMode,
     update_message_with_configured_failure_comment_message,
 )
+from packit_service.worker.reporting.news import News
 
 create_table_content = StatusReporterGithubChecks._create_table
 
 
 @pytest.mark.parametrize(
-    (
-        "project,commit_sha,"
-        "pr_id,pr_object,"
-        "state,description,check_name,url,state_to_set,"
-        "uid"
-    ),
+    ("project,commit_sha,pr_id,pr_object,state,description,check_name,url,state_to_set,uid"),
     [
         pytest.param(
             flexmock(),
@@ -83,24 +79,32 @@ def test_set_status_pagure(
 ):
     project = PagureProject(None, None, PagureService())
     reporter = StatusReporter.get_instance(
-        project=project, commit_sha=commit_sha, pr_id=pr_id, packit_user="packit"
+        project=project,
+        commit_sha=commit_sha,
+        pr_id=pr_id,
+        packit_user="packit",
     )
     act_upon = flexmock(pr_object.source_project) if pr_id else flexmock(PagureProject)
 
     act_upon.should_receive("set_commit_status").with_args(
-        commit_sha, state_to_set, url, description, check_name, trim=True
+        commit_sha,
+        state_to_set,
+        url,
+        description,
+        check_name,
+        trim=True,
     ).once()
 
     if pr_id is not None:
         flexmock(PagureProject).should_receive("get_pr").with_args(pr_id).and_return(
-            pr_object
+            pr_object,
         )
 
     reporter.set_status(state, description, check_name, url)
 
 
 @pytest.mark.parametrize(
-    ("commit_sha,pr_id,pr_object," "state,description,check_name,url,state_to_set"),
+    ("commit_sha,pr_id,pr_object,state,description,check_name,url,state_to_set"),
     [
         pytest.param(
             "7654321",
@@ -127,21 +131,36 @@ def test_set_status_pagure(
     ],
 )
 def test_set_status_gitlab(
-    commit_sha, pr_id, pr_object, state, description, check_name, url, state_to_set
+    commit_sha,
+    pr_id,
+    pr_object,
+    state,
+    description,
+    check_name,
+    url,
+    state_to_set,
 ):
     project = GitlabProject(None, None, None)
     reporter = StatusReporter.get_instance(
-        project=project, commit_sha=commit_sha, pr_id=pr_id, packit_user="packit"
+        project=project,
+        commit_sha=commit_sha,
+        pr_id=pr_id,
+        packit_user="packit",
     )
     act_upon = flexmock(pr_object.source_project) if pr_id else flexmock(GitlabProject)
 
     act_upon.should_receive("set_commit_status").with_args(
-        commit_sha, state_to_set, url, description, check_name, trim=True
+        commit_sha,
+        state_to_set,
+        url,
+        description,
+        check_name,
+        trim=True,
     ).once()
 
     if pr_id is not None:
         flexmock(GitlabProject).should_receive("get_pr").with_args(pr_id).and_return(
-            pr_object
+            pr_object,
         )
 
     reporter.set_status(state, description, check_name, url)
@@ -223,9 +242,7 @@ def test_set_status_github_check(
     check_conclusion,
     project_object_id,
 ):
-    flexmock(reporting).should_receive("get_random_news_sentence").and_return(
-        "Interesting news."
-    )
+    flexmock(News).should_receive("get_sentence").and_return("Interesting news.")
 
     project = GithubProject(None, None, None)
     reporter = StatusReporter.get_instance(
@@ -245,7 +262,8 @@ def test_set_status_github_check(
         status=check_status,
         conclusion=check_conclusion,
         output=create_github_check_run_output(
-            title, summary + "---\n*Interesting news.*"
+            title,
+            summary + "\n\n---\n*Interesting news.*",
         ),
     ).once()
 
@@ -272,7 +290,7 @@ def test_set_status_github_check(
             "https://api.packit.dev/build/111/logs",
             CommitStatus.success,
             GithubAPIException,
-            dict(),
+            {},
             StatusReporterGithubStatuses,
             id="GitHub PR",
         ),
@@ -288,7 +306,7 @@ def test_set_status_github_check(
             "https://api.packit.dev/build/112/logs",
             CommitStatus.failure,
             GitlabAPIException,
-            {"__cause__": gitlab.GitlabError(response_code=403)},
+            {"__cause__": GitlabError(response_code=403)},
             StatusReporterGitlab,
             id="branch push",
         ),
@@ -316,7 +334,12 @@ def test_commit_comment_instead_of_status(
         setattr(exception, key, value)
 
     project.should_receive("set_commit_status").with_args(
-        commit_sha, state_to_set, url, description, check_name, trim=True
+        commit_sha,
+        state_to_set,
+        url,
+        description,
+        check_name,
+        trim=True,
     ).and_raise(exception).once()
     project.should_receive("commit_comment").with_args(
         commit=commit_sha,
@@ -325,7 +348,7 @@ def test_commit_comment_instead_of_status(
                 f"- name: {check_name}",
                 f"- state: {state.name}",
                 f"- url: {url if url else 'not provided'}",
-            ]
+            ],
         )
         + f"\n\n{description}",
     )
@@ -367,7 +390,10 @@ def test_report_status_by_comment(
 ):
     project = GitlabProject(None, None, None)
     reporter = StatusReporter.get_instance(
-        project=project, commit_sha=commit_sha, pr_id=pr_id, packit_user="packit"
+        project=project,
+        commit_sha=commit_sha,
+        pr_id=pr_id,
+        packit_user="packit",
     )
     act_upon = flexmock(GitlabProject)
 
@@ -378,12 +404,12 @@ def test_report_status_by_comment(
             f"| [{check_names}]({url}) | {result} |",
             "### Description\n",
             "should include this",
-        )
+        ),
     )
 
     if pr_id:
-        act_upon.should_receive("get_pr").with_args(pr_id=pr_id).and_return(
-            flexmock().should_receive("comment").with_args(body=comment_body).mock()
+        act_upon.should_receive("get_pr").with_args(pr_id).and_return(
+            flexmock().should_receive("comment").with_args(body=comment_body).mock(),
         ).once()
     else:
         act_upon.should_receive("commit_comment").with_args(
@@ -441,9 +467,7 @@ def test_status_instead_check(
     exception_type,
     event_id,
 ):
-    flexmock(reporting).should_receive("get_random_news_sentence").and_return(
-        "Interesting news."
-    )
+    flexmock(News).should_receive("get_sentence").and_return("Interesting news.")
 
     project = GithubProject(None, None, None)
     reporter = StatusReporter.get_instance(
@@ -463,12 +487,18 @@ def test_status_instead_check(
         status=check_status,
         conclusion=check_conclusion,
         output=create_github_check_run_output(
-            title, summary + "---\n*Interesting news.*"
+            title,
+            summary + "\n\n---\n*Interesting news.*",
         ),
     ).and_raise(exception_type).once()
 
     act_upon.should_receive("set_commit_status").with_args(
-        commit_sha, commit_state_to_set, url, title, check_name, trim=True
+        commit_sha,
+        commit_state_to_set,
+        url,
+        title,
+        check_name,
+        trim=True,
     ).once()
 
     reporter.set_status(state, title, check_name, url)
@@ -617,10 +647,10 @@ def test_comment(pr_id, commit_sha, duplicate_check, existing_comments, should_c
 
     if pr_id:
         pr = flexmock()
-        act_upon.should_receive("get_pr").with_args(pr_id=pr_id).and_return(pr)
+        act_upon.should_receive("get_pr").with_args(pr_id).and_return(pr)
         if duplicate_check != DuplicateCheckMode.do_not_check:
             flexmock(pr).should_receive("get_comments").with_args(
-                reverse=True
+                reverse=True,
             ).and_return(existing_comments)
 
         if should_comment:
@@ -630,7 +660,7 @@ def test_comment(pr_id, commit_sha, duplicate_check, existing_comments, should_c
     else:
         if duplicate_check != DuplicateCheckMode.do_not_check:
             act_upon.should_receive("get_commit_comments").with_args(
-                commit_sha
+                commit_sha,
             ).and_return(existing_comments)
 
         if should_comment:
@@ -649,14 +679,13 @@ def test_comment(pr_id, commit_sha, duplicate_check, existing_comments, should_c
     ],
 )
 def test_update_message_with_configured_failure_comment_message(
-    comment, configured_message, result
+    comment,
+    configured_message,
+    result,
 ):
     job_config = flexmock(
         notifications=NotificationsConfig(
-            failure_comment=FailureCommentNotificationsConfig(configured_message)
-        )
+            failure_comment=FailureCommentNotificationsConfig(configured_message),
+        ),
     )
-    assert (
-        update_message_with_configured_failure_comment_message(comment, job_config)
-        == result
-    )
+    assert update_message_with_configured_failure_comment_message(comment, job_config) == result

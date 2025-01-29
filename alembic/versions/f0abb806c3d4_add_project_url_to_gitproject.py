@@ -5,12 +5,14 @@ Revises: c6250555a36c
 Create Date: 2020-04-27 11:46:17.288814
 
 """
+
 from typing import TYPE_CHECKING
 
 import sqlalchemy as sa
-from alembic import op
 from sqlalchemy import Column, Integer, String, orm
 from sqlalchemy.ext.declarative import declarative_base
+
+from alembic import op
 
 # revision identifiers, used by Alembic.
 revision = "f0abb806c3d4"
@@ -52,9 +54,7 @@ def upgrade():
 
     for project in session.query(GitProjectUpgradeModel).all():
         if not project.project_url:
-            project.project_url = (
-                f"https://github.com/{project.namespace}/{project.repo_name}"
-            )
+            project.project_url = f"https://github.com/{project.namespace}/{project.repo_name}"
             session.add(project)
 
     session.commit()

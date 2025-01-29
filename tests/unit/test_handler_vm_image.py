@@ -2,35 +2,33 @@
 # SPDX-License-Identifier: MIT
 
 from celery import Celery
-from flexmock import flexmock
-from flexmock import Mock
+from flexmock import Mock, flexmock
 
+from packit_service.events import (
+    github,
+    vm_image,
+)
 from packit_service.models import (
     PipelineModel,
     ProjectEventModel,
-    VMImageBuildTargetModel,
     VMImageBuildStatus,
-)
-from packit_service.worker.result import TaskResults
-from packit_service.worker.events import VMImageBuildResultEvent
-from packit_service.worker.events.github import (
-    PullRequestCommentGithubEvent,
-)
-from packit_service.worker.handlers.vm_image import (
-    GetVMImageBuildReporterFromJobHelperMixin,
+    VMImageBuildTargetModel,
 )
 from packit_service.worker.handlers import (
     VMImageBuildHandler,
     VMImageBuildResultHandler,
 )
-from packit_service.worker.mixin import ConfigFromEventMixin
-from packit_service.worker.reporting import StatusReporter, BaseCommitStatus
+from packit_service.worker.handlers.vm_image import (
+    GetVMImageBuildReporterFromJobHelperMixin,
+)
+from packit_service.worker.reporting import BaseCommitStatus, StatusReporter
+from packit_service.worker.result import TaskResults
 
 
 def test_get_vm_image_build_reporter_from_job_helper_mixin(
     fake_package_config_job_config_project_db_trigger,
 ):
-    class Test(ConfigFromEventMixin, GetVMImageBuildReporterFromJobHelperMixin):
+    class Test(GetVMImageBuildReporterFromJobHelperMixin):
         def __init__(self) -> None:
             super().__init__()
             (
@@ -54,13 +52,13 @@ def test_get_vm_image_build_reporter_from_job_helper_mixin(
     mixin = Test()
 
     flexmock(ProjectEventModel).should_receive("get_or_create").and_return(
-        flexmock(id=1)
+        flexmock(id=1),
     )
     flexmock(StatusReporter).should_receive("report").with_args(
         description="Building VM Image...",
         state=BaseCommitStatus.pending,
         url="",
-        check_names=["vm-image-build-fedora-36-x86_64"],
+        check_names=["vm-image-build:fedora-36-x86_64"],
         markdown_content="",
         links_to_external_services=None,
         update_feedback_time=None,
@@ -71,7 +69,7 @@ def test_get_vm_image_build_reporter_from_job_helper_mixin(
         description="VM Image build error...",
         state=BaseCommitStatus.error,
         url="",
-        check_names=["vm-image-build-fedora-36-x86_64"],
+        check_names=["vm-image-build:fedora-36-x86_64"],
         markdown_content="",
         links_to_external_services=None,
         update_feedback_time=None,
@@ -82,7 +80,7 @@ def test_get_vm_image_build_reporter_from_job_helper_mixin(
         description="VM Image build failed...",
         state=BaseCommitStatus.failure,
         url="",
-        check_names=["vm-image-build-fedora-36-x86_64"],
+        check_names=["vm-image-build:fedora-36-x86_64"],
         markdown_content="",
         links_to_external_services=None,
         update_feedback_time=None,
@@ -93,7 +91,7 @@ def test_get_vm_image_build_reporter_from_job_helper_mixin(
         description="VM Image build is complete",
         state=BaseCommitStatus.success,
         url="",
-        check_names=["vm-image-build-fedora-36-x86_64"],
+        check_names=["vm-image-build:fedora-36-x86_64"],
         markdown_content="",
         links_to_external_services=None,
         update_feedback_time=None,
@@ -104,7 +102,7 @@ def test_get_vm_image_build_reporter_from_job_helper_mixin(
         description="VM Image Build job failed internal checks",
         state=BaseCommitStatus.neutral,
         url="https://packit.dev/docs/cli/build/in-image-builder/",
-        check_names=["vm-image-build-fedora-36-x86_64"],
+        check_names=["vm-image-build:fedora-36-x86_64"],
         markdown_content="",
         links_to_external_services=None,
         update_feedback_time=None,
@@ -123,7 +121,7 @@ def test_vm_image_build_handler(fake_package_config_job_config_project_db_trigge
         package_config,
         job_config,
         {
-            "event_type": PullRequestCommentGithubEvent.__name__,
+            "event_type": github.pr.Comment.event_type(),
             "project_url": "https://github.com/majamassarini/knx-stack",
             "commit_sha": "4321aa",
             "pr_id": 21,
@@ -131,7 +129,7 @@ def test_vm_image_build_handler(fake_package_config_job_config_project_db_trigge
         None,
     )
     flexmock(db_project_object).should_receive("__str__").and_return(
-        "db_project_object"
+        "db_project_object",
     )
     handler.data._db_project_event = flexmock()
     handler.data._db_project_object = db_project_object
@@ -139,11 +137,12 @@ def test_vm_image_build_handler(fake_package_config_job_config_project_db_trigge
     handler._packit_api = flexmock(copr_helper=flexmock())
 
     repo_download_url = (
-        "https://download.copr.fedorainfracloud.org/"
-        "results/mmassari/knx-stack/fedora-36-x86_64/"
+        "https://download.copr.fedorainfracloud.org/results/mmassari/knx-stack/fedora-36-x86_64/"
     )
     handler.packit_api.copr_helper.should_receive("get_repo_download_url").with_args(
-        owner="mmassari", project="knx-stack", chroot="fedora-36-x86_64"
+        owner="mmassari",
+        project="knx-stack",
+        chroot="fedora-36-x86_64",
     ).and_return(repo_download_url)
     flexmock(handler).should_receive("vm_image_builder").and_return(
         flexmock()
@@ -159,7 +158,7 @@ def test_vm_image_build_handler(fake_package_config_job_config_project_db_trigge
             {"packages": ["python-knx-stack"]},
             repo_download_url,
         )
-        .mock()
+        .mock(),
     )
     flexmock(handler).should_receive("report_status")
 
@@ -192,7 +191,7 @@ def test_vm_image_build_result_handler_ok(
         package_config,
         job_config,
         {
-            "event_type": VMImageBuildResultEvent.__name__,
+            "event_type": vm_image.Result.event_type(),
             "build_id": 1,
             "status": "error",
             "message": "Build failed bla bla bla",
@@ -201,7 +200,7 @@ def test_vm_image_build_result_handler_ok(
     handler._project = project
 
     flexmock(VMImageBuildTargetModel).should_receive("get_all_by_build_id").with_args(
-        1
+        1,
     ).and_return(
         [
             flexmock(
@@ -210,13 +209,13 @@ def test_vm_image_build_result_handler_ok(
                     flexmock()
                     .should_receive("get_project_event_object")
                     .and_return(db_project_object)
-                    .mock()
+                    .mock(),
                 ],
             )
             .should_receive("set_status")
             .with_args("error")
-            .mock()
-        ]
+            .mock(),
+        ],
     )
 
     flexmock(handler).should_receive("report_status")
@@ -237,7 +236,7 @@ def test_vm_image_build_result_handler_ko(
         package_config,
         job_config,
         {
-            "event_type": VMImageBuildResultEvent.__name__,
+            "event_type": vm_image.Result.event_type(),
             "build_id": 1,
             "status": "error",
         },
@@ -245,7 +244,7 @@ def test_vm_image_build_result_handler_ko(
     handler._project = project
 
     flexmock(VMImageBuildTargetModel).should_receive("get_all_by_build_id").with_args(
-        1
+        1,
     ).and_return([])
 
     flexmock(handler).should_receive("report_status")

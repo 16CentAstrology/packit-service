@@ -4,6 +4,7 @@
 """
 This file defines generic job handler
 """
+
 import enum
 import logging
 import shutil
@@ -11,43 +12,43 @@ from collections import defaultdict
 from datetime import datetime
 from os import getenv
 from pathlib import Path
-from typing import Dict, Optional, Set, Type, Tuple
+from typing import Optional
 
-from celery import Task
-from celery import signature
+from celery import Task, signature
 from celery.canvas import Signature
 from ogr.abstract import GitProject
 from packit.config import JobConfig, JobType, PackageConfig
 from packit.constants import DATETIME_FORMAT
-from packit_service.config import ServiceConfig
 
+from packit_service.config import ServiceConfig
+from packit_service.events.event import Event
+from packit_service.events.event_data import EventData
 from packit_service.models import (
     AbstractProjectObjectDbType,
 )
 from packit_service.sentry_integration import push_scope_to_sentry
 from packit_service.utils import dump_job_config, dump_package_config
 from packit_service.worker.celery_task import CeleryTask
-from packit_service.worker.events import Event, EventData
-from packit_service.worker.monitoring import Pushgateway
-from packit_service.worker.result import TaskResults
 from packit_service.worker.checker.abstract import Checker
-
 from packit_service.worker.mixin import (
     Config,
     PackitAPIProtocol,
 )
+from packit_service.worker.monitoring import Pushgateway
+from packit_service.worker.result import TaskResults
 
 logger = logging.getLogger(__name__)
 
-MAP_JOB_TYPE_TO_HANDLER: Dict[JobType, Set[Type["JobHandler"]]] = defaultdict(set)
-MAP_REQUIRED_JOB_TYPE_TO_HANDLER: Dict[JobType, Set[Type["JobHandler"]]] = defaultdict(
+MAP_JOB_TYPE_TO_HANDLER: dict[JobType, set[type["JobHandler"]]] = defaultdict(set)
+MAP_REQUIRED_JOB_TYPE_TO_HANDLER: dict[JobType, set[type["JobHandler"]]] = defaultdict(
+    set,
+)
+SUPPORTED_EVENTS_FOR_HANDLER: dict[type["JobHandler"], set[type["Event"]]] = defaultdict(set)
+SUPPORTED_EVENTS_FOR_HANDLER_FEDORA_CI: dict[type["JobHandler"], set[type["Event"]]] = defaultdict(
     set
 )
-SUPPORTED_EVENTS_FOR_HANDLER: Dict[
-    Type["JobHandler"], Set[Type["Event"]]
-] = defaultdict(set)
-MAP_COMMENT_TO_HANDLER: Dict[str, Set[Type["JobHandler"]]] = defaultdict(set)
-MAP_CHECK_PREFIX_TO_HANDLER: Dict[str, Set[Type["JobHandler"]]] = defaultdict(set)
+MAP_COMMENT_TO_HANDLER: dict[str, set[type["JobHandler"]]] = defaultdict(set)
+MAP_CHECK_PREFIX_TO_HANDLER: dict[str, set[type["JobHandler"]]] = defaultdict(set)
 
 
 def configured_as(job_type: JobType):
@@ -71,23 +72,22 @@ def configured_as(job_type: JobType):
     E.g. CoprBuildHandler uses both copr_build and build:
     ```
     @configured_as(job_type=JobType.copr_build)
-    @configured_as(job_type=JobType.build)
     class CoprBuildHandler(JobHandler):
     ```
     """
 
-    def _add_to_mapping(kls: Type["JobHandler"]):
+    def _add_to_mapping(kls: type["JobHandler"]):
         MAP_JOB_TYPE_TO_HANDLER[job_type].add(kls)
         return kls
 
     return _add_to_mapping
 
 
-def reacts_to(event: Type["Event"]):
+def reacts_to(event: type["Event"]):
     """
     [class decorator]
     Specify an event for which we want to use this handler.
-    Matching is done via isinstance so you can use some abstract class as well.
+    Matching is done via `isinstance` so you can use some abstract class as well.
 
     Multiple decorators are allowed.
 
@@ -100,8 +100,32 @@ def reacts_to(event: Type["Event"]):
     ```
     """
 
-    def _add_to_mapping(kls: Type["JobHandler"]):
+    def _add_to_mapping(kls: type["JobHandler"]):
         SUPPORTED_EVENTS_FOR_HANDLER[kls].add(event)
+        return kls
+
+    return _add_to_mapping
+
+
+def reacts_to_as_fedora_ci(event: type["Event"]):
+    """
+    [class decorator]
+    Specify an event for which we want to use this handler as a Fedora CI.
+    Matching is done via `isinstance` so you can use some abstract class as well.
+
+    Multiple decorators are allowed.
+
+    Example:
+    ```
+    @reacts_to(ReleaseEvent)
+    @reacts_to(PullRequestGithubEvent)
+    @reacts_to(PushGitHubEvent)
+    class CoprBuildHandler(JobHandler):
+    ```
+    """
+
+    def _add_to_mapping(kls: type["JobHandler"]):
+        SUPPORTED_EVENTS_FOR_HANDLER_FEDORA_CI[kls].add(event)
         return kls
 
     return _add_to_mapping
@@ -122,14 +146,13 @@ def run_for_comment(command: str):
     ```
     @configured_as(job_type=JobType.propose_downstream)
     @run_for_comment(command="propose-downstream")
-    @run_for_comment(command="propose-update")
     @reacts_to(event=ReleaseEvent)
     @reacts_to(event=IssueCommentEvent)
     class ProposeDownstreamHandler(JobHandler):
     ```
     """
 
-    def _add_to_mapping(kls: Type["JobHandler"]):
+    def _add_to_mapping(kls: type["JobHandler"]):
         MAP_COMMENT_TO_HANDLER[command].add(kls)
         return kls
 
@@ -149,7 +172,6 @@ def run_for_check_rerun(prefix: str):
     Example:
     ```
     @configured_as(job_type=JobType.copr_build)
-    @configured_as(job_type=JobType.build)
     @run_for_check_rerun(prefix="rpm-build")
     @reacts_to(CheckRerunPullRequestEvent)
     @reacts_to(CheckRerunCommitEvent)
@@ -157,7 +179,7 @@ def run_for_check_rerun(prefix: str):
     ```
     """
 
-    def _add_to_mapping(kls: Type["JobHandler"]):
+    def _add_to_mapping(kls: type["JobHandler"]):
         MAP_CHECK_PREFIX_TO_HANDLER[prefix].add(kls)
         return kls
 
@@ -181,12 +203,20 @@ class TaskName(str, enum.Enum):
     # downstream_koji_build_report = "task.run_downstream_koji_build_report_handler"
     sync_from_downstream = "task.run_sync_from_downstream_handler"
     bodhi_update = "task.bodhi_update"
+    bodhi_update_from_sidetag = "task.bodhi_update_from_sidetag"
     retrigger_bodhi_update = "task.retrigger_bodhi_update"
     issue_comment_retrigger_bodhi_update = "task.issue_comment_retrigger_bodhi_update"
     github_fas_verification = "task.github_fas_verification"
     vm_image_build = "task.run_vm_image_build_handler"
     vm_image_build_result = "task.run_vm_image_build_result_handler"
-    pull_from_upstream = "pull_from_upstream"
+    pull_from_upstream = "task.pull_from_upstream"
+    check_onboarded_projects = "task.check_onboarded_projects"
+    koji_build_tag = "task.koji_build_tag"
+    tag_into_sidetag = "task.tag_into_sidetag"
+    openscanhub_task_finished = "task.openscanhub_task_finished"
+    openscanhub_task_started = "task.openscanhub_task_started"
+    downstream_koji_scratch_build = "task.run_downstream_koji_scratch_build_handler"
+    downstream_koji_scratch_build_report = "task.run_downstream_koji_scratch_build_report_handler"
 
 
 class Handler(PackitAPIProtocol, Config):
@@ -201,8 +231,10 @@ class Handler(PackitAPIProtocol, Config):
                 {
                     "repository": self.project.repo,
                     "namespace": self.project.namespace,
-                }
+                },
             )
+        if "package_name" in self.data.event_dict:
+            tags.update({"package_name": self.data.event_dict["package_name"]})
         return tags
 
     def run_n_clean(self) -> TaskResults:
@@ -211,6 +243,9 @@ class Handler(PackitAPIProtocol, Config):
                 for k, v in self.get_tag_info().items():
                     scope.set_tag(k, v)
                 return self.run()
+        except Exception as ex:
+            logger.error(f"Failed to run the handler: {ex}")
+            raise
         finally:
             self.clean()
 
@@ -224,7 +259,7 @@ class Handler(PackitAPIProtocol, Config):
         # Do not clean dir if does not exist
         if not p.is_dir():
             logger.debug(
-                f"Directory {self.service_config.command_handler_work_dir!r} does not exist."
+                f"Directory {self.service_config.command_handler_work_dir!r} does not exist.",
             )
             return
 
@@ -241,7 +276,7 @@ class Handler(PackitAPIProtocol, Config):
                 shutil.rmtree(item)
 
     @staticmethod
-    def get_checkers() -> Tuple[Type[Checker], ...]:
+    def get_checkers() -> tuple[type[Checker], ...]:
         return ()
 
     @classmethod
@@ -312,29 +347,22 @@ class JobHandler(Handler):
         references which hold just a single package.
         """
         if len(self.package_config.packages) == 1:
-            return list(self.package_config.packages.keys())[0]
-        else:
-            return None
+            return next(iter(self.package_config.packages.keys()))
+
+        return None
 
     def run_job(self):
         """
         If pre-check succeeds, run the job for the specific handler.
         :return: Dict [str, TaskResults]
         """
-        job_type = (
-            self.job_config.type.value if self.job_config else self.task_name.value
-        )
-        logger.debug(f"Running handler {str(self)} for {job_type}")
-        job_results: Dict[str, TaskResults] = {}
+        job_type = self.job_config.type.value if self.job_config else self.task_name.value
+        logger.debug(f"Running handler {self!s} for {job_type}")
+        job_results: dict[str, TaskResults] = {}
         current_time = datetime.now().strftime(DATETIME_FORMAT)
         result_key = f"{job_type}-{current_time}"
         job_results[result_key] = self.run_n_clean()
         logger.debug("Job finished!")
-
-        for result in job_results.values():
-            if not (result and result["success"]):
-                if msg := result["details"].get("msg"):
-                    logger.error(msg)
 
         # push the metrics from job
         self.pushgateway.push()
@@ -354,9 +382,11 @@ class JobHandler(Handler):
             cls.task_name.value,
             kwargs={
                 "package_config": dump_package_config(
-                    event.packages_config.get_package_config_for(job)
-                    if event.packages_config
-                    else None
+                    (
+                        event.packages_config.get_package_config_for(job)
+                        if event.packages_config
+                        else None
+                    ),
                 ),
                 "job_config": dump_job_config(job),
                 "event": event.get_dict(),
@@ -376,7 +406,9 @@ class RetriableJobHandler(JobHandler):
         celery_task: Task,
     ):
         super().__init__(
-            package_config=package_config, job_config=job_config, event=event
+            package_config=package_config,
+            job_config=job_config,
+            event=event,
         )
         self.celery_task = CeleryTask(celery_task)
 

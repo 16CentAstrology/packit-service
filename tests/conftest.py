@@ -7,28 +7,22 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
+from deepdiff import DeepDiff
 from flexmock import flexmock
-
 from ogr import GithubService, GitlabService, PagureService
-from packit.config import JobConfigTriggerType, JobConfig, PackageConfig
+from packit.config import JobConfig, JobConfigTriggerType, PackageConfig
 from packit.config.common_package_config import Deployment
+
+from packit_service import events
 from packit_service.config import ServiceConfig
 from packit_service.models import (
-    ProjectEventModelType,
-    ProjectEventModel,
     BuildStatus,
+    ProjectEventModel,
+    ProjectEventModelType,
     PullRequestModel,
 )
-from packit_service.worker.events import (
-    PullRequestGithubEvent,
-    PushGitHubEvent,
-    ReleaseEvent,
-    MergeRequestGitlabEvent,
-    PushPagureEvent,
-)
 from packit_service.worker.parser import Parser
-from tests.spellbook import SAVED_HTTPD_REQS, DATA_DIR, load_the_message_from_file
-from deepdiff import DeepDiff
+from tests.spellbook import DATA_DIR, SAVED_HTTPD_REQS, load_the_message_from_file
 
 
 @pytest.fixture(autouse=True)
@@ -154,7 +148,9 @@ def srpm_build_model(
     srpm_build.should_receive("get_project_event_model").and_return(project_event_model)
 
     run_model = flexmock(
-        id=3, job_project_event=project_event_model, srpm_build=srpm_build
+        id=3,
+        job_project_event=project_event_model,
+        srpm_build=srpm_build,
     )
     runs.append(run_model)
 
@@ -194,10 +190,16 @@ def copr_build_model(
         type=project_event_model_type,
         event_id=1,
         get_project_event_object=lambda: trigger_object_model,
+        packages_config=None,
     )
 
     runs = []
-    srpm_build = flexmock(logs="asdsdf", url=None, runs=runs)
+    srpm_build = flexmock(
+        logs="asdsdf",
+        url=None,
+        runs=runs,
+        status=BuildStatus.success,
+    )
     copr_group = flexmock(runs=runs)
     copr_build = flexmock(
         id=1,
@@ -218,7 +220,7 @@ def copr_build_model(
                 "release": "1",
                 "arch": "noarch",
                 "epoch": 0,
-            }
+            },
         ],
         task_accepted_time=datetime.now(),
         build_start_time=None,
@@ -268,7 +270,9 @@ def copr_build_pr():
 @pytest.fixture()
 def koji_build_pr():
     project_model = flexmock(
-        repo_name="bar", namespace="foo", project_url="https://github.com/foo/bar"
+        repo_name="bar",
+        namespace="foo",
+        project_url="https://github.com/foo/bar",
     )
     pr_model = flexmock(
         id=1,
@@ -301,7 +305,65 @@ def koji_build_pr():
     koji_build_model.get_project_event_object = lambda: pr_model
     koji_build_model.get_srpm_build = lambda: srpm_build
     koji_build_model.should_receive("get_project_event_model").and_return(
-        project_event_model
+        project_event_model,
+    )
+
+    flexmock(ProjectEventModel).should_receive("get_or_create").with_args(
+        type=pr_model.project_event_model_type,
+        event_id=pr_model.id,
+        commit_sha="0011223344",
+    ).and_return(project_event_model)
+
+    run_model = flexmock(
+        id=3,
+        job_project_event=project_event_model,
+        srpm_build=srpm_build,
+        copr_build=koji_build_model,
+    )
+    runs.append(run_model)
+
+    return koji_build_model
+
+
+@pytest.fixture()
+def koji_build_pr_downstream():
+    project_model = flexmock(
+        repo_name="packit",
+        namespace="rpms",
+        project_url="https://src.fedoraproject.org/rpms/packit",
+    )
+    pr_model = flexmock(
+        id=1,
+        pr_id=123,
+        project=project_model,
+        job_config_trigger_type=JobConfigTriggerType.pull_request,
+        project_event_model_type=ProjectEventModelType.pull_request,
+        commit_sha="0011223344",
+    )
+    project_event_model = flexmock(
+        id=2,
+        type=ProjectEventModelType.pull_request,
+        event_id=1,
+        get_project_event_object=lambda: pr_model,
+    )
+    runs = []
+    srpm_build = flexmock(logs="asdsdf", url=None, runs=runs)
+    koji_build_model = flexmock(
+        id=1,
+        task_id="1",
+        commit_sha="0011223344",
+        project_name="some-project",
+        owner="some-owner",
+        web_url="https://some-url",
+        target="some-target",
+        status="some-status",
+        runs=runs,
+    )
+    koji_build_model._srpm_build_for_mocking = srpm_build
+    koji_build_model.get_project_event_object = lambda: pr_model
+    koji_build_model.get_srpm_build = lambda: srpm_build
+    koji_build_model.should_receive("get_project_event_model").and_return(
+        project_event_model,
     )
 
     flexmock(ProjectEventModel).should_receive("get_or_create").with_args(
@@ -335,7 +397,7 @@ def add_pull_request_event_with_sha_123456():
         id=123,
     )
     db_project_event = (
-        flexmock(type=ProjectEventModelType.pull_request)
+        flexmock(type=ProjectEventModelType.pull_request, commit_sha="123456")
         .should_receive("get_project_event_object")
         .and_return(db_project_object)
         .mock()
@@ -355,12 +417,16 @@ def add_pull_request_event_with_pr_id_9():
         .should_receive("get_project_event_object")
         .and_return(db_project_object)
         .mock()
+        .should_receive("set_packages_config")
+        .mock()
     )
     flexmock(PullRequestModel).should_receive("get_by_id").with_args(9).and_return(
-        db_project_object
+        db_project_object,
     )
     flexmock(ProjectEventModel).should_receive("get_or_create").with_args(
-        type=ProjectEventModelType.pull_request, event_id=9, commit_sha="12345"
+        type=ProjectEventModelType.pull_request,
+        event_id=9,
+        commit_sha="12345",
     ).and_return(db_project_event)
     flexmock(PullRequestModel).should_receive("get_or_create").with_args(
         pr_id=9,
@@ -383,12 +449,16 @@ def add_pull_request_event_with_sha_0011223344():
         .should_receive("get_project_event_object")
         .and_return(db_project_object)
         .mock()
+        .should_receive("set_packages_config")
+        .mock()
     )
     flexmock(PullRequestModel).should_receive("get_by_id").with_args(9).and_return(
-        db_project_object
+        db_project_object,
     )
     flexmock(ProjectEventModel).should_receive("get_or_create").with_args(
-        type=ProjectEventModelType.pull_request, event_id=9, commit_sha="0011223344"
+        type=ProjectEventModelType.pull_request,
+        event_id=9,
+        commit_sha="0011223344",
     ).and_return(db_project_event)
     flexmock(PullRequestModel).should_receive("get_or_create").with_args(
         pr_id=9,
@@ -406,7 +476,7 @@ def github_release_webhook() -> dict:
 
 
 @pytest.fixture(scope="module")
-def release_event(github_release_webhook) -> ReleaseEvent:
+def release_event(github_release_webhook) -> events.github.release.Release:
     return Parser.parse_release_event(github_release_webhook)
 
 
@@ -425,18 +495,18 @@ def github_push_webhook():
 @pytest.fixture(scope="module")
 def github_vm_image_build_comment():
     with open(
-        DATA_DIR / "webhooks" / "github" / "vm_image_build_comment.json"
+        DATA_DIR / "webhooks" / "github" / "vm_image_build_comment.json",
     ) as outfile:
         return json.load(outfile)
 
 
 @pytest.fixture(scope="module")
-def github_pr_event(github_pr_webhook) -> PullRequestGithubEvent:
+def github_pr_event(github_pr_webhook) -> events.github.pr.Action:
     return Parser.parse_pr_event(github_pr_webhook)
 
 
 @pytest.fixture(scope="module")
-def github_push_event(github_push_webhook) -> PushGitHubEvent:
+def github_push_event(github_push_webhook) -> events.github.push.Commit:
     return Parser.parse_github_push_event(github_push_webhook)
 
 
@@ -453,12 +523,12 @@ def distgit_push_packit():
 
 
 @pytest.fixture(scope="module")
-def distgit_push_event(distgit_push_packit) -> PushPagureEvent:
+def distgit_push_event(distgit_push_packit) -> events.pagure.push.Commit:
     return Parser.parse_pagure_push_event(distgit_push_packit)
 
 
 @pytest.fixture(scope="module")
-def gitlab_mr_event(gitlab_mr_webhook) -> MergeRequestGitlabEvent:
+def gitlab_mr_event(gitlab_mr_webhook) -> events.gitlab.mr.Action:
     return Parser.parse_mr_event(gitlab_mr_webhook)
 
 
@@ -472,7 +542,7 @@ def cache_clear(request):
     """
 
     if getattr(request.module, "CACHE_CLEAR", None):
-        [f.cache_clear() for f in getattr(request.module, "CACHE_CLEAR")]
+        [f.cache_clear() for f in request.module.CACHE_CLEAR]
 
 
 @pytest.fixture()
@@ -526,6 +596,11 @@ def koji_build_completed_rawhide():
 
 
 @pytest.fixture()
+def koji_build_completed_event(koji_build_completed_rawhide) -> events.koji.result.Build:
+    return Parser.parse_koji_build_event(koji_build_completed_rawhide)
+
+
+@pytest.fixture()
 def koji_build_completed_f36():
     with open(DATA_DIR / "fedmsg" / "koji_build_completed_f36.json") as outfile:
         return load_the_message_from_file(outfile)
@@ -537,21 +612,25 @@ def koji_build_completed_epel8():
         return load_the_message_from_file(outfile)
 
 
+@pytest.fixture()
+def koji_build_tagged():
+    with open(DATA_DIR / "fedmsg" / "koji_build_tagged.json") as outfile:
+        return load_the_message_from_file(outfile)
+
+
 def pytest_assertrepr_compare(op, left, right):
     if isinstance(left, JobConfig) and isinstance(right, JobConfig) and op == "==":
         from packit.schema import JobConfigSchema
 
         schema = JobConfigSchema()
         return [str(DeepDiff(schema.dump(left), schema.dump(right)))]
-    elif (
-        isinstance(left, PackageConfig)
-        and isinstance(right, PackageConfig)
-        and op == "=="
-    ):
+
+    if isinstance(left, PackageConfig) and isinstance(right, PackageConfig) and op == "==":
         from packit.schema import PackageConfigSchema
 
         schema = PackageConfigSchema()
         return [str(DeepDiff(schema.dump(left), schema.dump(right)))]
+    return None
 
 
 @pytest.fixture()
@@ -564,3 +643,21 @@ def pagure_pr_comment_added():
 def new_hotness_update():
     with open(DATA_DIR / "fedmsg" / "new_hotness_update.json") as outfile:
         return json.load(outfile)
+
+
+@pytest.fixture()
+def mock_get_fast_forward_aliases():
+    import packit
+
+    mock_aliases_module = flexmock(packit.config.aliases)
+    mock_aliases_module.should_receive("get_aliases").and_return(
+        {
+            "fedora-all": ["fedora-39", "fedora-40", "fedora-rawhide"],
+            "fedora-stable": ["fedora-39", "fedora-40"],
+            "fedora-development": ["fedora-rawhide"],
+            "fedora-latest": ["fedora-40"],
+            "fedora-latest-stable": ["fedora-40"],
+            "fedora-branched": ["fedora-39", "fedora-40"],
+            "epel-all": ["epel-8", "epel-9"],
+        },
+    )

@@ -5,10 +5,10 @@ from flask import url_for
 from packit.utils import nested_get
 
 from packit_service.models import (
-    TestingFarmResult,
     PipelineModel,
     SyncReleaseStatus,
     SyncReleaseTargetStatus,
+    TestingFarmResult,
 )
 from packit_service.service.api.runs import process_runs
 from tests_openshift.conftest import SampleValues
@@ -36,9 +36,7 @@ def test_copr_builds_list(client, clean_before_and_after, multiple_copr_builds):
     assert response_dict[1]["repo_namespace"] == SampleValues.repo_namespace
     assert response_dict[1]["repo_name"] == SampleValues.repo_name
     assert response_dict[1]["pr_id"] == SampleValues.pr_id
-    assert {
-        len(response_build["status_per_chroot"]) for response_build in response_dict
-    } == {1, 2}
+    assert {len(response_build["status_per_chroot"]) for response_build in response_dict} == {1, 2}
 
     assert response_dict[1]["build_submitted_time"] is not None
     assert response_dict[1]["project_url"] == SampleValues.project_url
@@ -52,7 +50,9 @@ def test_copr_builds_list(client, clean_before_and_after, multiple_copr_builds):
 
 #  Test Copr Builds with status waiting_for_srpm
 def test_copr_builds_list_waiting_for_srpm(
-    client, clean_before_and_after, a_copr_build_waiting_for_srpm
+    client,
+    clean_before_and_after,
+    a_copr_build_waiting_for_srpm,
 ):
     response = client.get(url_for("api.copr-builds_copr_builds_list"))
     response_dict = response.json
@@ -62,7 +62,7 @@ def test_copr_builds_list_waiting_for_srpm(
 #  Test Pagination
 def test_pagination(client, clean_before_and_after, too_many_copr_builds):
     response_1 = client.get(
-        url_for("api.copr-builds_copr_builds_list") + "?page=2&per_page=20"
+        url_for("api.copr-builds_copr_builds_list") + "?page=2&per_page=20",
     )
     response_dict_1 = response_1.json
     assert len(list(response_dict_1[1]["status_per_chroot"])) == 2
@@ -70,7 +70,7 @@ def test_pagination(client, clean_before_and_after, too_many_copr_builds):
     assert len(response_dict_1) == 20  # three builds, but two unique build ids
 
     response_2 = client.get(
-        url_for("api.copr-builds_copr_builds_list") + "?page=1&per_page=30"
+        url_for("api.copr-builds_copr_builds_list") + "?page=1&per_page=30",
     )
     response_dict_2 = response_2.json
     assert len(list(response_dict_2[1]["status_per_chroot"])) == 2
@@ -81,7 +81,7 @@ def test_pagination(client, clean_before_and_after, too_many_copr_builds):
 # Test detailed build info
 def test_detailed_copr_build_info(client, clean_before_and_after, a_copr_build_for_pr):
     response = client.get(
-        url_for("api.copr-builds_copr_build_item", id=a_copr_build_for_pr.id)
+        url_for("api.copr-builds_copr_build_item", id=a_copr_build_for_pr.id),
     )
     response_dict = response.json
     assert response_dict["build_id"] == SampleValues.build_id
@@ -100,7 +100,7 @@ def test_detailed_copr_build_info(client, clean_before_and_after, a_copr_build_f
     # Project info:
     assert response_dict["repo_namespace"] == SampleValues.repo_namespace
     assert response_dict["repo_name"] == SampleValues.repo_name
-    assert response_dict["git_repo"] == SampleValues.project_url
+    assert response_dict["project_url"] == SampleValues.project_url
     assert response_dict["pr_id"] == SampleValues.pr_id
     assert response_dict["built_packages"] == SampleValues.built_packages
     assert "branch_name" in response_dict
@@ -127,10 +127,12 @@ def test_koji_builds_list(client, clean_before_and_after, multiple_koji_builds):
 
 
 def test_koji_builds_list_non_scratch(
-    client, clean_before_and_after, multiple_koji_builds
+    client,
+    clean_before_and_after,
+    multiple_koji_builds,
 ):
     response = client.get(
-        url_for("api.koji-builds_koji_builds_list") + "?scratch=false"
+        url_for("api.koji-builds_koji_builds_list") + "?scratch=false",
     )
     response_dict = response.json
     assert len(response_dict) == 1
@@ -144,7 +146,7 @@ def test_koji_builds_list_scratch(client, clean_before_and_after, multiple_koji_
 
 def test_detailed_koji_build_info(client, clean_before_and_after, a_koji_build_for_pr):
     response = client.get(
-        url_for("api.koji-builds_koji_build_item", id=a_koji_build_for_pr.id)
+        url_for("api.koji-builds_koji_build_item", id=a_koji_build_for_pr.id),
     )
     response_dict = response.json
     assert response_dict["task_id"] == SampleValues.build_id
@@ -161,19 +163,22 @@ def test_detailed_koji_build_info(client, clean_before_and_after, a_koji_build_f
     # Project info:
     assert response_dict["repo_namespace"] == SampleValues.repo_namespace
     assert response_dict["repo_name"] == SampleValues.repo_name
-    assert response_dict["git_repo"] == SampleValues.project_url
+    assert response_dict["project_url"] == SampleValues.project_url
     assert response_dict["pr_id"] == SampleValues.pr_id
     assert "branch_name" in response_dict
     assert "release" in response_dict
 
 
 def test_detailed_koji_build_info_non_scratch(
-    client, clean_before_and_after, a_koji_build_for_pr_non_scratch
+    client,
+    clean_before_and_after,
+    a_koji_build_for_pr_non_scratch,
 ):
     response = client.get(
         url_for(
-            "api.koji-builds_koji_build_item", id=a_koji_build_for_pr_non_scratch.id
-        )
+            "api.koji-builds_koji_build_item",
+            id=a_koji_build_for_pr_non_scratch.id,
+        ),
     )
     response_dict = response.json
     assert response_dict["task_id"] == SampleValues.build_id
@@ -189,30 +194,36 @@ def test_detailed_koji_build_info_non_scratch(
 
 
 def test_detailed_koji_build_info_for_pr(
-    client, clean_before_and_after, a_koji_build_for_pr
+    client,
+    clean_before_and_after,
+    a_koji_build_for_pr,
 ):
     response = client.get(
-        url_for("api.koji-builds_koji_build_item", id=a_koji_build_for_pr.id)
+        url_for("api.koji-builds_koji_build_item", id=a_koji_build_for_pr.id),
     )
     response_dict = response.json
     assert response_dict["pr_id"] == SampleValues.pr_id
 
 
 def test_detailed_koji_build_info_for_branch_push(
-    client, clean_before_and_after, a_koji_build_for_branch_push
+    client,
+    clean_before_and_after,
+    a_koji_build_for_branch_push,
 ):
     response = client.get(
-        url_for("api.koji-builds_koji_build_item", id=a_koji_build_for_branch_push.id)
+        url_for("api.koji-builds_koji_build_item", id=a_koji_build_for_branch_push.id),
     )
     response_dict = response.json
     assert response_dict["branch_name"] == SampleValues.branch
 
 
 def test_detailed_koji_build_info_for_release(
-    client, clean_before_and_after, a_koji_build_for_release
+    client,
+    clean_before_and_after,
+    a_koji_build_for_release,
 ):
     response = client.get(
-        url_for("api.koji-builds_koji_build_item", id=a_koji_build_for_release.id)
+        url_for("api.koji-builds_koji_build_item", id=a_koji_build_for_release.id),
     )
     response_dict = response.json
     assert response_dict["release"] == SampleValues.tag_name
@@ -221,11 +232,11 @@ def test_detailed_koji_build_info_for_release(
 #  Test SRPM Builds
 def test_srpm_builds_list(client, clean_before_and_after, a_copr_build_for_pr):
     response = client.get(
-        url_for("api.srpm-builds_srpm_builds_list", id=a_copr_build_for_pr.id)
+        url_for("api.srpm-builds_srpm_builds_list", id=a_copr_build_for_pr.id),
     )
     response_dict = response.json
     assert response_dict[0]["status"] == "success"
-    assert type(response_dict[0]["srpm_build_id"]) is int
+    assert isinstance(response_dict[0]["srpm_build_id"], int)
     assert response_dict[0]["log_url"] is not None
     assert response_dict[0]["repo_namespace"] == SampleValues.repo_namespace
     assert response_dict[0]["repo_name"] == SampleValues.repo_name
@@ -236,11 +247,13 @@ def test_srpm_builds_list(client, clean_before_and_after, a_copr_build_for_pr):
 
 
 def test_srpm_build_info(
-    client, clean_before_and_after, srpm_build_model_with_new_run_for_pr
+    client,
+    clean_before_and_after,
+    srpm_build_model_with_new_run_for_pr,
 ):
     srpm_build_model, _ = srpm_build_model_with_new_run_for_pr
     response = client.get(
-        url_for("api.srpm-builds_srpm_build_item", id=srpm_build_model.id)
+        url_for("api.srpm-builds_srpm_build_item", id=srpm_build_model.id),
     )
     response_dict = response.json
 
@@ -252,18 +265,20 @@ def test_srpm_build_info(
     # Project info:
     assert response_dict["repo_namespace"] == SampleValues.repo_namespace
     assert response_dict["repo_name"] == SampleValues.repo_name
-    assert response_dict["git_repo"] == SampleValues.project_url
+    assert response_dict["project_url"] == SampleValues.project_url
     assert response_dict["pr_id"] == SampleValues.pr_id
     assert "branch_name" in response_dict
     assert "release" in response_dict
 
 
 def test_srpm_build_in_copr_info(
-    client, clean_before_and_after, srpm_build_in_copr_model
+    client,
+    clean_before_and_after,
+    srpm_build_in_copr_model,
 ):
     srpm_build_model, _ = srpm_build_in_copr_model
     response = client.get(
-        url_for("api.srpm-builds_srpm_build_item", id=srpm_build_model.id)
+        url_for("api.srpm-builds_srpm_build_item", id=srpm_build_model.id),
     )
     response_dict = response.json
 
@@ -287,27 +302,27 @@ def test_allowlist_all(client, clean_before_and_after, new_allowlist_entry):
 def test_allowlist_specific(client, clean_before_and_after, new_allowlist_entry):
     """Test Allowlist API (specific user)"""
     user_1 = client.get(
-        url_for("api.allowlist_allowlist_item", namespace="github.com/Rayquaza")
+        url_for("api.allowlist_allowlist_item", namespace="github.com/Rayquaza"),
     )
     assert user_1.json["namespace"] == "github.com/Rayquaza"
     assert user_1.json["status"] == "approved_manually"
 
     user_2 = client.get(
-        url_for("api.allowlist_allowlist_item", namespace="github.com/Zacian")
+        url_for("api.allowlist_allowlist_item", namespace="github.com/Zacian"),
     )
     assert user_2.status_code == 204  # No content when not in allowlist
 
 
 def test_get_testing_farm_results(
-    client, clean_before_and_after, multiple_new_test_runs
+    client,
+    clean_before_and_after,
+    multiple_new_test_runs,
 ):
     """Test Get Testing Farm Results"""
     response = client.get(url_for("api.testing-farm_testing_farm_results"))
     response_dict = response.json
     assert len(response_dict) == 4
-    assert response_dict[0]["packit_id"] in {
-        test_run.id for test_run in multiple_new_test_runs
-    }
+    assert response_dict[0]["packit_id"] in {test_run.id for test_run in multiple_new_test_runs}
     assert response_dict[0]["pipeline_id"] == SampleValues.another_different_pipeline_id
     assert response_dict[0]["target"] == SampleValues.chroots[0]
     assert response_dict[0]["ref"] == SampleValues.different_commit_sha
@@ -328,7 +343,7 @@ def test_get_testing_farm_results(
 
 def test_get_testing_farm_result(client, clean_before_and_after, a_new_test_run_pr):
     response = client.get(
-        url_for("api.testing-farm_testing_farm_result", id=a_new_test_run_pr.id)
+        url_for("api.testing-farm_testing_farm_result", id=a_new_test_run_pr.id),
     )
     response_dict = response.json
 
@@ -341,7 +356,7 @@ def test_get_testing_farm_result(client, clean_before_and_after, a_new_test_run_
     # Project info:
     assert response_dict["repo_namespace"] == SampleValues.repo_namespace
     assert response_dict["repo_name"] == SampleValues.repo_name
-    assert response_dict["git_repo"] == SampleValues.project_url
+    assert response_dict["project_url"] == SampleValues.project_url
     assert response_dict["pr_id"] == SampleValues.pr_id
     assert "branch_name" in response_dict
     assert "release" in response_dict
@@ -359,21 +374,25 @@ def test_get_projects_list(client, clean_before_and_after, a_copr_build_for_pr):
 
 
 def test_get_projects_list_forge(
-    client, clean_before_and_after, multiple_forge_projects
+    client,
+    clean_before_and_after,
+    multiple_forge_projects,
 ):
     """Test Get Projects by Forge"""
     response = client.get(
         url_for(
             "api.projects_projects_forge",
             forge="github.com",
-        )
+        ),
     )
     response_dict = response.json
     assert len(response_dict) == 2
 
 
 def test_get_projects_list_namespace(
-    client, clean_before_and_after, multiple_copr_builds
+    client,
+    clean_before_and_after,
+    multiple_copr_builds,
 ):
     """Test Get Projects by Namespace"""
     response = client.get(
@@ -381,7 +400,7 @@ def test_get_projects_list_namespace(
             "api.projects_projects_namespace",
             forge="github.com",
             namespace="the-namespace",
-        )
+        ),
     )
     response_dict = response.json
     assert len(response_dict) == 1
@@ -397,7 +416,7 @@ def test_get_project_info(client, clean_before_and_after, a_copr_build_for_pr):
             forge="github.com",
             namespace="the-namespace",
             repo_name="the-repo-name",
-        )
+        ),
     )
     project = response.json
     assert project["namespace"] == SampleValues.repo_namespace
@@ -414,7 +433,7 @@ def test_get_projects_prs(client, clean_before_and_after, a_copr_build_for_pr):
             forge="github.com",
             namespace="the-namespace",
             repo_name="the-repo-name",
-        )
+        ),
     )
     response_dict = response.json
     assert len(response_dict) == 1
@@ -432,7 +451,7 @@ def test_get_projects_prs_koji(client, clean_before_and_after, a_koji_build_for_
             forge="github.com",
             namespace="the-namespace",
             repo_name="the-repo-name",
-        )
+        ),
     )
     response_dict = response.json
     assert len(response_dict) == 1
@@ -449,7 +468,7 @@ def test_get_projects_issues(client, clean_before_and_after, an_issue_model):
             forge="github.com",
             namespace="the-namespace",
             repo_name="the-repo-name",
-        )
+        ),
     )
     response_dict = response.json
     assert response_dict[0] == SampleValues.issue_id
@@ -463,7 +482,7 @@ def test_get_projects_releases(client, clean_before_and_after, release_model):
             forge="github.com",
             namespace="the-namespace",
             repo_name="the-repo-name",
-        )
+        ),
     )
     response_dict = response.json
     assert len(response_dict) == 1
@@ -472,7 +491,9 @@ def test_get_projects_releases(client, clean_before_and_after, release_model):
 
 
 def test_get_projects_branches(
-    client, clean_before_and_after, a_copr_build_for_branch_push
+    client,
+    clean_before_and_after,
+    a_copr_build_for_branch_push,
 ):
     """Test Get Project's Releases"""
     response = client.get(
@@ -481,7 +502,7 @@ def test_get_projects_branches(
             forge="github.com",
             namespace="the-namespace",
             repo_name="the-repo-name",
-        )
+        ),
     )
     response_dict = response.json
     assert len(response_dict) == 1
@@ -606,19 +627,23 @@ def test_propose_downstream_list_issues(
 
 
 def test_detailed_propose_info_release(
-    client, clean_before_and_after, propose_model_submitted_release
+    client,
+    clean_before_and_after,
+    propose_model_submitted_release,
 ):
     response = client.get(
         url_for(
             "api.propose-downstream_propose_result",
             id=propose_model_submitted_release.id,
-        )
+        ),
     )
     response_dict = response.json
 
     assert response_dict["status"] == SyncReleaseTargetStatus.submitted
     assert response_dict["branch"] == SampleValues.branch
     assert response_dict["downstream_pr_url"] == SampleValues.downstream_pr_url
+    assert response_dict["downstream_pr_id"] == SampleValues.downstream_pr_id
+    assert response_dict["downstream_pr_project"] == SampleValues.downstream_project_url
     assert response_dict["submitted_time"] is not None
     assert response_dict["finished_time"] is not None
     assert response_dict["logs"] == "random logs"
@@ -626,24 +651,28 @@ def test_detailed_propose_info_release(
     # Project info:
     assert response_dict["repo_namespace"] == SampleValues.repo_namespace
     assert response_dict["repo_name"] == SampleValues.repo_name
-    assert response_dict["git_repo"] == SampleValues.project_url
+    assert response_dict["project_url"] == SampleValues.project_url
     assert response_dict["release"] == SampleValues.tag_name
 
 
 def test_detailed_pull_from_upstream_info(
-    client, clean_before_and_after, pull_from_upstream_target_model
+    client,
+    clean_before_and_after,
+    pull_from_upstream_target_model,
 ):
     response = client.get(
         url_for(
             "api.pull-from-upstream_pull_result",
             id=pull_from_upstream_target_model.id,
-        )
+        ),
     )
     response_dict = response.json
 
     assert response_dict["status"] == SyncReleaseTargetStatus.submitted
     assert response_dict["branch"] == SampleValues.branch
     assert response_dict["downstream_pr_url"] == SampleValues.downstream_pr_url
+    assert response_dict["downstream_pr_id"] == SampleValues.downstream_pr_id
+    assert response_dict["downstream_pr_project"] == SampleValues.downstream_project_url
     assert response_dict["submitted_time"] is not None
     assert response_dict["finished_time"] is not None
     assert response_dict["logs"] == "random logs"
@@ -651,21 +680,76 @@ def test_detailed_pull_from_upstream_info(
     # Project info:
     assert response_dict["repo_namespace"] == SampleValues.repo_namespace
     assert response_dict["repo_name"] == SampleValues.repo_name
-    assert response_dict["git_repo"] == SampleValues.project_url
+    assert response_dict["project_url"] == SampleValues.project_url
     assert response_dict["release"] == SampleValues.tag_name
 
 
-def test_detailed_propose_info_issue(
-    client, clean_before_and_after, propose_model_submitted_issue
+def test_detailed_pull_from_upstream_info_non_git(
+    client,
+    clean_before_and_after,
+    pull_from_upstream_target_model_non_git,
 ):
     response = client.get(
         url_for(
-            "api.propose-downstream_propose_result", id=propose_model_submitted_issue.id
-        )
+            "api.pull-from-upstream_pull_result",
+            id=pull_from_upstream_target_model_non_git.id,
+        ),
+    )
+    response_dict = response.json
+
+    assert response_dict["status"] == SyncReleaseTargetStatus.submitted
+    assert response_dict["branch"] == SampleValues.branch
+    assert response_dict["downstream_pr_url"] == SampleValues.downstream_pr_url
+    assert response_dict["downstream_pr_id"] == SampleValues.downstream_pr_id
+    assert response_dict["downstream_pr_project"] == SampleValues.downstream_project_url
+    assert response_dict["submitted_time"] is not None
+    assert response_dict["finished_time"] is not None
+    assert response_dict["logs"] == "random logs"
+
+    # Project info:
+    assert response_dict["repo_namespace"] is None
+    assert response_dict["repo_name"] is None
+    assert (
+        response_dict["project_url"]
+        == f"https://release-monitoring.org/project/{SampleValues.anitya_project_id}"
+    )
+    assert response_dict["release"] is None
+    assert response_dict["anitya_version"] == SampleValues.tag_name
+    assert response_dict["anitya_project_id"] == SampleValues.anitya_project_id
+    assert response_dict["anitya_project_name"] == SampleValues.anitya_project_name
+
+
+def test_detailed_propose_info_issue(
+    client,
+    clean_before_and_after,
+    propose_model_submitted_issue,
+):
+    response = client.get(
+        url_for(
+            "api.propose-downstream_propose_result",
+            id=propose_model_submitted_issue.id,
+        ),
     )
     response_dict = response.json
 
     assert response_dict["issue_id"] == SampleValues.issue_id
+
+
+def test_detailed_pull_from_upstream_without_pr_model(
+    client,
+    clean_before_and_after,
+    pull_from_upstream_target_model_without_pr_model,
+):
+    response = client.get(
+        url_for(
+            "api.pull-from-upstream_pull_result",
+            id=pull_from_upstream_target_model_without_pr_model.id,
+        ),
+    )
+    response_dict = response.json
+
+    assert response_dict["downstream_pr_project"] is None
+    assert response_dict["downstream_pr_id"] is None
 
 
 @pytest.mark.parametrize(
@@ -779,7 +863,7 @@ def test_project_usage_info(
             forge="github.com",
             namespace="the-namespace",
             repo_name="the-repo-name",
-        )
+        ),
     )
     response_dict = response.json
 
@@ -798,7 +882,12 @@ def test_project_usage_info(
     assert nested_get(response_dict, "jobs", "srpm_builds", "job_runs") == 13
     assert (
         nested_get(
-            response_dict, "jobs", "srpm_builds", "per_event", "release", "job_runs"
+            response_dict,
+            "jobs",
+            "srpm_builds",
+            "per_event",
+            "release",
+            "job_runs",
         )
         == 1
     )
@@ -826,3 +915,109 @@ def test_project_usage_info(
         )
         == 1
     )
+
+
+def test_bodhi_update_list(
+    client,
+    clean_before_and_after,
+    multiple_bodhi_update_runs,
+):
+    response = client.get(url_for("api.bodhi-updates_bodhi_updates_list"))
+    response_dict = response.json
+
+    assert len(response_dict) == 2
+
+    response_dict.reverse()
+    assert response_dict[0]["status"] == "queued"
+    assert response_dict[0]["koji_nvrs"] == SampleValues.nvr
+    assert response_dict[0]["branch"] == SampleValues.dist_git_branch
+    assert response_dict[0]["branch_name"] == SampleValues.branch
+
+    assert response_dict[1]["koji_nvrs"] == SampleValues.different_nvr
+    assert response_dict[1]["branch"] == SampleValues.different_dist_git_branch
+
+    assert response_dict[0]["repo_namespace"] == SampleValues.repo_namespace
+    assert response_dict[0]["repo_name"] == SampleValues.repo_name
+    assert response_dict[0]["project_url"] == SampleValues.project_url
+
+
+def test_bodhi_update_info(
+    client,
+    clean_before_and_after,
+    bodhi_update_model,
+):
+    response = client.get(
+        url_for("api.bodhi-updates_bodhi_update_item", id=bodhi_update_model.id),
+    )
+    response_dict = response.json
+    assert response_dict["alias"] == SampleValues.alias
+    assert response_dict["branch"] == SampleValues.dist_git_branch
+    assert response_dict["web_url"] == SampleValues.bodhi_url
+    assert response_dict["koji_nvrs"] == SampleValues.nvr
+    assert response_dict["branch_name"] == SampleValues.branch
+    assert response_dict["repo_name"] == SampleValues.repo_name
+    assert response_dict["repo_namespace"] == SampleValues.repo_namespace
+    assert response_dict["status"] == "error"
+    assert response_dict["submitted_time"] is not None
+
+
+def test_scan_info(
+    client,
+    clean_before_and_after,
+    a_scan,
+):
+    response = client.get(
+        url_for("api.openscanhub-scans_scan_item", id=a_scan.id),
+    )
+    response_dict = response.json
+    assert response_dict["task_id"] == SampleValues.task_id
+    assert response_dict["url"] == SampleValues.scan_url
+    assert response_dict["status"] == SampleValues.scan_status_success
+    assert response_dict["issues_added_url"] == SampleValues.issues_added_url
+    assert response_dict["issues_fixed_url"] == SampleValues.issues_fixed_url
+    assert response_dict["scan_results_url"] == SampleValues.scan_results_url
+    assert response_dict["repo_namespace"] == SampleValues.repo_namespace
+    assert response_dict["repo_name"] == SampleValues.repo_name
+    assert response_dict["project_url"] == SampleValues.project_url
+    assert response_dict["issues_added_count"] == SampleValues.issues_added_count
+
+
+def test_scans_list(
+    client,
+    clean_before_and_after,
+    a_scan,
+):
+    response = client.get(url_for("api.openscanhub-scans_scans_list"))
+    response_dict = response.json
+
+    assert len(response_dict) == 1
+
+
+def test_koji_tag_request_info(
+    client,
+    clean_before_and_after,
+    a_koji_tag_request,
+):
+    response = client.get(
+        url_for("api.koji-tag-requests_koji_tag_request_item", id=a_koji_tag_request.id),
+    )
+    response_dict = response.json
+    assert response_dict["task_id"] == SampleValues.build_id
+    assert response_dict["web_url"] == SampleValues.koji_web_url
+    assert response_dict["chroot"] == SampleValues.target
+    assert response_dict["sidetag"] == SampleValues.sidetag
+    assert response_dict["nvr"] == SampleValues.nvr
+    assert response_dict["repo_namespace"] == SampleValues.repo_namespace
+    assert response_dict["repo_name"] == SampleValues.repo_name
+    assert response_dict["project_url"] == SampleValues.project_url
+
+
+def test_koji_tag_requests_list(
+    client,
+    clean_before_and_after,
+    a_koji_tag_request,
+):
+    response = client.get(url_for("api.koji-tag-requests_koji_tag_requests_list"))
+    response_dict = response.json
+
+    assert len(response_dict) == 1

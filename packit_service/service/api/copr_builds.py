@@ -7,10 +7,10 @@ from logging import getLogger
 from flask_restx import Namespace, Resource
 
 from packit_service.models import (
-    CoprBuildTargetModel,
-    optional_timestamp,
     BuildStatus,
     CoprBuildGroupModel,
+    CoprBuildTargetModel,
+    optional_timestamp,
 )
 from packit_service.service.api.parsers import indices, pagination_arguments
 from packit_service.service.api.utils import get_project_info_from_build, response_maker
@@ -37,6 +37,13 @@ class CoprBuildsList(Resource):
             build_info = CoprBuildTargetModel.get_by_build_id(build.build_id, None)
             if build_info.status == BuildStatus.waiting_for_srpm:
                 continue
+            if (
+                build_info.status == BuildStatus.failure
+                and not build_info.build_start_time
+                and not build_info.build_logs_url
+            ):
+                # SRPM build failed, it doesn't make sense to list this build
+                continue
             project_info = build_info.get_project()
             build_dict = {
                 "packit_id": build_info.id,
@@ -45,7 +52,7 @@ class CoprBuildsList(Resource):
                 "status_per_chroot": {},
                 "packit_id_per_chroot": {},
                 "build_submitted_time": optional_timestamp(
-                    build_info.build_submitted_time
+                    build_info.build_submitted_time,
                 ),
                 "web_url": build_info.web_url,
                 "ref": build_info.commit_sha,
@@ -59,9 +66,7 @@ class CoprBuildsList(Resource):
             for i, chroot in enumerate(build.target):
                 # [0] because sqlalchemy returns a single element sub-list
                 build_dict["status_per_chroot"][chroot[0]] = build.status[i][0]
-                build_dict["packit_id_per_chroot"][
-                    chroot[0]
-                ] = build.packit_id_per_chroot[i][0]
+                build_dict["packit_id_per_chroot"][chroot[0]] = build.packit_id_per_chroot[i][0]
 
             result.append(build_dict)
 
@@ -113,7 +118,8 @@ class CoprBuildItem(Resource):
 class CoprBuildGroup(Resource):
     @ns.response(HTTPStatus.OK, "OK, copr build group details follow")
     @ns.response(
-        HTTPStatus.NOT_FOUND.value, "No info about koji build group stored in DB"
+        HTTPStatus.NOT_FOUND.value,
+        "No info about koji build group stored in DB",
     )
     def get(self, id):
         """A specific test run details."""
@@ -128,9 +134,7 @@ class CoprBuildGroup(Resource):
         group_dict = {
             "submitted_time": optional_timestamp(group_model.submitted_time),
             "run_ids": sorted(run.id for run in group_model.runs),
-            "build_target_ids": sorted(
-                build.id for build in group_model.grouped_targets
-            ),
+            "build_target_ids": sorted(build.id for build in group_model.grouped_targets),
         }
 
         group_dict.update(get_project_info_from_build(group_model))

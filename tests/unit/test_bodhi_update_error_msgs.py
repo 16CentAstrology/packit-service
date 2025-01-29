@@ -1,26 +1,27 @@
+# Copyright Contributors to the Packit project.
+# SPDX-License-Identifier: MIT
+
 import pytest
-
 from flexmock import flexmock
-
-from packit.exceptions import PackitException
 from packit.config import (
+    CommonPackageConfig,
     JobConfig,
     JobConfigTriggerType,
     JobType,
     PackageConfig,
-    CommonPackageConfig,
 )
+from packit.exceptions import PackitException
+
 from packit_service.config import ServiceConfig
-from packit_service.worker.handlers import bodhi
-from packit_service.worker.celery_task import CeleryTask
-from packit_service.worker.events.enums import PullRequestAction
-from packit_service.worker.events import (
-    PullRequestCommentPagureEvent,
-    IssueCommentEvent,
+from packit_service.events import (
+    pagure,
 )
+from packit_service.events.enums import PullRequestAction
+from packit_service.models import BodhiUpdateTargetModel
+from packit_service.worker.celery_task import CeleryTask
+from packit_service.worker.handlers import bodhi
 from packit_service.worker.handlers.bodhi import (
     RetriggerBodhiUpdateHandler,
-    IssueCommentRetriggerBodhiUpdateHandler,
 )
 from packit_service.worker.handlers.mixin import KojiBuildData
 
@@ -31,7 +32,7 @@ def package_config__job_config():
         packages={
             "package": CommonPackageConfig(
                 identifier="first",
-            )
+            ),
         },
         jobs=[
             JobConfig(
@@ -40,7 +41,7 @@ def package_config__job_config():
                 packages={
                     "package": CommonPackageConfig(
                         identifier="first",
-                    )
+                    ),
                 },
             ),
         ],
@@ -51,7 +52,7 @@ def package_config__job_config():
         packages={
             "package": CommonPackageConfig(
                 identifier="first",
-            )
+            ),
         },
     )
     return package_config, job_config
@@ -60,13 +61,13 @@ def package_config__job_config():
 @pytest.fixture(scope="module")
 def package_config__job_config__pull_request_event(package_config__job_config):
     package_config, job_config = package_config__job_config
-    flexmock(PullRequestCommentPagureEvent).should_receive("commit_sha").and_return(
-        "abcdef"
+    flexmock(pagure.pr.Comment).should_receive("commit_sha").and_return(
+        "abcdef",
     )
-    flexmock(PullRequestCommentPagureEvent).should_receive(
-        "get_packages_config"
+    flexmock(pagure.pr.Comment).should_receive(
+        "get_packages_config",
     ).and_return(package_config)
-    data = PullRequestCommentPagureEvent(
+    data = pagure.pr.Comment(
         pr_id=123,
         action=PullRequestAction.opened,
         base_repo_namespace="a_namespace",
@@ -82,45 +83,6 @@ def package_config__job_config__pull_request_event(package_config__job_config):
     return package_config, job_config, data
 
 
-def test_pull_request_retrigger_bodhi_update_no_koji_data(
-    package_config__job_config__pull_request_event,
-):
-    package_config, job_config, data = package_config__job_config__pull_request_event
-
-    msg = (
-        "Packit failed on creating Bodhi update "
-        "in dist-git (an url):\n\n"
-        "| dist-git branch | error |\n"
-        "| --------------- | ----- |\n"
-        "| | ``` error abc ``` |\n\n"
-        "Fedora Bodhi update was re-triggered by comment in dist-git PR with id 123.\n\n"
-        "You can retrigger the update by adding a comment (`/packit create-update`) "
-        "into this issue.\n\n---\n\n"
-        "*Get in [touch with us](https://packit.dev/#contact) if you need some help.*\n"
-    )
-    flexmock(bodhi).should_receive("report_in_issue_repository").with_args(
-        issue_repository=None,
-        service_config=ServiceConfig,
-        title=("Fedora Bodhi update failed to be created"),
-        message=msg,
-        comment_to_existing=msg,
-    ).once()
-
-    error_msg = "error abc"
-    dg = flexmock(local_project=flexmock(git_url="an url"))
-    packit_api = flexmock(dg=dg)
-    flexmock(RetriggerBodhiUpdateHandler).should_receive("packit_api").and_return(
-        packit_api
-    )
-    flexmock(RetriggerBodhiUpdateHandler).should_receive("__next__").and_raise(
-        PackitException, error_msg
-    )
-    flexmock(CeleryTask).should_receive("is_last_try").and_return(True)
-    handler = RetriggerBodhiUpdateHandler(package_config, job_config, data, flexmock())
-    with pytest.raises(PackitException):
-        handler.run()
-
-
 def test_pull_request_retrigger_bodhi_update_with_koji_data(
     package_config__job_config__pull_request_event,
 ):
@@ -129,9 +91,11 @@ def test_pull_request_retrigger_bodhi_update_with_koji_data(
     msg = (
         "Packit failed on creating Bodhi update "
         "in dist-git (an url):\n\n"
-        "| dist-git branch | error |\n"
-        "| --------------- | ----- |\n"
-        "| `f36` | ``` error abc ``` |\n\n"
+        "<table>"
+        "<tr><th>dist-git branch</th><th>error</th></tr>"
+        "<tr><td><code>f36</code></td>"
+        '<td>See <a href="/jobs/bodhi/12">/jobs/bodhi/12</a></td></tr>\n'
+        "</table>\n\n"
         "Fedora Bodhi update was re-triggered by comment in dist-git PR with id 123.\n\n"
         "You can retrigger the update by adding a comment (`/packit create-update`) "
         "into this issue.\n\n---\n\n"
@@ -148,70 +112,39 @@ def test_pull_request_retrigger_bodhi_update_with_koji_data(
     error_msg = "error abc"
     dg = flexmock(local_project=flexmock(git_url="an url"))
     packit_api = (
-        flexmock(dg=dg)
-        .should_receive("create_update")
-        .and_raise(PackitException, error_msg)
-        .mock()
+        flexmock(dg=dg).should_receive("create_update").and_raise(PackitException, error_msg).mock()
     )
     flexmock(RetriggerBodhiUpdateHandler).should_receive("packit_api").and_return(
-        packit_api
+        packit_api,
+    )
+    flexmock(RetriggerBodhiUpdateHandler).should_receive(
+        "_get_or_create_bodhi_update_group_model",
+    ).and_return(
+        flexmock(
+            grouped_targets=[
+                flexmock(
+                    id=12,
+                    target="f36",
+                    koji_nvrs="a_package_1.f36",
+                    sidetag=None,
+                    set_status=lambda x: None,
+                    set_data=lambda x: None,
+                ),
+            ],
+        ),
     )
     flexmock(RetriggerBodhiUpdateHandler).should_receive("__next__").and_return(
-        KojiBuildData(dist_git_branch="f36", build_id=1, nvr="a_package_1.f36", state=1)
+        KojiBuildData(
+            dist_git_branch="f36",
+            build_id=1,
+            nvr="a_package_1.f36",
+            state=1,
+            task_id=123,
+        ),
     )
+    flexmock(BodhiUpdateTargetModel).should_receive(
+        "get_all_successful_or_in_progress_by_nvrs",
+    ).and_return(set())
     flexmock(CeleryTask).should_receive("is_last_try").and_return(True)
     handler = RetriggerBodhiUpdateHandler(package_config, job_config, data, flexmock())
-    with pytest.raises(PackitException):
-        handler.run()
-
-
-def test_issue_comment_retrigger_bodhi_update_no_koji_data(package_config__job_config):
-    package_config, job_config = package_config__job_config
-    flexmock(IssueCommentEvent).should_receive("tag_name").and_return("1")
-    flexmock(IssueCommentEvent).should_receive("commit_sha").and_return("abcdef")
-    data = IssueCommentEvent(
-        issue_id=123,
-        action=PullRequestAction.opened,
-        repo_namespace="a_namespace",
-        repo_name="a_repo_name",
-        target_repo="a_target",
-        project_url="projec_url",
-        actor="actor",
-        comment="/packit creat-update",
-        comment_id=321,
-    ).get_dict()
-
-    msg = (
-        "Packit failed on creating Bodhi update "
-        "in dist-git (an url):\n\n"
-        "| dist-git branch | error |\n"
-        "| --------------- | ----- |\n"
-        "| | ``` error abc ``` |\n\n"
-        "Fedora Bodhi update was re-triggered by comment in issue 123.\n\n"
-        "You can retrigger the update by adding a comment (`/packit create-update`) "
-        "into this issue.\n\n---\n\n"
-        "*Get in [touch with us](https://packit.dev/#contact) if you need some help.*\n"
-    )
-    flexmock(bodhi).should_receive("report_in_issue_repository").with_args(
-        issue_repository=None,
-        service_config=ServiceConfig,
-        title=("Fedora Bodhi update failed to be created"),
-        message=msg,
-        comment_to_existing=msg,
-    ).once()
-
-    error_msg = "error abc"
-    dg = flexmock(local_project=flexmock(git_url="an url"))
-    packit_api = flexmock(dg=dg)
-    flexmock(IssueCommentRetriggerBodhiUpdateHandler).should_receive(
-        "packit_api"
-    ).and_return(packit_api)
-    flexmock(IssueCommentRetriggerBodhiUpdateHandler).should_receive(
-        "__next__"
-    ).and_raise(PackitException, error_msg)
-    flexmock(CeleryTask).should_receive("is_last_try").and_return(True)
-    handler = IssueCommentRetriggerBodhiUpdateHandler(
-        package_config, job_config, data, flexmock()
-    )
-    with pytest.raises(PackitException):
-        handler.run()
+    handler.run()

@@ -8,9 +8,9 @@ from flask import request
 from flask_restx import Namespace, Resource
 
 from packit_service.models import (
+    KojiBuildGroupModel,
     KojiBuildTargetModel,
     optional_timestamp,
-    KojiBuildGroupModel,
 )
 from packit_service.service.api.parsers import indices, pagination_arguments
 from packit_service.service.api.utils import get_project_info_from_build, response_maker
@@ -27,9 +27,7 @@ class KojiBuildsList(Resource):
     def get(self):
         """List all Koji builds."""
         scratch = (
-            request.args.get("scratch").lower() == "true"
-            if "scratch" in request.args
-            else None
+            request.args.get("scratch").lower() == "true" if "scratch" in request.args else None
         )
         first, last = indices()
         result = []
@@ -70,7 +68,8 @@ class KojiBuildsList(Resource):
 class KojiBuildItem(Resource):
     @koji_builds_ns.response(HTTPStatus.OK, "OK, koji build details follow")
     @koji_builds_ns.response(
-        HTTPStatus.NOT_FOUND.value, "No info about build stored in DB"
+        HTTPStatus.NOT_FOUND.value,
+        "No info about build stored in DB",
     )
     def get(self, id):
         """A specific koji build details."""
@@ -98,6 +97,8 @@ class KojiBuildItem(Resource):
             "build_logs_urls": build.build_logs_urls,
             "srpm_build_id": srpm_build.id if srpm_build else None,
             "run_ids": sorted(run.id for run in build.group_of_targets.runs),
+            "build_submission_stdout": build.build_submission_stdout,
+            "error_message": build.data.get("error") if build.data else None,
         }
 
         build_dict.update(get_project_info_from_build(build))
@@ -109,7 +110,8 @@ class KojiBuildItem(Resource):
 class KojiBuildGroup(Resource):
     @koji_builds_ns.response(HTTPStatus.OK, "OK, koji build group details follow")
     @koji_builds_ns.response(
-        HTTPStatus.NOT_FOUND.value, "No info about koji build group stored in DB"
+        HTTPStatus.NOT_FOUND.value,
+        "No info about koji build group stored in DB",
     )
     def get(self, id):
         """A specific test run details."""
@@ -124,9 +126,7 @@ class KojiBuildGroup(Resource):
         group_dict = {
             "submitted_time": optional_timestamp(group_model.submitted_time),
             "run_ids": sorted(run.id for run in group_model.runs),
-            "build_target_ids": sorted(
-                build.id for build in group_model.grouped_targets
-            ),
+            "build_target_ids": sorted(build.id for build in group_model.grouped_targets),
         }
 
         group_dict.update(get_project_info_from_build(group_model))

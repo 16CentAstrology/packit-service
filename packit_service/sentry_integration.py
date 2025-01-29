@@ -4,7 +4,6 @@
 import logging
 from contextlib import contextmanager
 from os import getenv
-from typing import List, Dict
 
 from sentry_sdk.integrations import Integration
 from sentry_sdk.integrations.logging import LoggingIntegration
@@ -14,7 +13,7 @@ from packit_service.utils import only_once
 logger = logging.getLogger(__name__)
 
 
-def traces_sampler(sampling_context: Dict) -> float:
+def traces_sampler(sampling_context: dict) -> float:
     """
     Compute sample rate or sampling decision for a transaction.
     https://docs.sentry.io/platforms/python/performance/
@@ -28,7 +27,7 @@ def traces_sampler(sampling_context: Dict) -> float:
     if rate := getenv("SENTRY_TRACES_SAMPLE_RATE"):
         return float(rate)
     # TODO: Take sampling_context into account
-    return 0.25 if getenv("DEPLOYMENT") == "prod" else 1.0
+    return 0.1 if getenv("DEPLOYMENT") == "prod" else 0.25
 
 
 @only_once
@@ -42,7 +41,7 @@ def configure_sentry(
         f"Setup sentry for {runner_type}: "
         f"celery_integration={celery_integration}, "
         f"flask_integration={flask_integration}, "
-        f"sqlalchemy_integration={sqlalchemy_integration}"
+        f"sqlalchemy_integration={sqlalchemy_integration}",
     )
 
     secret_key = getenv("SENTRY_SECRET")
@@ -52,7 +51,7 @@ def configure_sentry(
     # so that we don't have to have sentry sdk installed locally
     import sentry_sdk
 
-    integrations: List[Integration] = []
+    integrations: list[Integration] = []
 
     if celery_integration:
         # https://docs.sentry.io/platforms/python/celery/
@@ -84,6 +83,8 @@ def configure_sentry(
         integrations=integrations,
         environment=getenv("DEPLOYMENT"),
         traces_sampler=traces_sampler,
+        # Do not report crawlers sending requests with wrong method.
+        ignore_errors=["MethodNotAllowed"],
     )
     with sentry_sdk.configure_scope() as scope:
         scope.set_tag("runner-type", runner_type)

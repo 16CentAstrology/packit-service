@@ -1,16 +1,16 @@
 # Copyright Contributors to the Packit project.
 # SPDX-License-Identifier: MIT
 
+import copy
 import json
 from datetime import datetime
 
 import pytest
 import requests
 from celery.canvas import Signature
+from celery.canvas import group as celery_group
 from copr.v3 import Client
 from flexmock import flexmock
-
-import packit_service.service.urls as urls
 from ogr.services.github import GithubProject
 from ogr.utils import RequestResponse
 from packit.config import (
@@ -20,40 +20,49 @@ from packit.config import (
     JobType,
     PackageConfig,
 )
+from packit.config.requirements import LabelRequirementsConfig, RequirementsConfig
 from packit.copr_helper import CoprHelper
 from packit.local_project import LocalProject
+from packit.utils.koji_helper import KojiHelper
+
+import packit_service.service.urls as urls
 from packit_service.config import PackageConfigGetter, ServiceConfig
 from packit_service.constants import COPR_API_FAIL_STATE, DEFAULT_RETRY_LIMIT
+from packit_service.events import copr, koji
 from packit_service.models import (
-    CoprBuildTargetModel,
-    ProjectEventModelType,
-    KojiBuildTargetModel,
-    SRPMBuildModel,
-    TFTTestRunTargetModel,
-    TFTTestRunGroupModel,
-    TestingFarmResult,
     BuildStatus,
-    ProjectReleaseModel,
+    CoprBuildTargetModel,
     GitBranchModel,
+    KojiBuildTargetModel,
+    ProjectEventModelType,
+    ProjectReleaseModel,
+    SidetagModel,
+    SRPMBuildModel,
+    TestingFarmResult,
+    TFTTestRunGroupModel,
+    TFTTestRunTargetModel,
 )
 from packit_service.service.urls import (
     get_copr_build_info_url,
     get_koji_build_info_url,
     get_srpm_build_info_url,
 )
-from packit_service.worker.helpers.build.copr_build import CoprBuildJobHelper
-from packit_service.worker.events import AbstractCoprBuildEvent, KojiTaskEvent
 from packit_service.worker.handlers import CoprBuildEndHandler
+from packit_service.worker.handlers.bodhi import BodhiUpdateFromSidetagHandler
+from packit_service.worker.handlers.distgit import DownstreamKojiBuildHandler
+from packit_service.worker.helpers.build.copr_build import CoprBuildJobHelper
+from packit_service.worker.helpers.testing_farm import TestingFarmJobHelper
 from packit_service.worker.jobs import SteveJobs
 from packit_service.worker.monitoring import Pushgateway
 from packit_service.worker.reporting import BaseCommitStatus, StatusReporter
 from packit_service.worker.tasks import (
     run_copr_build_end_handler,
     run_copr_build_start_handler,
+    run_downstream_koji_scratch_build_report_handler,
     run_koji_build_report_handler,
+    run_koji_build_tag_handler,
     run_testing_farm_handler,
 )
-from packit_service.worker.helpers.testing_farm import TestingFarmJobHelper
 from tests.conftest import copr_build_model
 from tests.spellbook import DATA_DIR, first_dict_value, get_parameters_from_results
 
@@ -72,7 +81,7 @@ def mock_get_valid_build_targets():
             "fedora-32-x86_64",
             "fedora-31-x86_64",
             "fedora-rawhide-x86_64",
-        }
+        },
     )
 
 
@@ -109,7 +118,7 @@ def srpm_build_end():
 @pytest.fixture(scope="module")
 def koji_build_scratch_start():
     return json.loads(
-        (DATA_DIR / "fedmsg" / "koji_build_scratch_start.json").read_text()
+        (DATA_DIR / "fedmsg" / "koji_build_scratch_start.json").read_text(),
     )
 
 
@@ -129,14 +138,14 @@ def pc_build_pr():
                     "package": CommonPackageConfig(
                         _targets=["fedora-all"],
                         specfile_path="test.spec",
-                    )
+                    ),
                 },
-            )
+            ),
         ],
         packages={
             "package": CommonPackageConfig(
                 specfile_path="test.spec",
-            )
+            ),
         },
     )
 
@@ -152,14 +161,81 @@ def pc_koji_build_pr():
                     "package": CommonPackageConfig(
                         _targets=["fedora-all"],
                         specfile_path="test.spec",
-                    )
+                    ),
                 },
-            )
+            ),
         ],
         packages={
             "package": CommonPackageConfig(
                 specfile_path="test.spec",
-            )
+            ),
+        },
+    )
+
+
+@pytest.fixture(scope="module")
+def pc_koji_build_tag_specfile():
+    return PackageConfig(
+        jobs=[
+            JobConfig(
+                type=JobType.koji_build,
+                trigger=JobConfigTriggerType.commit,
+                sidetag_group="test",
+                dependents=["packit"],
+                packages={
+                    "specfile": CommonPackageConfig(
+                        _targets=["fedora-all"],
+                        specfile_path="python-specfile.spec",
+                        downstream_package_name="python-specfile",
+                    ),
+                },
+            ),
+        ],
+        packages={
+            "specfile": CommonPackageConfig(
+                specfile_path="python-specfile.spec",
+                downstream_package_name="python-specfile",
+            ),
+        },
+    )
+
+
+@pytest.fixture(scope="module")
+def pc_koji_build_tag_packit():
+    return PackageConfig(
+        jobs=[
+            JobConfig(
+                type=JobType.koji_build,
+                trigger=JobConfigTriggerType.koji_build,
+                sidetag_group="test",
+                dependencies=["python-specfile"],
+                packages={
+                    "packit": CommonPackageConfig(
+                        _targets=["fedora-all"],
+                        specfile_path="packit.spec",
+                        downstream_package_name="packit",
+                    ),
+                },
+            ),
+            JobConfig(
+                type=JobType.bodhi_update,
+                trigger=JobConfigTriggerType.koji_build,
+                sidetag_group="test",
+                dependencies=["python-specfile"],
+                packages={
+                    "packit": CommonPackageConfig(
+                        _targets=["fedora-all"],
+                        specfile_path="packit.spec",
+                        downstream_package_name="packit",
+                    ),
+                },
+            ),
+        ],
+        packages={
+            "packit": CommonPackageConfig(
+                specfile_path="packit.spec",
+                downstream_package_name="packit",
+            ),
         },
     )
 
@@ -176,14 +252,14 @@ def pc_build_push():
                         _targets=["fedora-all"],
                         specfile_path="test.spec",
                         branch="build-branch",
-                    )
+                    ),
                 },
-            )
+            ),
         ],
         packages={
             "package": CommonPackageConfig(
                 specfile_path="test.spec",
-            )
+            ),
         },
     )
 
@@ -199,14 +275,14 @@ def pc_build_release():
                     "package": CommonPackageConfig(
                         _targets=["fedora-all"],
                         specfile_path="test.spec",
-                    )
+                    ),
                 },
-            )
+            ),
         ],
         packages={
             "package": CommonPackageConfig(
                 specfile_path="test.spec",
-            )
+            ),
         },
     )
 
@@ -251,38 +327,38 @@ def test_copr_build_end(
     pr_comment_exists,
 ):
     def get_comments(*args, **kwargs):
-        if pr_comment_exists:
-            return [
-                flexmock(
-                    author="packit-as-a-service[bot]",
-                    body="Congratulations! One of the builds has completed. :champagne:\n\n"
-                    "You can install the built RPMs by following these steps:\n\n* "
-                    "`sudo yum install -y dnf-plugins-core` on RHEL 8\n* "
-                    "`sudo dnf install -y dnf-plugins-core` on Fedora\n* "
-                    "`dnf copr enable packit/packit-service-hello-world-24`\n* "
-                    "And now you can install the packages.\n\n"
-                    "Please note that the RPMs should be used only in a testing environment.",
-                )
-            ]
-        else:
+        if not pr_comment_exists:
             return []
+
+        return [
+            flexmock(
+                author="packit-as-a-service[bot]",
+                body="Congratulations! One of the builds has completed. :champagne:\n\n"
+                "You can install the built RPMs by following these steps:\n\n* "
+                "`sudo yum install -y dnf-plugins-core` on RHEL 8\n* "
+                "`sudo dnf install -y dnf-plugins-core` on Fedora\n* "
+                "`dnf copr enable packit/packit-service-hello-world-24`\n* "
+                "And now you can install the packages.\n\n"
+                "Please note that the RPMs should be used only in a testing environment.",
+            ),
+        ]
 
     pr = flexmock(source_project=flexmock(), get_comments=get_comments)
     flexmock(GithubProject).should_receive("is_private").and_return(False)
     flexmock(GithubProject).should_receive("get_pr").and_return(pr)
     pc_build_pr.jobs[0].notifications.pull_request.successful_build = pc_comment_pr_succ
-    flexmock(AbstractCoprBuildEvent).should_receive("get_packages_config").and_return(
-        pc_build_pr
+    flexmock(copr.CoprBuild).should_receive("get_packages_config").and_return(
+        pc_build_pr,
     )
     flexmock(CoprHelper).should_receive("get_copr_client").and_return(
-        Client(config={"username": "packit", "copr_url": "https://dummy.url"})
+        Client(config={"username": "packit", "copr_url": "https://dummy.url"}),
     )
     if pr_comment_called and not pr_comment_exists:
         pr.should_receive("comment")
     else:
         pr.should_receive("comment").never()
     flexmock(CoprBuildTargetModel).should_receive("get_by_build_id").and_return(
-        copr_build_pr
+        copr_build_pr,
     )
 
     copr_build_pr.should_call("set_status").with_args(BuildStatus.success).once()
@@ -305,7 +381,7 @@ def test_copr_build_end(
 
     # no test job defined => testing farm should be skipped
     flexmock(TestingFarmJobHelper).should_receive("run_testing_farm").times(0)
-    flexmock(Signature).should_receive("apply_async").once()
+    flexmock(celery_group).should_receive("apply_async").once()
 
     # fix SRPM url since it touches multiple classes
 
@@ -329,14 +405,14 @@ def test_copr_build_end(
 
     # fix SRPM url since it touches multiple classes
     flexmock(copr_build_pr._srpm_build_for_mocking).should_receive("set_url").with_args(
-        "https://my.host/my.srpm"
+        "https://my.host/my.srpm",
     ).mock()
 
     flexmock(Pushgateway).should_receive("push").times(2).and_return()
 
     processing_results = SteveJobs().process_message(copr_build_end)
     event_dict, job, job_config, package_config = get_parameters_from_results(
-        processing_results
+        processing_results,
     )
     assert json.dumps(event_dict)
 
@@ -350,24 +426,24 @@ def test_copr_build_end(
 
 
 def test_copr_build_end_push(
-    copr_build_end_push, pc_build_push, copr_build_branch_push
+    copr_build_end_push,
+    pc_build_push,
+    copr_build_branch_push,
 ):
     flexmock(GithubProject).should_receive("is_private").and_return(False)
     flexmock(GithubProject).should_receive("get_pr").and_return(
         # we cannot comment for branch push events
-        flexmock(source_project=flexmock())
-        .should_receive("comment")
-        .never()
+        flexmock(source_project=flexmock()).should_receive("comment").never(),
     )
-    flexmock(AbstractCoprBuildEvent).should_receive("get_packages_config").and_return(
-        pc_build_push
+    flexmock(copr.CoprBuild).should_receive("get_packages_config").and_return(
+        pc_build_push,
     )
     flexmock(CoprHelper).should_receive("get_copr_client").and_return(
-        Client(config={"username": "packit", "copr_url": "https://dummy.url"})
+        Client(config={"username": "packit", "copr_url": "https://dummy.url"}),
     )
 
     flexmock(CoprBuildTargetModel).should_receive("get_by_build_id").and_return(
-        copr_build_branch_push
+        copr_build_branch_push,
     )
 
     copr_build_branch_push.should_receive("set_status").with_args(BuildStatus.success)
@@ -390,7 +466,7 @@ def test_copr_build_end_push(
         update_feedback_time=object,
     ).once()
 
-    flexmock(Signature).should_receive("apply_async").once()
+    flexmock(celery_group).should_receive("apply_async").once()
 
     # skip SRPM url since it touches multiple classes
     flexmock(CoprBuildEndHandler).should_receive("set_srpm_url").and_return(None)
@@ -408,7 +484,7 @@ def test_copr_build_end_push(
 
     processing_results = SteveJobs().process_message(copr_build_end_push)
     event_dict, job, job_config, package_config = get_parameters_from_results(
-        processing_results
+        processing_results,
     )
     assert json.dumps(event_dict)
 
@@ -422,25 +498,24 @@ def test_copr_build_end_push(
 
 
 def test_copr_build_end_release(
-    copr_build_end_release, pc_build_release, copr_build_release
+    copr_build_end_release,
+    pc_build_release,
+    copr_build_release,
 ):
     flexmock(GithubProject).should_receive("is_private").and_return(False)
     flexmock(GithubProject).should_receive("get_pr").and_return(
         # we cannot comment for branch push events
-        flexmock(source_project=flexmock())
-        .should_receive("comment")
-        .never()
-        .mock()
+        flexmock(source_project=flexmock()).should_receive("comment").never().mock(),
     )
-    flexmock(AbstractCoprBuildEvent).should_receive("get_packages_config").and_return(
-        pc_build_release
+    flexmock(copr.CoprBuild).should_receive("get_packages_config").and_return(
+        pc_build_release,
     )
     flexmock(CoprHelper).should_receive("get_copr_client").and_return(
-        Client(config={"username": "packit", "copr_url": "https://dummy.url"})
+        Client(config={"username": "packit", "copr_url": "https://dummy.url"}),
     )
 
     flexmock(CoprBuildTargetModel).should_receive("get_by_build_id").and_return(
-        copr_build_release
+        copr_build_release,
     )
     copr_build_release.should_receive("set_status").with_args(BuildStatus.success)
     copr_build_release.should_receive("set_end_time").once()
@@ -462,10 +537,11 @@ def test_copr_build_end_release(
         update_feedback_time=object,
     ).once()
 
-    flexmock(Signature).should_receive("apply_async").once()
+    flexmock(celery_group).should_receive("apply_async").once()
 
     flexmock(CoprBuildJobHelper).should_receive("get_build_chroot").with_args(
-        1, "some-target"
+        1,
+        "some-target",
     ).and_return(flexmock(ended_on=1666889710)).once()
 
     # skip SRPM url since it touches multiple classes
@@ -475,7 +551,7 @@ def test_copr_build_end_release(
 
     processing_results = SteveJobs().process_message(copr_build_end_release)
     event_dict, job, job_config, package_config = get_parameters_from_results(
-        processing_results
+        processing_results,
     )
     assert json.dumps(event_dict)
 
@@ -498,10 +574,10 @@ def test_copr_build_end_testing_farm(copr_build_end, copr_build_pr):
     flexmock(GithubProject).should_receive("get_pr").and_return(
         flexmock(
             source_project=flexmock(
-                get_web_url=lambda: "https://github.com/source/bar"
+                get_web_url=lambda: "https://github.com/source/bar",
             ),
             target_project=flexmock(
-                get_web_url=lambda: "https://github.com/target/bar"
+                get_web_url=lambda: "https://github.com/target/bar",
             ),
             head_commit="0011223344",
             target_branch_head_commit="deadbeef",
@@ -509,7 +585,7 @@ def test_copr_build_end_testing_farm(copr_build_end, copr_build_pr):
             target_branch="the-target-branch",
         )
         .should_receive("comment")
-        .mock()
+        .mock(),
     )
     urls.DASHBOARD_URL = "https://dashboard.localhost"
 
@@ -517,7 +593,7 @@ def test_copr_build_end_testing_farm(copr_build_end, copr_build_pr):
         packages={
             "package": CommonPackageConfig(
                 specfile_path="test.spec",
-            )
+            ),
         },
         jobs=[
             JobConfig(
@@ -527,7 +603,7 @@ def test_copr_build_end_testing_farm(copr_build_end, copr_build_pr):
                     "package": CommonPackageConfig(
                         _targets=["fedora-rawhide"],
                         specfile_path="test.spec",
-                    )
+                    ),
                 },
             ),
             JobConfig(
@@ -537,26 +613,26 @@ def test_copr_build_end_testing_farm(copr_build_end, copr_build_pr):
                     "package": CommonPackageConfig(
                         _targets=["fedora-rawhide"],
                         specfile_path="test.spec",
-                    )
+                    ),
                 },
             ),
         ],
     )
 
-    flexmock(AbstractCoprBuildEvent).should_receive("get_packages_config").and_return(
-        config
+    flexmock(copr.CoprBuild).should_receive("get_packages_config").and_return(
+        config,
     )
     flexmock(CoprHelper).should_receive("get_copr_client").and_return(
-        Client(config={"username": "packit", "copr_url": "https://dummy.url"})
+        Client(config={"username": "packit", "copr_url": "https://dummy.url"}),
     )
     flexmock(PackageConfigGetter).should_receive(
-        "get_package_config_from_repo"
+        "get_package_config_from_repo",
     ).and_return(config)
 
     flexmock(LocalProject).should_receive("refresh_the_arguments").and_return(None)
 
     flexmock(CoprBuildTargetModel).should_receive("get_by_build_id").and_return(
-        copr_build_pr
+        copr_build_pr,
     )
     flexmock(CoprBuildTargetModel).should_receive("get_by_id").and_return(copr_build_pr)
     copr_build_pr.should_call("set_status").with_args(BuildStatus.success).once()
@@ -594,7 +670,7 @@ def test_copr_build_end_testing_farm(copr_build_end, copr_build_pr):
                 "ref": "0011223344",
                 "merge_sha": "deadbeef",
                 "path": ".",
-            }
+            },
         },
         "environments": [
             {
@@ -606,7 +682,7 @@ def test_copr_build_end_testing_farm(copr_build_end, copr_build_pr):
                         "arch": "x86_64",
                         "trigger": "commit",
                         "initiator": "packit",
-                    }
+                    },
                 },
                 "artifacts": [
                     {
@@ -630,31 +706,31 @@ def test_copr_build_end_testing_farm(copr_build_end, copr_build_pr):
                     "PACKIT_COPR_PROJECT": "some-owner/some-project",
                     "PACKIT_COPR_RPMS": "hello-world-0.1-1.noarch",
                 },
-            }
+            },
         ],
         "notification": {
             "webhook": {
                 "url": "https://prod.packit.dev/api/testing-farm/results",
                 "token": "secret token",
-            }
+            },
         },
     }
 
     flexmock(TestingFarmJobHelper).should_receive("is_fmf_configured").and_return(True)
     flexmock(TestingFarmJobHelper).should_receive("distro2compose").with_args(
-        "fedora-rawhide-x86_64"
+        "fedora-rawhide-x86_64",
     ).and_return("Fedora-Rawhide")
 
     pipeline_id = "5e8079d8-f181-41cf-af96-28e99774eb68"
     flexmock(TestingFarmJobHelper).should_receive(
-        "send_testing_farm_request"
+        "send_testing_farm_request",
     ).with_args(endpoint="requests", method="POST", data=payload).and_return(
         RequestResponse(
             status_code=200,
             ok=True,
             content=json.dumps({"id": pipeline_id}).encode(),
             json={"id": pipeline_id},
-        )
+        ),
     )
 
     flexmock(StatusReporter).should_receive("report").with_args(
@@ -668,7 +744,7 @@ def test_copr_build_end_testing_farm(copr_build_end, copr_build_pr):
     ).once()
 
     flexmock(GithubProject).should_receive("get_web_url").and_return(
-        "https://github.com/foo/bar"
+        "https://github.com/foo/bar",
     )
 
     tft_test_run_model = (
@@ -685,7 +761,7 @@ def test_copr_build_end_testing_farm(copr_build_end, copr_build_pr):
     )
     group = flexmock(grouped_targets=[tft_test_run_model])
     flexmock(TFTTestRunGroupModel).should_receive("create").with_args(
-        [copr_build_pr.group_of_targets.runs[-1]]
+        [copr_build_pr.group_of_targets.runs[-1]],
     ).and_return(group)
     flexmock(TFTTestRunTargetModel).should_receive("create").with_args(
         pipeline_id=None,
@@ -701,13 +777,14 @@ def test_copr_build_end_testing_farm(copr_build_end, copr_build_pr):
     flexmock(StatusReporter).should_receive("report").with_args(
         state=BaseCommitStatus.running,
         description="Tests have been submitted ...",
-        url="https://dashboard.localhost/results/testing-farm/5",
+        url="https://dashboard.localhost/jobs/testing-farm/5",
         check_names=EXPECTED_TESTING_FARM_CHECK_NAME,
         markdown_content=None,
         links_to_external_services=None,
         update_feedback_time=object,
     ).once()
-    flexmock(Signature).should_receive("apply_async").twice()
+    flexmock(Signature).should_receive("apply_async").once()
+    flexmock(celery_group).should_receive("apply_async").once()
 
     # skip SRPM url since it touches multiple classes
     flexmock(CoprBuildEndHandler).should_receive("set_srpm_url").and_return(None)
@@ -725,7 +802,7 @@ def test_copr_build_end_testing_farm(copr_build_end, copr_build_pr):
 
     processing_results = SteveJobs().process_message(copr_build_end)
     event_dict, job, job_config, package_config = get_parameters_from_results(
-        processing_results
+        processing_results,
     )
     assert json.dumps(event_dict)
 
@@ -738,9 +815,9 @@ def test_copr_build_end_testing_farm(copr_build_end, copr_build_pr):
     )
 
     flexmock(CoprBuildTargetModel).should_receive("get_all_by").and_return(
-        [copr_build_pr]
+        [copr_build_pr],
     )
-    event_dict["tests_targets_override"] = ["fedora-rawhide-x86_64"]
+    event_dict["tests_targets_override"] = [("fedora-rawhide-x86_64", None)]
     run_testing_farm_handler(
         package_config=package_config,
         event=event_dict,
@@ -759,10 +836,10 @@ def test_copr_build_end_testing_farm_pr_branch(copr_build_end, copr_build_pr):
     flexmock(GithubProject).should_receive("get_pr").and_return(
         flexmock(
             source_project=flexmock(
-                get_web_url=lambda: "https://github.com/source/bar"
+                get_web_url=lambda: "https://github.com/source/bar",
             ),
             target_project=flexmock(
-                get_web_url=lambda: "https://github.com/target/bar"
+                get_web_url=lambda: "https://github.com/target/bar",
             ),
             head_commit="0011223344",
             target_branch_head_commit="deadbeef",
@@ -770,7 +847,7 @@ def test_copr_build_end_testing_farm_pr_branch(copr_build_end, copr_build_pr):
             target_branch="the-target-branch",
         )
         .should_receive("comment")
-        .mock()
+        .mock(),
     )
     urls.DASHBOARD_URL = "https://dashboard.localhost"
 
@@ -778,7 +855,7 @@ def test_copr_build_end_testing_farm_pr_branch(copr_build_end, copr_build_pr):
         packages={
             "package": CommonPackageConfig(
                 specfile_path="test.spec",
-            )
+            ),
         },
         jobs=[
             JobConfig(
@@ -788,7 +865,7 @@ def test_copr_build_end_testing_farm_pr_branch(copr_build_end, copr_build_pr):
                     "package": CommonPackageConfig(
                         _targets=["fedora-rawhide"],
                         specfile_path="test.spec",
-                    )
+                    ),
                 },
             ),
             JobConfig(
@@ -799,26 +876,26 @@ def test_copr_build_end_testing_farm_pr_branch(copr_build_end, copr_build_pr):
                         _targets=["fedora-rawhide"],
                         specfile_path="test.spec",
                         branch="the-target-branch",
-                    )
+                    ),
                 },
             ),
         ],
     )
 
-    flexmock(AbstractCoprBuildEvent).should_receive("get_packages_config").and_return(
-        config
+    flexmock(copr.CoprBuild).should_receive("get_packages_config").and_return(
+        config,
     )
     flexmock(CoprHelper).should_receive("get_copr_client").and_return(
-        Client(config={"username": "packit", "copr_url": "https://dummy.url"})
+        Client(config={"username": "packit", "copr_url": "https://dummy.url"}),
     )
     flexmock(PackageConfigGetter).should_receive(
-        "get_package_config_from_repo"
+        "get_package_config_from_repo",
     ).and_return(config)
 
     flexmock(LocalProject).should_receive("refresh_the_arguments").and_return(None)
 
     flexmock(CoprBuildTargetModel).should_receive("get_by_build_id").and_return(
-        copr_build_pr
+        copr_build_pr,
     )
     flexmock(CoprBuildTargetModel).should_receive("get_by_id").and_return(copr_build_pr)
     copr_build_pr.should_call("set_status").with_args(BuildStatus.success).once()
@@ -849,10 +926,11 @@ def test_copr_build_end_testing_farm_pr_branch(copr_build_end, copr_build_pr):
     ).once()
 
     flexmock(GithubProject).should_receive("get_web_url").and_return(
-        "https://github.com/foo/bar"
+        "https://github.com/foo/bar",
     )
 
-    flexmock(Signature).should_receive("apply_async").twice()
+    flexmock(Signature).should_receive("apply_async").once()
+    flexmock(celery_group).should_receive("apply_async").once()
 
     # skip SRPM url since it touches multiple classes
     flexmock(CoprBuildEndHandler).should_receive("set_srpm_url").and_return(None)
@@ -870,7 +948,7 @@ def test_copr_build_end_testing_farm_pr_branch(copr_build_end, copr_build_pr):
 
     processing_results = SteveJobs().process_message(copr_build_end)
     event_dict, job, job_config, package_config = get_parameters_from_results(
-        processing_results
+        processing_results,
     )
     assert json.dumps(event_dict)
 
@@ -893,10 +971,10 @@ def test_copr_build_end_testing_farm_different_pr_branch(copr_build_end, copr_bu
     flexmock(GithubProject).should_receive("get_pr").and_return(
         flexmock(
             source_project=flexmock(
-                get_web_url=lambda: "https://github.com/source/bar"
+                get_web_url=lambda: "https://github.com/source/bar",
             ),
             target_project=flexmock(
-                get_web_url=lambda: "https://github.com/target/bar"
+                get_web_url=lambda: "https://github.com/target/bar",
             ),
             head_commit="0011223344",
             target_branch_head_commit="deadbeef",
@@ -904,7 +982,7 @@ def test_copr_build_end_testing_farm_different_pr_branch(copr_build_end, copr_bu
             target_branch="the-target-branch",
         )
         .should_receive("comment")
-        .mock()
+        .mock(),
     )
     urls.DASHBOARD_URL = "https://dashboard.localhost"
 
@@ -912,7 +990,7 @@ def test_copr_build_end_testing_farm_different_pr_branch(copr_build_end, copr_bu
         packages={
             "package": CommonPackageConfig(
                 specfile_path="test.spec",
-            )
+            ),
         },
         jobs=[
             JobConfig(
@@ -922,7 +1000,7 @@ def test_copr_build_end_testing_farm_different_pr_branch(copr_build_end, copr_bu
                     "package": CommonPackageConfig(
                         _targets=["fedora-rawhide"],
                         specfile_path="test.spec",
-                    )
+                    ),
                 },
             ),
             JobConfig(
@@ -933,26 +1011,26 @@ def test_copr_build_end_testing_farm_different_pr_branch(copr_build_end, copr_bu
                         _targets=["fedora-rawhide"],
                         specfile_path="test.spec",
                         branch="the-other-branch",
-                    )
+                    ),
                 },
             ),
         ],
     )
 
-    flexmock(AbstractCoprBuildEvent).should_receive("get_packages_config").and_return(
-        config
+    flexmock(copr.CoprBuild).should_receive("get_packages_config").and_return(
+        config,
     )
     flexmock(CoprHelper).should_receive("get_copr_client").and_return(
-        Client(config={"username": "packit", "copr_url": "https://dummy.url"})
+        Client(config={"username": "packit", "copr_url": "https://dummy.url"}),
     )
     flexmock(PackageConfigGetter).should_receive(
-        "get_package_config_from_repo"
+        "get_package_config_from_repo",
     ).and_return(config)
 
     flexmock(LocalProject).should_receive("refresh_the_arguments").and_return(None)
 
     flexmock(CoprBuildTargetModel).should_receive("get_by_build_id").and_return(
-        copr_build_pr
+        copr_build_pr,
     )
     flexmock(CoprBuildTargetModel).should_receive("get_by_id").and_return(copr_build_pr)
     copr_build_pr.should_call("set_status").with_args(BuildStatus.success).once()
@@ -983,10 +1061,10 @@ def test_copr_build_end_testing_farm_different_pr_branch(copr_build_end, copr_bu
     ).never()
 
     flexmock(GithubProject).should_receive("get_web_url").and_return(
-        "https://github.com/foo/bar"
+        "https://github.com/foo/bar",
     )
 
-    flexmock(Signature).should_receive("apply_async").once()
+    flexmock(celery_group).should_receive("apply_async").once()
 
     # skip SRPM url since it touches multiple classes
     flexmock(CoprBuildEndHandler).should_receive("set_srpm_url").and_return(None)
@@ -1004,7 +1082,7 @@ def test_copr_build_end_testing_farm_different_pr_branch(copr_build_end, copr_bu
 
     processing_results = SteveJobs().process_message(copr_build_end)
     event_dict, job, job_config, package_config = get_parameters_from_results(
-        processing_results
+        processing_results,
     )
     assert json.dumps(event_dict)
 
@@ -1017,7 +1095,19 @@ def test_copr_build_end_testing_farm_different_pr_branch(copr_build_end, copr_bu
     )
 
 
-def test_copr_build_end_testing_farm_manual_trigger(copr_build_end, copr_build_pr):
+@pytest.mark.parametrize(
+    "build_status,report_manual_triggered_times",
+    (
+        (BuildStatus.success, 0),
+        (BuildStatus.failure, 0),
+    ),
+)
+def test_copr_build_end_testing_farm_manual_trigger(
+    copr_build_end,
+    copr_build_pr,
+    build_status,
+    report_manual_triggered_times,
+):
     ServiceConfig.get_service_config().testing_farm_api_url = (
         "https://api.dev.testing-farm.io/v0.1/"
     )
@@ -1027,10 +1117,10 @@ def test_copr_build_end_testing_farm_manual_trigger(copr_build_end, copr_build_p
     flexmock(GithubProject).should_receive("get_pr").and_return(
         flexmock(
             source_project=flexmock(
-                get_web_url=lambda: "https://github.com/source/bar"
+                get_web_url=lambda: "https://github.com/source/bar",
             ),
             target_project=flexmock(
-                get_web_url=lambda: "https://github.com/target/bar"
+                get_web_url=lambda: "https://github.com/target/bar",
             ),
             head_commit="0011223344",
             target_branch_head_commit="deadbeef",
@@ -1038,7 +1128,7 @@ def test_copr_build_end_testing_farm_manual_trigger(copr_build_end, copr_build_p
             target_branch="the-target-branch",
         )
         .should_receive("comment")
-        .mock()
+        .mock(),
     )
     urls.DASHBOARD_URL = "https://dashboard.localhost"
 
@@ -1046,7 +1136,7 @@ def test_copr_build_end_testing_farm_manual_trigger(copr_build_end, copr_build_p
         packages={
             "package": CommonPackageConfig(
                 specfile_path="test.spec",
-            )
+            ),
         },
         jobs=[
             JobConfig(
@@ -1056,7 +1146,7 @@ def test_copr_build_end_testing_farm_manual_trigger(copr_build_end, copr_build_p
                     "package": CommonPackageConfig(
                         _targets=["fedora-rawhide"],
                         specfile_path="test.spec",
-                    )
+                    ),
                 },
             ),
             JobConfig(
@@ -1067,26 +1157,176 @@ def test_copr_build_end_testing_farm_manual_trigger(copr_build_end, copr_build_p
                     "package": CommonPackageConfig(
                         _targets=["fedora-rawhide"],
                         specfile_path="test.spec",
-                    )
+                    ),
                 },
             ),
         ],
     )
 
-    flexmock(AbstractCoprBuildEvent).should_receive("get_packages_config").and_return(
-        config
+    flexmock(copr.CoprBuild).should_receive("get_packages_config").and_return(
+        config,
     )
     flexmock(CoprHelper).should_receive("get_copr_client").and_return(
-        Client(config={"username": "packit", "copr_url": "https://dummy.url"})
+        Client(config={"username": "packit", "copr_url": "https://dummy.url"}),
     )
     flexmock(PackageConfigGetter).should_receive(
-        "get_package_config_from_repo"
+        "get_package_config_from_repo",
     ).and_return(config)
 
     flexmock(LocalProject).should_receive("refresh_the_arguments").and_return(None)
 
     flexmock(CoprBuildTargetModel).should_receive("get_by_build_id").and_return(
-        copr_build_pr
+        copr_build_pr,
+    )
+    flexmock(CoprBuildTargetModel).should_receive("get_by_id").and_return(copr_build_pr)
+    copr_build_pr.should_call("set_status").with_args(build_status).once()
+    copr_build_pr.should_receive("set_end_time").once()
+    copr_build_pr.should_receive("get_package_name").and_return(None)
+    flexmock(requests).should_receive("get").and_return(requests.Response())
+    flexmock(requests.Response).should_receive("raise_for_status").and_return(None)
+    # check if packit-service set correct PR status
+    url = get_copr_build_info_url(1)
+    if build_status == BuildStatus.success:
+        flexmock(StatusReporter).should_receive("report").with_args(
+            state=BaseCommitStatus.success,
+            description="RPMs were built successfully.",
+            url=url,
+            check_names=EXPECTED_BUILD_CHECK_NAME,
+            markdown_content=None,
+            links_to_external_services=None,
+            update_feedback_time=object,
+        ).once()
+    else:
+        flexmock(StatusReporter).should_receive("report").with_args(
+            description="RPMs failed to be built.",
+            state=BaseCommitStatus.failure,
+            url=url,
+            check_names=EXPECTED_BUILD_CHECK_NAME,
+            markdown_content=None,
+            links_to_external_services=None,
+            update_feedback_time=object,
+        ).once()
+
+    flexmock(StatusReporter).should_receive("report").with_args(
+        state=BaseCommitStatus.failure,
+        description="RPMs failed to be built.",
+        url=url,
+        check_names=EXPECTED_TESTING_FARM_CHECK_NAME,
+        markdown_content=None,
+        links_to_external_services=None,
+        update_feedback_time=object,
+    ).times(report_manual_triggered_times)
+
+    flexmock(GithubProject).should_receive("get_web_url").and_return(
+        "https://github.com/foo/bar",
+    )
+
+    flexmock(celery_group).should_receive("apply_async").once()
+
+    # skip SRPM url since it touches multiple classes
+    flexmock(CoprBuildEndHandler).should_receive("set_srpm_url").and_return(None)
+
+    (
+        flexmock(CoprBuildJobHelper)
+        .should_receive("get_build_chroot")
+        .with_args(1, "some-target")
+        .and_return(flexmock(ended_on=1666889710))
+        .at_least()
+        .once()
+    )
+
+    flexmock(Pushgateway).should_receive("push").times(2).and_return()
+    copr_event = copy.deepcopy(copr_build_end)
+    copr_event["status"] = 1 if build_status == BuildStatus.success else 0
+    processing_results = SteveJobs().process_message(copr_event)
+    event_dict, job, job_config, package_config = get_parameters_from_results(
+        processing_results,
+    )
+    assert json.dumps(event_dict)
+
+    flexmock(CoprBuildJobHelper).should_receive("get_built_packages").and_return([])
+
+    run_copr_build_end_handler(
+        package_config=package_config,
+        event=event_dict,
+        job_config=job_config,
+    )
+
+
+def test_copr_build_end_testing_farm_labels_matching(copr_build_end, copr_build_pr):
+    ServiceConfig.get_service_config().testing_farm_api_url = (
+        "https://api.dev.testing-farm.io/v0.1/"
+    )
+    ServiceConfig.get_service_config().testing_farm_secret = "secret token"
+
+    flexmock(GithubProject).should_receive("is_private").and_return(False)
+    flexmock(GithubProject).should_receive("get_pr").and_return(
+        flexmock(
+            source_project=flexmock(
+                get_web_url=lambda: "https://github.com/source/bar",
+            ),
+            target_project=flexmock(
+                get_web_url=lambda: "https://github.com/target/bar",
+            ),
+            head_commit="0011223344",
+            target_branch_head_commit="deadbeef",
+            source_branch="the-source-branch",
+            target_branch="the-target-branch",
+            id=123,
+            labels=[flexmock(name="a-label")],
+        )
+        .should_receive("comment")
+        .mock(),
+    )
+    urls.DASHBOARD_URL = "https://dashboard.localhost"
+
+    config = PackageConfig(
+        packages={
+            "package": CommonPackageConfig(
+                specfile_path="test.spec",
+            ),
+        },
+        jobs=[
+            JobConfig(
+                type=JobType.copr_build,
+                trigger=JobConfigTriggerType.pull_request,
+                packages={
+                    "package": CommonPackageConfig(
+                        _targets=["fedora-rawhide"],
+                        specfile_path="test.spec",
+                    ),
+                },
+            ),
+            JobConfig(
+                type=JobType.tests,
+                trigger=JobConfigTriggerType.pull_request,
+                packages={
+                    "package": CommonPackageConfig(
+                        _targets=["fedora-rawhide"],
+                        specfile_path="test.spec",
+                        require=RequirementsConfig(
+                            label=LabelRequirementsConfig(present=["a-label"]),
+                        ),
+                    ),
+                },
+            ),
+        ],
+    )
+
+    flexmock(copr.CoprBuild).should_receive("get_packages_config").and_return(
+        config,
+    )
+    flexmock(CoprHelper).should_receive("get_copr_client").and_return(
+        Client(config={"username": "packit", "copr_url": "https://dummy.url"}),
+    )
+    flexmock(PackageConfigGetter).should_receive(
+        "get_package_config_from_repo",
+    ).and_return(config)
+
+    flexmock(LocalProject).should_receive("refresh_the_arguments").and_return(None)
+
+    flexmock(CoprBuildTargetModel).should_receive("get_by_build_id").and_return(
+        copr_build_pr,
     )
     flexmock(CoprBuildTargetModel).should_receive("get_by_id").and_return(copr_build_pr)
     copr_build_pr.should_call("set_status").with_args(BuildStatus.success).once()
@@ -1117,10 +1357,11 @@ def test_copr_build_end_testing_farm_manual_trigger(copr_build_end, copr_build_p
     ).once()
 
     flexmock(GithubProject).should_receive("get_web_url").and_return(
-        "https://github.com/foo/bar"
+        "https://github.com/foo/bar",
     )
 
     flexmock(Signature).should_receive("apply_async").once()
+    flexmock(celery_group).should_receive("apply_async").once()
 
     # skip SRPM url since it touches multiple classes
     flexmock(CoprBuildEndHandler).should_receive("set_srpm_url").and_return(None)
@@ -1138,7 +1379,145 @@ def test_copr_build_end_testing_farm_manual_trigger(copr_build_end, copr_build_p
 
     processing_results = SteveJobs().process_message(copr_build_end)
     event_dict, job, job_config, package_config = get_parameters_from_results(
-        processing_results
+        processing_results,
+    )
+    assert json.dumps(event_dict)
+
+    flexmock(CoprBuildJobHelper).should_receive("get_built_packages").and_return([])
+
+    run_copr_build_end_handler(
+        package_config=package_config,
+        event=event_dict,
+        job_config=job_config,
+    )
+
+
+def test_copr_build_end_testing_farm_labels_not_matching(copr_build_end, copr_build_pr):
+    ServiceConfig.get_service_config().testing_farm_api_url = (
+        "https://api.dev.testing-farm.io/v0.1/"
+    )
+    ServiceConfig.get_service_config().testing_farm_secret = "secret token"
+
+    flexmock(GithubProject).should_receive("is_private").and_return(False)
+    flexmock(GithubProject).should_receive("get_pr").and_return(
+        flexmock(
+            source_project=flexmock(
+                get_web_url=lambda: "https://github.com/source/bar",
+            ),
+            target_project=flexmock(
+                get_web_url=lambda: "https://github.com/target/bar",
+            ),
+            head_commit="0011223344",
+            target_branch_head_commit="deadbeef",
+            source_branch="the-source-branch",
+            target_branch="the-target-branch",
+            id=123,
+            labels=[flexmock(name="another-label")],
+        )
+        .should_receive("comment")
+        .mock(),
+    )
+    urls.DASHBOARD_URL = "https://dashboard.localhost"
+
+    config = PackageConfig(
+        packages={
+            "package": CommonPackageConfig(
+                specfile_path="test.spec",
+            ),
+        },
+        jobs=[
+            JobConfig(
+                type=JobType.copr_build,
+                trigger=JobConfigTriggerType.pull_request,
+                packages={
+                    "package": CommonPackageConfig(
+                        _targets=["fedora-rawhide"],
+                        specfile_path="test.spec",
+                    ),
+                },
+            ),
+            JobConfig(
+                type=JobType.tests,
+                trigger=JobConfigTriggerType.pull_request,
+                packages={
+                    "package": CommonPackageConfig(
+                        _targets=["fedora-rawhide"],
+                        specfile_path="test.spec",
+                        require=RequirementsConfig(
+                            label=LabelRequirementsConfig(present=["a-label"]),
+                        ),
+                    ),
+                },
+            ),
+        ],
+    )
+
+    flexmock(copr.CoprBuild).should_receive("get_packages_config").and_return(
+        config,
+    )
+    flexmock(CoprHelper).should_receive("get_copr_client").and_return(
+        Client(config={"username": "packit", "copr_url": "https://dummy.url"}),
+    )
+    flexmock(PackageConfigGetter).should_receive(
+        "get_package_config_from_repo",
+    ).and_return(config)
+
+    flexmock(LocalProject).should_receive("refresh_the_arguments").and_return(None)
+
+    flexmock(CoprBuildTargetModel).should_receive("get_by_build_id").and_return(
+        copr_build_pr,
+    )
+    flexmock(CoprBuildTargetModel).should_receive("get_by_id").and_return(copr_build_pr)
+    copr_build_pr.should_call("set_status").with_args(BuildStatus.success).once()
+    copr_build_pr.should_receive("set_end_time").once()
+    copr_build_pr.should_receive("get_package_name").and_return(None)
+    flexmock(requests).should_receive("get").and_return(requests.Response())
+    flexmock(requests.Response).should_receive("raise_for_status").and_return(None)
+    # check if packit-service set correct PR status
+    url = get_copr_build_info_url(1)
+    flexmock(StatusReporter).should_receive("report").with_args(
+        state=BaseCommitStatus.success,
+        description="RPMs were built successfully.",
+        url=url,
+        check_names=EXPECTED_BUILD_CHECK_NAME,
+        markdown_content=None,
+        links_to_external_services=None,
+        update_feedback_time=object,
+    ).once()
+
+    flexmock(StatusReporter).should_receive("report").with_args(
+        state=BaseCommitStatus.pending,
+        description="RPMs were built successfully.",
+        url=url,
+        check_names=EXPECTED_TESTING_FARM_CHECK_NAME,
+        markdown_content=None,
+        links_to_external_services=None,
+        update_feedback_time=object,
+    ).once()
+
+    flexmock(GithubProject).should_receive("get_web_url").and_return(
+        "https://github.com/foo/bar",
+    )
+
+    flexmock(celery_group).should_receive("apply_async").once()
+
+    # skip SRPM url since it touches multiple classes
+    flexmock(CoprBuildEndHandler).should_receive("set_srpm_url").and_return(None)
+
+    (
+        flexmock(CoprBuildJobHelper)
+        .should_receive("get_build_chroot")
+        .with_args(1, "some-target")
+        .and_return(flexmock(ended_on=1666889710))
+        .at_least()
+        .once()
+    )
+
+    flexmock(Pushgateway).should_receive("push").times(2).and_return()
+
+    processing_results = SteveJobs().process_message(copr_build_end)
+    event_dict, job, job_config, package_config = get_parameters_from_results(
+        processing_results,
     )
     assert json.dumps(event_dict)
 
@@ -1156,7 +1535,7 @@ def test_copr_build_end_push_testing_farm(copr_build_end_push, copr_build_branch
         packages={
             "package": CommonPackageConfig(
                 specfile_path="test.spec",
-            )
+            ),
         },
         jobs=[
             JobConfig(
@@ -1167,7 +1546,7 @@ def test_copr_build_end_push_testing_farm(copr_build_end_push, copr_build_branch
                         _targets=["fedora-all"],
                         specfile_path="test.spec",
                         branch="build-branch",
-                    )
+                    ),
                 },
             ),
             JobConfig(
@@ -1178,32 +1557,30 @@ def test_copr_build_end_push_testing_farm(copr_build_end_push, copr_build_branch
                         _targets=["fedora-all"],
                         specfile_path="test.spec",
                         branch="build-branch",
-                    )
+                    ),
                 },
             ),
         ],
     )
 
-    flexmock(AbstractCoprBuildEvent).should_receive("get_packages_config").and_return(
-        config
+    flexmock(copr.CoprBuild).should_receive("get_packages_config").and_return(
+        config,
     )
     flexmock(PackageConfigGetter).should_receive(
-        "get_package_config_from_repo"
+        "get_package_config_from_repo",
     ).and_return(config)
 
     flexmock(GithubProject).should_receive("is_private").and_return(False)
     flexmock(GithubProject).should_receive("get_pr").and_return(
         # we cannot comment for branch push events
-        flexmock(source_project=flexmock())
-        .should_receive("comment")
-        .never()
+        flexmock(source_project=flexmock()).should_receive("comment").never(),
     )
     flexmock(CoprHelper).should_receive("get_copr_client").and_return(
-        Client(config={"username": "packit", "copr_url": "https://dummy.url"})
+        Client(config={"username": "packit", "copr_url": "https://dummy.url"}),
     )
 
     flexmock(CoprBuildTargetModel).should_receive("get_by_build_id").and_return(
-        copr_build_branch_push
+        copr_build_branch_push,
     )
 
     copr_build_branch_push.should_receive("set_status").with_args(BuildStatus.success)
@@ -1213,7 +1590,7 @@ def test_copr_build_end_push_testing_farm(copr_build_end_push, copr_build_branch
     flexmock(requests).should_receive("get").and_return(requests.Response())
     flexmock(requests.Response).should_receive("raise_for_status").and_return(None)
     flexmock(CoprBuildJobHelper).should_receive(
-        "report_status_to_build_for_chroot"
+        "report_status_to_build_for_chroot",
     ).with_args(
         state=BaseCommitStatus.success,
         description="RPMs were built successfully.",
@@ -1221,7 +1598,7 @@ def test_copr_build_end_push_testing_farm(copr_build_end_push, copr_build_branch
         chroot=copr_build_end_push["chroot"],
     ).once()
     flexmock(CoprBuildJobHelper).should_receive(
-        "report_status_to_all_test_jobs_for_chroot"
+        "report_status_to_all_test_jobs_for_chroot",
     ).with_args(
         state=BaseCommitStatus.pending,
         description="RPMs were built successfully.",
@@ -1229,7 +1606,8 @@ def test_copr_build_end_push_testing_farm(copr_build_end_push, copr_build_branch
         chroot=copr_build_end_push["chroot"],
     ).once()
 
-    flexmock(Signature).should_receive("apply_async").twice()
+    flexmock(Signature).should_receive("apply_async").once()
+    flexmock(celery_group).should_receive("apply_async").once()
 
     # skip SRPM url since it touches multiple classes
     flexmock(CoprBuildEndHandler).should_receive("set_srpm_url").and_return(None)
@@ -1247,7 +1625,7 @@ def test_copr_build_end_push_testing_farm(copr_build_end_push, copr_build_branch
 
     processing_results = SteveJobs().process_message(copr_build_end_push)
     event_dict, job, job_config, package_config = get_parameters_from_results(
-        processing_results
+        processing_results,
     )
     assert json.dumps(event_dict)
 
@@ -1261,13 +1639,14 @@ def test_copr_build_end_push_testing_farm(copr_build_end_push, copr_build_branch
 
 
 def test_copr_build_end_push_testing_farm_different_branch(
-    copr_build_end_push, copr_build_branch_push
+    copr_build_end_push,
+    copr_build_branch_push,
 ):
     config = PackageConfig(
         packages={
             "package": CommonPackageConfig(
                 specfile_path="test.spec",
-            )
+            ),
         },
         jobs=[
             JobConfig(
@@ -1278,7 +1657,7 @@ def test_copr_build_end_push_testing_farm_different_branch(
                         _targets=["fedora-all"],
                         specfile_path="test.spec",
                         branch="build-branch",
-                    )
+                    ),
                 },
             ),
             JobConfig(
@@ -1289,32 +1668,30 @@ def test_copr_build_end_push_testing_farm_different_branch(
                         _targets=["fedora-all"],
                         specfile_path="test.spec",
                         branch="test-branch",
-                    )
+                    ),
                 },
             ),
         ],
     )
 
-    flexmock(AbstractCoprBuildEvent).should_receive("get_packages_config").and_return(
-        config
+    flexmock(copr.CoprBuild).should_receive("get_packages_config").and_return(
+        config,
     )
     flexmock(PackageConfigGetter).should_receive(
-        "get_package_config_from_repo"
+        "get_package_config_from_repo",
     ).and_return(config)
 
     flexmock(GithubProject).should_receive("is_private").and_return(False)
     flexmock(GithubProject).should_receive("get_pr").and_return(
         # we cannot comment for branch push events
-        flexmock(source_project=flexmock())
-        .should_receive("comment")
-        .never()
+        flexmock(source_project=flexmock()).should_receive("comment").never(),
     )
     flexmock(CoprHelper).should_receive("get_copr_client").and_return(
-        Client(config={"username": "packit", "copr_url": "https://dummy.url"})
+        Client(config={"username": "packit", "copr_url": "https://dummy.url"}),
     )
 
     flexmock(CoprBuildTargetModel).should_receive("get_by_build_id").and_return(
-        copr_build_branch_push
+        copr_build_branch_push,
     )
 
     copr_build_branch_push.should_receive("set_status").with_args(BuildStatus.success)
@@ -1325,7 +1702,7 @@ def test_copr_build_end_push_testing_farm_different_branch(
     flexmock(requests.Response).should_receive("raise_for_status").and_return(None)
     # check if packit-service set correct PR status
     flexmock(CoprBuildJobHelper).should_receive(
-        "report_status_to_build_for_chroot"
+        "report_status_to_build_for_chroot",
     ).with_args(
         state=BaseCommitStatus.success,
         description="RPMs were built successfully.",
@@ -1333,7 +1710,7 @@ def test_copr_build_end_push_testing_farm_different_branch(
         chroot=copr_build_end_push["chroot"],
     ).once()
 
-    flexmock(Signature).should_receive("apply_async").once()
+    flexmock(celery_group).should_receive("apply_async").once()
 
     # skip SRPM url since it touches multiple classes
     flexmock(CoprBuildEndHandler).should_receive("set_srpm_url").and_return(None)
@@ -1351,7 +1728,7 @@ def test_copr_build_end_push_testing_farm_different_branch(
 
     processing_results = SteveJobs().process_message(copr_build_end_push)
     event_dict, job, job_config, package_config = get_parameters_from_results(
-        processing_results
+        processing_results,
     )
     assert json.dumps(event_dict)
 
@@ -1365,7 +1742,8 @@ def test_copr_build_end_push_testing_farm_different_branch(
 
 
 def test_copr_build_end_report_multiple_testing_farm_jobs(
-    copr_build_end, copr_build_pr
+    copr_build_end,
+    copr_build_pr,
 ):
     ServiceConfig.get_service_config().testing_farm_api_url = (
         "https://api.dev.testing-farm.io/v0.1/"
@@ -1376,10 +1754,10 @@ def test_copr_build_end_report_multiple_testing_farm_jobs(
     flexmock(GithubProject).should_receive("get_pr").and_return(
         flexmock(
             source_project=flexmock(
-                get_web_url=lambda: "https://github.com/source/bar"
+                get_web_url=lambda: "https://github.com/source/bar",
             ),
             target_project=flexmock(
-                get_web_url=lambda: "https://github.com/target/bar"
+                get_web_url=lambda: "https://github.com/target/bar",
             ),
             head_commit="0011223344",
             target_branch_head_commit="deadbeef",
@@ -1387,7 +1765,7 @@ def test_copr_build_end_report_multiple_testing_farm_jobs(
             target_branch="the-target-branch",
         )
         .should_receive("comment")
-        .mock()
+        .mock(),
     )
     urls.DASHBOARD_URL = "https://dashboard.localhost"
 
@@ -1395,7 +1773,7 @@ def test_copr_build_end_report_multiple_testing_farm_jobs(
         packages={
             "package": CommonPackageConfig(
                 specfile_path="test.spec",
-            )
+            ),
         },
         jobs=[
             JobConfig(
@@ -1405,7 +1783,7 @@ def test_copr_build_end_report_multiple_testing_farm_jobs(
                     "package": CommonPackageConfig(
                         _targets=["fedora-rawhide"],
                         specfile_path="test.spec",
-                    )
+                    ),
                 },
             ),
             JobConfig(
@@ -1416,7 +1794,7 @@ def test_copr_build_end_report_multiple_testing_farm_jobs(
                         identifier="test1",
                         _targets=["fedora-rawhide"],
                         specfile_path="test.spec",
-                    )
+                    ),
                 },
             ),
             JobConfig(
@@ -1427,26 +1805,26 @@ def test_copr_build_end_report_multiple_testing_farm_jobs(
                         identifier="test2",
                         _targets=["fedora-rawhide", "other-target"],
                         specfile_path="test.spec",
-                    )
+                    ),
                 },
             ),
         ],
     )
 
-    flexmock(AbstractCoprBuildEvent).should_receive("get_packages_config").and_return(
-        config
+    flexmock(copr.CoprBuild).should_receive("get_packages_config").and_return(
+        config,
     )
     flexmock(CoprHelper).should_receive("get_copr_client").and_return(
-        Client(config={"username": "packit", "copr_url": "https://dummy.url"})
+        Client(config={"username": "packit", "copr_url": "https://dummy.url"}),
     )
     flexmock(PackageConfigGetter).should_receive(
-        "get_package_config_from_repo"
+        "get_package_config_from_repo",
     ).and_return(config)
 
     flexmock(LocalProject).should_receive("refresh_the_arguments").and_return(None)
 
     flexmock(CoprBuildTargetModel).should_receive("get_by_build_id").and_return(
-        copr_build_pr
+        copr_build_pr,
     )
     flexmock(CoprBuildTargetModel).should_receive("get_by_id").and_return(copr_build_pr)
     copr_build_pr.should_call("set_status").with_args(BuildStatus.success).once()
@@ -1489,10 +1867,11 @@ def test_copr_build_end_report_multiple_testing_farm_jobs(
     flexmock(TestingFarmJobHelper).should_receive("prepare_and_send_tf_request")
 
     flexmock(GithubProject).should_receive("get_web_url").and_return(
-        "https://github.com/foo/bar"
+        "https://github.com/foo/bar",
     )
 
-    flexmock(Signature).should_receive("apply_async").times(3)
+    flexmock(Signature).should_receive("apply_async").times(2)
+    flexmock(celery_group).should_receive("apply_async").times(1)
 
     # skip SRPM url since it touches multiple classes
     flexmock(CoprBuildEndHandler).should_receive("set_srpm_url").and_return(None)
@@ -1510,7 +1889,7 @@ def test_copr_build_end_report_multiple_testing_farm_jobs(
 
     processing_results = SteveJobs().process_message(copr_build_end)
     event_dict, job, job_config, package_config = get_parameters_from_results(
-        processing_results
+        processing_results,
     )
     assert json.dumps(event_dict)
 
@@ -1526,15 +1905,15 @@ def test_copr_build_end_report_multiple_testing_farm_jobs(
 def test_copr_build_end_failed_testing_farm(copr_build_end, copr_build_pr):
     flexmock(GithubProject).should_receive("is_private").and_return(False)
     flexmock(GithubProject).should_receive("get_web_url").and_return(
-        "https://github.com/target/bar"
+        "https://github.com/target/bar",
     )
     flexmock(GithubProject).should_receive("get_pr").and_return(
         flexmock(
             source_project=flexmock(
-                get_web_url=lambda: "https://github.com/source/bar"
+                get_web_url=lambda: "https://github.com/source/bar",
             ),
             target_project=flexmock(
-                get_web_url=lambda: "https://github.com/target/bar"
+                get_web_url=lambda: "https://github.com/target/bar",
             ),
             head_commit="0011223344",
             target_branch_head_commit="deadbeef",
@@ -1542,14 +1921,14 @@ def test_copr_build_end_failed_testing_farm(copr_build_end, copr_build_pr):
             target_branch="the-target-branch",
         )
         .should_receive("comment")
-        .mock()
+        .mock(),
     )
 
     config = PackageConfig(
         packages={
             "package": CommonPackageConfig(
                 specfile_path="test.spec",
-            )
+            ),
         },
         jobs=[
             JobConfig(
@@ -1559,7 +1938,7 @@ def test_copr_build_end_failed_testing_farm(copr_build_end, copr_build_pr):
                     "package": CommonPackageConfig(
                         _targets=["fedora-rawhide"],
                         specfile_path="test.spec",
-                    )
+                    ),
                 },
             ),
             JobConfig(
@@ -1569,26 +1948,26 @@ def test_copr_build_end_failed_testing_farm(copr_build_end, copr_build_pr):
                     "package": CommonPackageConfig(
                         _targets=["fedora-rawhide"],
                         specfile_path="test.spec",
-                    )
+                    ),
                 },
             ),
         ],
     )
 
-    flexmock(AbstractCoprBuildEvent).should_receive("get_packages_config").and_return(
-        config
+    flexmock(copr.CoprBuild).should_receive("get_packages_config").and_return(
+        config,
     )
     flexmock(CoprHelper).should_receive("get_copr_client").and_return(
-        Client(config={"username": "packit", "copr_url": "https://dummy.url"})
+        Client(config={"username": "packit", "copr_url": "https://dummy.url"}),
     )
     flexmock(PackageConfigGetter).should_receive(
-        "get_package_config_from_repo"
+        "get_package_config_from_repo",
     ).and_return(config)
 
     flexmock(LocalProject).should_receive("refresh_the_arguments").and_return(None)
 
     flexmock(CoprBuildTargetModel).should_receive("get_by_build_id").and_return(
-        copr_build_pr
+        copr_build_pr,
     )
     flexmock(CoprBuildTargetModel).should_receive("get_by_id").and_return(copr_build_pr)
     copr_build_pr.should_call("set_status").with_args(BuildStatus.success).once()
@@ -1630,23 +2009,25 @@ def test_copr_build_end_failed_testing_farm(copr_build_end, copr_build_pr):
     )
     flexmock(TFTTestRunTargetModel).should_receive("create").and_return(test)
     flexmock(TFTTestRunGroupModel).should_receive("create").with_args(
-        [copr_build_pr.group_of_targets.runs[-1]]
+        [copr_build_pr.group_of_targets.runs[-1]],
     ).and_return(flexmock(grouped_targets=[test]))
     flexmock(TestingFarmJobHelper).should_receive("is_fmf_configured").and_return(True)
     flexmock(TestingFarmJobHelper).should_receive("distro2compose").with_args(
-        "fedora-rawhide-x86_64"
+        "fedora-rawhide-x86_64",
     ).and_return("Fedora-Rawhide")
     flexmock(TestingFarmJobHelper).should_receive(
-        "send_testing_farm_request"
+        "send_testing_farm_request",
     ).and_return(
         RequestResponse(
             status_code=400,
             ok=False,
             content=b'{"errors": "some error"}',
             json={
-                "errors": {"settings": {"pipeline": {"timeout": "unexpected type str"}}}
+                "errors": {
+                    "settings": {"pipeline": {"timeout": "unexpected type str"}},
+                },
             },
-        )
+        ),
     )
 
     flexmock(StatusReporter).should_receive("report").with_args(
@@ -1671,7 +2052,8 @@ def test_copr_build_end_failed_testing_farm(copr_build_end, copr_build_pr):
         update_feedback_time=object,
     ).once()
 
-    flexmock(Signature).should_receive("apply_async").twice()
+    flexmock(Signature).should_receive("apply_async").once()
+    flexmock(celery_group).should_receive("apply_async").once()
 
     (
         flexmock(CoprBuildJobHelper)
@@ -1689,7 +2071,7 @@ def test_copr_build_end_failed_testing_farm(copr_build_end, copr_build_pr):
 
     processing_results = SteveJobs().process_message(copr_build_end)
     event_dict, job, job_config, package_config = get_parameters_from_results(
-        processing_results
+        processing_results,
     )
     assert json.dumps(event_dict)
 
@@ -1701,7 +2083,7 @@ def test_copr_build_end_failed_testing_farm(copr_build_end, copr_build_pr):
         job_config=job_config,
     )
 
-    event_dict["tests_targets_override"] = ["fedora-rawhide-x86_64"]
+    event_dict["tests_targets_override"] = [("fedora-rawhide-x86_64", None)]
     run_testing_farm_handler(
         package_config=package_config,
         event=event_dict,
@@ -1713,15 +2095,15 @@ def test_copr_build_end_failed_testing_farm(copr_build_end, copr_build_pr):
 def test_copr_build_end_failed_testing_farm_no_json(copr_build_end, copr_build_pr):
     flexmock(GithubProject).should_receive("is_private").and_return(False)
     flexmock(GithubProject).should_receive("get_web_url").and_return(
-        "https://github.com/target/bar"
+        "https://github.com/target/bar",
     )
     flexmock(GithubProject).should_receive("get_pr").and_return(
         flexmock(
             source_project=flexmock(
-                get_web_url=lambda: "https://github.com/source/bar"
+                get_web_url=lambda: "https://github.com/source/bar",
             ),
             target_project=flexmock(
-                get_web_url=lambda: "https://github.com/target/bar"
+                get_web_url=lambda: "https://github.com/target/bar",
             ),
             head_commit="0011223344",
             target_branch_head_commit="deadbeef",
@@ -1729,14 +2111,14 @@ def test_copr_build_end_failed_testing_farm_no_json(copr_build_end, copr_build_p
             target_branch="the-target-branch",
         )
         .should_receive("comment")
-        .mock()
+        .mock(),
     )
 
     config = PackageConfig(
         packages={
             "package": CommonPackageConfig(
                 specfile_path="test.spec",
-            )
+            ),
         },
         jobs=[
             JobConfig(
@@ -1746,7 +2128,7 @@ def test_copr_build_end_failed_testing_farm_no_json(copr_build_end, copr_build_p
                     "package": CommonPackageConfig(
                         _targets=["fedora-rawhide"],
                         specfile_path="test.spec",
-                    )
+                    ),
                 },
             ),
             JobConfig(
@@ -1756,26 +2138,26 @@ def test_copr_build_end_failed_testing_farm_no_json(copr_build_end, copr_build_p
                     "package": CommonPackageConfig(
                         _targets=["fedora-rawhide"],
                         specfile_path="test.spec",
-                    )
+                    ),
                 },
             ),
         ],
     )
 
-    flexmock(AbstractCoprBuildEvent).should_receive("get_packages_config").and_return(
-        config
+    flexmock(copr.CoprBuild).should_receive("get_packages_config").and_return(
+        config,
     )
     flexmock(CoprHelper).should_receive("get_copr_client").and_return(
-        Client(config={"username": "packit", "copr_url": "https://dummy.url"})
+        Client(config={"username": "packit", "copr_url": "https://dummy.url"}),
     )
     flexmock(PackageConfigGetter).should_receive(
-        "get_package_config_from_repo"
+        "get_package_config_from_repo",
     ).and_return(config)
 
     flexmock(LocalProject).should_receive("refresh_the_arguments").and_return(None)
 
     flexmock(CoprBuildTargetModel).should_receive("get_by_build_id").and_return(
-        copr_build_pr
+        copr_build_pr,
     )
     flexmock(CoprBuildTargetModel).should_receive("get_by_id").and_return(copr_build_pr)
     copr_build_pr.should_call("set_status").with_args(BuildStatus.success).once()
@@ -1816,15 +2198,15 @@ def test_copr_build_end_failed_testing_farm_no_json(copr_build_end, copr_build_p
         .mock()
     )
     flexmock(TFTTestRunGroupModel).should_receive("create").with_args(
-        [copr_build_pr.group_of_targets.runs[-1]]
+        [copr_build_pr.group_of_targets.runs[-1]],
     ).and_return(flexmock(grouped_targets=[test]))
     flexmock(TFTTestRunTargetModel).should_receive("create").and_return(test)
     flexmock(TestingFarmJobHelper).should_receive("is_fmf_configured").and_return(True)
     flexmock(TestingFarmJobHelper).should_receive("distro2compose").with_args(
-        "fedora-rawhide-x86_64"
+        "fedora-rawhide-x86_64",
     ).and_return("Fedora-Rawhide")
     flexmock(TestingFarmJobHelper).should_receive(
-        "send_testing_farm_request"
+        "send_testing_farm_request",
     ).and_return(
         RequestResponse(
             status_code=400,
@@ -1832,11 +2214,11 @@ def test_copr_build_end_failed_testing_farm_no_json(copr_build_end, copr_build_p
             content=b"some text error",
             reason="some text error",
             json=None,
-        )
+        ),
     )
 
     flexmock(CoprBuildTargetModel).should_receive("set_status").with_args(
-        BuildStatus.failure
+        BuildStatus.failure,
     )
     flexmock(StatusReporter).should_receive("report").with_args(
         state=BaseCommitStatus.running,
@@ -1857,7 +2239,8 @@ def test_copr_build_end_failed_testing_farm_no_json(copr_build_end, copr_build_p
         update_feedback_time=object,
     ).once()
 
-    flexmock(Signature).should_receive("apply_async").twice()
+    flexmock(Signature).should_receive("apply_async").once()
+    flexmock(celery_group).should_receive("apply_async").once()
 
     (
         flexmock(CoprBuildJobHelper)
@@ -1874,7 +2257,7 @@ def test_copr_build_end_failed_testing_farm_no_json(copr_build_end, copr_build_p
 
     processing_results = SteveJobs().process_message(copr_build_end)
     event_dict, job, job_config, package_config = get_parameters_from_results(
-        processing_results
+        processing_results,
     )
     assert json.dumps(event_dict)
 
@@ -1886,7 +2269,7 @@ def test_copr_build_end_failed_testing_farm_no_json(copr_build_end, copr_build_p
         job_config=job_config,
     )
 
-    event_dict["tests_targets_override"] = ["fedora-rawhide-x86_64"]
+    event_dict["tests_targets_override"] = [("fedora-rawhide-x86_64", None)]
     task = run_testing_farm_handler.__wrapped__.__func__
     task(
         flexmock(
@@ -1903,20 +2286,20 @@ def test_copr_build_end_failed_testing_farm_no_json(copr_build_end, copr_build_p
 def test_copr_build_start(copr_build_start, pc_build_pr, copr_build_pr):
     flexmock(GithubProject).should_receive("is_private").and_return(False)
     flexmock(GithubProject).should_receive("get_pr").and_return(
-        flexmock(source_project=flexmock())
+        flexmock(source_project=flexmock()),
     )
-    flexmock(AbstractCoprBuildEvent).should_receive("get_packages_config").and_return(
-        pc_build_pr
+    flexmock(copr.CoprBuild).should_receive("get_packages_config").and_return(
+        pc_build_pr,
     )
     flexmock(CoprHelper).should_receive("get_copr_client").and_return(
-        Client(config={"username": "packit", "copr_url": "https://dummy.url"})
+        Client(config={"username": "packit", "copr_url": "https://dummy.url"}),
     )
     flexmock(CoprBuildJobHelper).should_receive("get_build_check").and_return(
-        EXPECTED_BUILD_CHECK_NAME
+        EXPECTED_BUILD_CHECK_NAME,
     )
 
     flexmock(CoprBuildTargetModel).should_receive("get_by_build_id").and_return(
-        copr_build_pr
+        copr_build_pr,
     )
     url = get_copr_build_info_url(1)
     flexmock(requests).should_receive("get").and_return(requests.Response())
@@ -1938,12 +2321,66 @@ def test_copr_build_start(copr_build_start, pc_build_pr, copr_build_pr):
         update_feedback_time=object,
     ).once()
 
-    flexmock(Signature).should_receive("apply_async").once()
+    flexmock(celery_group).should_receive("apply_async").once()
     flexmock(Pushgateway).should_receive("push").times(2).and_return()
 
     processing_results = SteveJobs().process_message(copr_build_start)
     event_dict, job, job_config, package_config = get_parameters_from_results(
-        processing_results
+        processing_results,
+    )
+    assert json.dumps(event_dict)
+
+    run_copr_build_start_handler(
+        package_config=package_config,
+        event=event_dict,
+        job_config=job_config,
+    )
+
+
+def test_copr_build_start_already_ended(copr_build_start, pc_build_pr, copr_build_pr):
+    copr_build_pr.status = BuildStatus.failure
+    flexmock(GithubProject).should_receive("is_private").and_return(False)
+    flexmock(GithubProject).should_receive("get_pr").and_return(
+        flexmock(source_project=flexmock()),
+    )
+    flexmock(copr.CoprBuild).should_receive("get_packages_config").and_return(
+        pc_build_pr,
+    )
+    flexmock(CoprHelper).should_receive("get_copr_client").and_return(
+        Client(config={"username": "packit", "copr_url": "https://dummy.url"}),
+    )
+    flexmock(CoprBuildJobHelper).should_receive("get_build_check").and_return(
+        EXPECTED_BUILD_CHECK_NAME,
+    )
+
+    flexmock(CoprBuildTargetModel).should_receive("get_by_build_id").and_return(
+        copr_build_pr,
+    )
+    url = get_copr_build_info_url(1)
+    flexmock(requests).should_receive("get").and_return(requests.Response())
+    flexmock(requests.Response).should_receive("raise_for_status").and_return(None)
+
+    copr_build_pr.should_receive("set_start_time").once()
+    copr_build_pr.should_call("set_status").with_args(BuildStatus.pending).never()
+    copr_build_pr.should_receive("get_package_name").and_return(None)
+
+    # check that the outdated status was not reported
+    flexmock(StatusReporter).should_receive("report").with_args(
+        state=BaseCommitStatus.running,
+        description="RPM build is in progress...",
+        url=url,
+        check_names=EXPECTED_BUILD_CHECK_NAME,
+        markdown_content=None,
+        links_to_external_services=None,
+        update_feedback_time=object,
+    ).never()
+
+    flexmock(celery_group).should_receive("apply_async").once()
+    flexmock(Pushgateway).should_receive("push").times(2).and_return()
+
+    processing_results = SteveJobs().process_message(copr_build_start)
+    event_dict, job, job_config, package_config = get_parameters_from_results(
+        processing_results,
     )
     assert json.dumps(event_dict)
 
@@ -1957,20 +2394,20 @@ def test_copr_build_start(copr_build_start, pc_build_pr, copr_build_pr):
 def test_copr_build_not_comment_on_success(copr_build_end, pc_build_pr, copr_build_pr):
     flexmock(GithubProject).should_receive("is_private").and_return(False)
     flexmock(GithubProject).should_receive("get_pr").and_return(
-        flexmock(source_project=flexmock()).should_receive("comment").never()
+        flexmock(source_project=flexmock()).should_receive("comment").never(),
     )
-    flexmock(AbstractCoprBuildEvent).should_receive("get_packages_config").and_return(
-        pc_build_pr
+    flexmock(copr.CoprBuild).should_receive("get_packages_config").and_return(
+        pc_build_pr,
     )
     flexmock(CoprHelper).should_receive("get_copr_client").and_return(
-        Client(config={"username": "packit", "copr_url": "https://dummy.url"})
+        Client(config={"username": "packit", "copr_url": "https://dummy.url"}),
     )
     flexmock(CoprBuildJobHelper).should_receive("get_build_check").and_return(
-        EXPECTED_BUILD_CHECK_NAME
+        EXPECTED_BUILD_CHECK_NAME,
     )
 
     flexmock(CoprBuildTargetModel).should_receive("get_by_build_id").and_return(
-        copr_build_pr
+        copr_build_pr,
     )
     copr_build_pr.should_call("set_status").with_args(BuildStatus.success).once()
     copr_build_pr.should_receive("set_end_time").once()
@@ -1991,7 +2428,7 @@ def test_copr_build_not_comment_on_success(copr_build_end, pc_build_pr, copr_bui
     ).once()
 
     flexmock(CoprBuildJobHelper).should_receive("get_built_packages").and_return([])
-    flexmock(Signature).should_receive("apply_async").once()
+    flexmock(celery_group).should_receive("apply_async").once()
 
     (
         flexmock(CoprBuildJobHelper)
@@ -2009,7 +2446,7 @@ def test_copr_build_not_comment_on_success(copr_build_end, pc_build_pr, copr_bui
 
     processing_results = SteveJobs().process_message(copr_build_end)
     event_dict, job, job_config, package_config = get_parameters_from_results(
-        processing_results
+        processing_results,
     )
     assert json.dumps(event_dict)
 
@@ -2023,12 +2460,12 @@ def test_copr_build_not_comment_on_success(copr_build_end, pc_build_pr, copr_bui
 def test_koji_build_start(koji_build_scratch_start, pc_koji_build_pr, koji_build_pr):
     koji_build_pr.target = "rawhide"
     flexmock(GithubProject).should_receive("is_private").and_return(False)
-    flexmock(KojiTaskEvent).should_receive("get_packages_config").and_return(
-        pc_koji_build_pr
+    flexmock(koji.result.Task).should_receive("get_packages_config").and_return(
+        pc_koji_build_pr,
     )
 
     flexmock(KojiBuildTargetModel).should_receive("get_by_task_id").and_return(
-        koji_build_pr
+        koji_build_pr,
     )
     url = get_koji_build_info_url(1)
     flexmock(requests).should_receive("get").and_return(requests.Response())
@@ -2050,12 +2487,12 @@ def test_koji_build_start(koji_build_scratch_start, pc_koji_build_pr, koji_build
         links_to_external_services=None,
         update_feedback_time=object,
     ).once()
-    flexmock(Signature).should_receive("apply_async").once()
+    flexmock(celery_group).should_receive("apply_async").once()
     flexmock(Pushgateway).should_receive("push").times(2).and_return()
 
     processing_results = SteveJobs().process_message(koji_build_scratch_start)
     event_dict, job, job_config, package_config = get_parameters_from_results(
-        processing_results
+        processing_results,
     )
     assert json.dumps(event_dict)
 
@@ -2079,21 +2516,18 @@ def test_koji_build_start_build_not_found(koji_build_scratch_start):
 
     assert len(processing_results) == 1
     assert processing_results[0]["success"]
-    assert (
-        "No packit config found in the repository."
-        == processing_results[0]["details"]["msg"]
-    )
+    assert processing_results[0]["details"]["msg"] == "No packit config found in the repository."
 
 
 def test_koji_build_end(koji_build_scratch_end, pc_koji_build_pr, koji_build_pr):
     koji_build_pr.target = "rawhide"
     flexmock(GithubProject).should_receive("is_private").and_return(False)
-    flexmock(KojiTaskEvent).should_receive("get_packages_config").and_return(
-        pc_koji_build_pr
+    flexmock(koji.result.Task).should_receive("get_packages_config").and_return(
+        pc_koji_build_pr,
     )
 
     flexmock(KojiBuildTargetModel).should_receive("get_by_task_id").and_return(
-        koji_build_pr
+        koji_build_pr,
     )
     url = get_koji_build_info_url(1)
     flexmock(requests).should_receive("get").and_return(requests.Response())
@@ -2115,12 +2549,12 @@ def test_koji_build_end(koji_build_scratch_end, pc_koji_build_pr, koji_build_pr)
         links_to_external_services=None,
         update_feedback_time=object,
     ).once()
-    flexmock(Signature).should_receive("apply_async").once()
+    flexmock(celery_group).should_receive("apply_async").once()
     flexmock(Pushgateway).should_receive("push").times(2).and_return()
 
     processing_results = SteveJobs().process_message(koji_build_scratch_end)
     event_dict, job, job_config, package_config = get_parameters_from_results(
-        processing_results
+        processing_results,
     )
     assert json.dumps(event_dict)
 
@@ -2133,23 +2567,138 @@ def test_koji_build_end(koji_build_scratch_end, pc_koji_build_pr, koji_build_pr)
     assert first_dict_value(results["job"])["success"]
 
 
+def test_koji_build_end_downstream(
+    koji_build_scratch_end, pc_koji_build_pr, koji_build_pr_downstream
+):
+    service_config = (
+        flexmock(
+            enabled_projects_for_fedora_ci="https://src.fedoraproject.org/rpms/packit",
+            koji_logs_url="",
+            koji_web_url="",
+        )
+        .should_receive("get_project")
+        .and_return(flexmock(namespace="rpms", repo="packit"))
+        .mock()
+    )
+    flexmock(ServiceConfig).should_receive("get_service_config").and_return(service_config)
+    koji_build_pr_downstream.target = "rawhide"
+    flexmock(GithubProject).should_receive("is_private").and_return(False)
+    flexmock(koji.result.Task).should_receive("get_packages_config").and_return(
+        pc_koji_build_pr,
+    )
+
+    flexmock(KojiBuildTargetModel).should_receive("get_by_task_id").and_return(
+        koji_build_pr_downstream,
+    )
+    url = get_koji_build_info_url(1)
+    flexmock(requests).should_receive("get").and_return(requests.Response())
+    flexmock(requests.Response).should_receive("raise_for_status").and_return(None)
+
+    koji_build_pr_downstream.should_receive("set_build_start_time").once()
+    koji_build_pr_downstream.should_receive("set_build_finished_time").once()
+    koji_build_pr_downstream.should_receive("set_status").with_args("success").once()
+    koji_build_pr_downstream.should_receive("set_build_logs_urls")
+    koji_build_pr_downstream.should_receive("set_web_url")
+
+    # check if packit-service set correct PR status
+    flexmock(StatusReporter).should_receive("set_status").with_args(
+        state=BaseCommitStatus.success,
+        description="RPM build succeeded.",
+        url=url,
+        check_name="Packit - scratch build",
+    ).once()
+    flexmock(Signature).should_receive("apply_async").once()
+    flexmock(Pushgateway).should_receive("push").times(2).and_return()
+
+    processing_results = SteveJobs().process_message(koji_build_scratch_end)
+    event_dict, job, job_config, package_config = get_parameters_from_results(
+        processing_results,
+    )
+    assert json.dumps(event_dict)
+
+    results = run_downstream_koji_scratch_build_report_handler(
+        package_config=package_config,
+        event=event_dict,
+        job_config=job_config,
+    )
+
+    assert first_dict_value(results["job"])["success"]
+
+
+def test_koji_build_tag(
+    koji_build_tagged,
+    pc_koji_build_tag_specfile,
+    pc_koji_build_tag_packit,
+):
+    flexmock(KojiHelper).should_receive("get_build_info").with_args(1234567).and_return(
+        {"task_id": 7654321},
+    )
+
+    flexmock(koji.tag.Build).should_receive("get_packages_config").and_return(
+        pc_koji_build_tag_specfile,
+    )
+
+    flexmock(SidetagModel).should_receive("get_by_koji_name").with_args(
+        "f40-build-side-12345",
+    ).and_return(
+        flexmock(
+            sidetag_group=flexmock(name="test"),
+            target="f40",
+            koji_name="f40-build-side-12345",
+        ),
+    )
+
+    flexmock(KojiHelper).should_receive("get_tag_info").with_args(
+        "f40-build-side-12345",
+    ).and_return({"name": "f40-build-side-12345"})
+    flexmock(KojiHelper).should_receive("get_builds_in_tag").with_args(
+        "f40-build-side-12345",
+    ).and_return(
+        [{"package_name": "python-specfile", "nvr": "python-specfile-0.32.0-1.fc40"}],
+    )
+
+    flexmock(PackageConfigGetter).should_receive(
+        "get_package_config_from_repo",
+    ).and_return(pc_koji_build_tag_specfile).and_return(pc_koji_build_tag_packit)
+
+    flexmock(DownstreamKojiBuildHandler).should_receive("pre_check").and_return(True)
+    flexmock(BodhiUpdateFromSidetagHandler).should_receive("pre_check").and_return(True)
+
+    flexmock(Signature).should_receive("apply_async").twice()
+    flexmock(celery_group).should_receive("apply_async").once()
+
+    processing_results = SteveJobs().process_message(koji_build_tagged)
+    event_dict, job, job_config, package_config = get_parameters_from_results(
+        processing_results,
+    )
+    assert json.dumps(event_dict)
+
+    results = run_koji_build_tag_handler(
+        package_config=package_config,
+        event=event_dict,
+        job_config=job_config,
+    )
+
+    assert first_dict_value(results["job"])["success"]
+
+
 def test_srpm_build_end(srpm_build_end, pc_build_pr, srpm_build_model):
     pr = flexmock(source_project=flexmock())
     flexmock(GithubProject).should_receive("is_private").and_return(False)
     flexmock(GithubProject).should_receive("get_pr").and_return(pr)
-    flexmock(AbstractCoprBuildEvent).should_receive("get_packages_config").and_return(
-        pc_build_pr
+    flexmock(copr.CoprBuild).should_receive("get_packages_config").and_return(
+        pc_build_pr,
     )
     flexmock(CoprHelper).should_receive("get_copr_client").and_return(
-        Client(config={"username": "packit", "copr_url": "https://dummy.url"})
+        Client(config={"username": "packit", "copr_url": "https://dummy.url"}),
     )
     flexmock(CoprBuildTargetModel).should_receive("get_all_by_build_id").and_return(
         [
-            flexmock(target="fedora-33-x86_64")
+            flexmock(target="fedora-33-x86_64", identifier=None)
             .should_receive("set_status")
             .with_args(BuildStatus.pending)
-            .mock()
-        ]
+            .mock(),
+        ],
     )
     (
         flexmock(CoprBuildJobHelper)
@@ -2162,7 +2711,7 @@ def test_srpm_build_end(srpm_build_end, pc_build_pr, srpm_build_model):
     flexmock(Pushgateway).should_receive("push").times(2).and_return()
 
     flexmock(SRPMBuildModel).should_receive("get_by_copr_build_id").and_return(
-        srpm_build_model
+        srpm_build_model,
     )
     srpm_build_model.should_call("set_status").with_args(BuildStatus.success).once()
     srpm_build_model.should_receive("set_end_time").once()
@@ -2179,15 +2728,15 @@ def test_srpm_build_end(srpm_build_end, pc_build_pr, srpm_build_model):
         update_feedback_time=object,
     ).once()
 
-    flexmock(Signature).should_receive("apply_async").once()
+    flexmock(celery_group).should_receive("apply_async").once()
 
     flexmock(srpm_build_model).should_receive("set_url").with_args(
-        "https://my.host/my.srpm"
+        "https://my.host/my.srpm",
     ).mock()
 
     processing_results = SteveJobs().process_message(srpm_build_end)
     event_dict, job, job_config, package_config = get_parameters_from_results(
-        processing_results
+        processing_results,
     )
     assert json.dumps(event_dict)
 
@@ -2205,14 +2754,14 @@ def test_srpm_build_end_failure(srpm_build_end, pc_build_pr, srpm_build_model):
     pr = flexmock(source_project=flexmock())
     flexmock(GithubProject).should_receive("is_private").and_return(False)
     flexmock(GithubProject).should_receive("get_pr").and_return(pr)
-    flexmock(AbstractCoprBuildEvent).should_receive("get_packages_config").and_return(
-        pc_build_pr
+    flexmock(copr.CoprBuild).should_receive("get_packages_config").and_return(
+        pc_build_pr,
     )
     flexmock(CoprHelper).should_receive("get_copr_client").and_return(
-        Client(config={"username": "packit", "copr_url": "https://dummy.url"})
+        Client(config={"username": "packit", "copr_url": "https://dummy.url"}),
     )
     flexmock(CoprBuildTargetModel).should_receive("get_all_by_build_id").and_return(
-        [flexmock(target="fedora-33-x86_64")]
+        [flexmock(target="fedora-33-x86_64", identifier=None)],
     )
     (
         flexmock(CoprBuildJobHelper)
@@ -2226,7 +2775,7 @@ def test_srpm_build_end_failure(srpm_build_end, pc_build_pr, srpm_build_model):
     flexmock(CoprBuildJobHelper).should_receive("monitor_not_submitted_copr_builds")
 
     flexmock(SRPMBuildModel).should_receive("get_by_copr_build_id").and_return(
-        srpm_build_model
+        srpm_build_model,
     )
     srpm_build_model.should_call("set_status").with_args(BuildStatus.failure).once()
     srpm_build_model.should_receive("set_end_time").once()
@@ -2243,15 +2792,15 @@ def test_srpm_build_end_failure(srpm_build_end, pc_build_pr, srpm_build_model):
         update_feedback_time=object,
     ).once()
 
-    flexmock(Signature).should_receive("apply_async").once()
+    flexmock(celery_group).should_receive("apply_async").once()
 
     flexmock(srpm_build_model).should_receive("set_url").with_args(
-        "https://my.host/my.srpm"
+        "https://my.host/my.srpm",
     ).mock()
 
     processing_results = SteveJobs().process_message(srpm_build_end)
     event_dict, job, job_config, package_config = get_parameters_from_results(
-        processing_results
+        processing_results,
     )
     assert json.dumps(event_dict)
 
@@ -2268,19 +2817,19 @@ def test_srpm_build_start(srpm_build_start, pc_build_pr, srpm_build_model):
     pr = flexmock(source_project=flexmock())
     flexmock(GithubProject).should_receive("is_private").and_return(False)
     flexmock(GithubProject).should_receive("get_pr").and_return(pr)
-    flexmock(AbstractCoprBuildEvent).should_receive("get_packages_config").and_return(
-        pc_build_pr
+    flexmock(copr.CoprBuild).should_receive("get_packages_config").and_return(
+        pc_build_pr,
     )
     flexmock(CoprHelper).should_receive("get_copr_client").and_return(
-        Client(config={"username": "packit", "copr_url": "https://dummy.url"})
+        Client(config={"username": "packit", "copr_url": "https://dummy.url"}),
     )
     flexmock(CoprBuildTargetModel).should_receive("get_all_by_build_id").and_return(
-        [flexmock(target="fedora-33-x86_64")]
+        [flexmock(target="fedora-33-x86_64", identifier=None)],
     )
     flexmock(Pushgateway).should_receive("push").times(2).and_return()
 
     flexmock(SRPMBuildModel).should_receive("get_by_copr_build_id").and_return(
-        srpm_build_model
+        srpm_build_model,
     )
     srpm_build_model.should_receive("get_package_name").and_return(None)
     flexmock(SRPMBuildModel).should_receive("set_start_time")
@@ -2297,11 +2846,11 @@ def test_srpm_build_start(srpm_build_start, pc_build_pr, srpm_build_model):
         update_feedback_time=object,
     ).once()
 
-    flexmock(Signature).should_receive("apply_async").once()
+    flexmock(celery_group).should_receive("apply_async").once()
 
     processing_results = SteveJobs().process_message(srpm_build_start)
     event_dict, job, job_config, package_config = get_parameters_from_results(
-        processing_results
+        processing_results,
     )
     assert json.dumps(event_dict)
 

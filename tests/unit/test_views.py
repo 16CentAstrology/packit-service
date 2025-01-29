@@ -4,6 +4,7 @@
 """
 Let's test flask views.
 """
+
 from datetime import datetime
 
 import pytest
@@ -14,8 +15,8 @@ from packit_service.models import (
     ProjectEventModelType,
     SRPMBuildModel,
 )
-from packit_service.service.app import packit_as_a_service as application
 from packit_service.service import urls
+from packit_service.service.app import packit_as_a_service as application
 from packit_service.service.urls import (
     get_copr_build_info_url,
     get_srpm_build_info_url,
@@ -65,7 +66,13 @@ def test_get_logs(client):
     srpm_build_mock.id = 11
     srpm_build_mock.url = "https://some.random.copr.subdomain.org/my_srpm.srpm"
     srpm_build_mock.build_submitted_time = datetime(
-        year=2020, month=1, day=1, hour=0, minute=0, second=0, microsecond=0
+        year=2020,
+        month=1,
+        day=1,
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
     )
 
     copr_build_mock = flexmock()
@@ -78,7 +85,13 @@ def test_get_logs(client):
     copr_build_mock.build_logs_url = "https://localhost:5000/build/2/foo-1-x86_64/logs"
     copr_build_mock.owner = "packit"
     copr_build_mock.build_submitted_time = datetime(
-        year=2020, month=1, day=1, hour=0, minute=0, second=0, microsecond=0
+        year=2020,
+        month=1,
+        day=1,
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
     )
     copr_build_mock.project_name = "example_project"
     copr_build_mock.should_receive("get_project_event_object").and_return(pr_mock)
@@ -86,11 +99,11 @@ def test_get_logs(client):
     copr_build_mock.should_receive("get_srpm_build").and_return(srpm_build_mock)
 
     flexmock(CoprBuildTargetModel).should_receive("get_by_id").and_return(
-        copr_build_mock
+        copr_build_mock,
     )
 
     logs_url = get_copr_build_info_url(1)
-    assert logs_url == "https://localhost/results/copr-builds/1"
+    assert logs_url == "https://localhost/jobs/copr/1"
 
 
 def test_get_srpm_logs(client):
@@ -101,7 +114,7 @@ def test_get_srpm_logs(client):
     flexmock(SRPMBuildModel).should_receive("get_by_id").and_return(srpm_build_mock)
 
     logs_url = get_srpm_build_info_url(2)
-    assert logs_url == "https://localhost/results/srpm-builds/2"
+    assert logs_url == "https://localhost/jobs/srpm/2"
 
 
 def test_system_api(client):

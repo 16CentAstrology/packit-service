@@ -5,29 +5,30 @@ Revises: f5792581522c
 Create Date: 2022-11-27 20:20:00.136412
 
 """
+
 import enum
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from packit_service.models import ProjectAndEventsConnector
-
-from alembic import op
 import sqlalchemy as sa
 import sqlalchemy.orm
 from sqlalchemy import (
+    JSON,
+    Boolean,
     Column,
-    Integer,
-    String,
     DateTime,
     Enum,
-    Table,
     ForeignKey,
-    JSON,
+    Integer,
+    String,
+    Table,
     Text,
-    Boolean,
 )
-from sqlalchemy.orm import relationship
 from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import relationship
+
+from alembic import op
+from packit_service.models import ProjectAndEventsConnector
 
 if TYPE_CHECKING:
     Base = object
@@ -83,7 +84,9 @@ class PipelineModel(Base):
     test_run_id = Column(Integer, ForeignKey("tft_test_run_targets.id"), index=True)
     test_run = relationship("TFTTestRunTargetModel", back_populates="runs")
     sync_release_run_id = Column(
-        Integer, ForeignKey("sync_release_runs.id"), index=True
+        Integer,
+        ForeignKey("sync_release_runs.id"),
+        index=True,
     )
     sync_release_run = relationship("SyncReleaseModel", back_populates="runs")
 
@@ -250,7 +253,8 @@ class SyncReleaseTargetModel(ProjectAndEventsConnector, Base):
     sync_release_id = Column(Integer, ForeignKey("sync_release_runs.id"))
 
     sync_release = relationship(
-        "SyncReleaseModel", back_populates="sync_release_targets"
+        "SyncReleaseModel",
+        back_populates="sync_release_targets",
     )
 
 
@@ -271,12 +275,14 @@ class SyncReleaseModel(ProjectAndEventsConnector, Base):
     status = Column(Enum(SyncReleaseStatus))
     submitted_time = Column(DateTime, default=datetime.utcnow)
     job_type = Column(
-        Enum(SyncReleaseJobType), default=SyncReleaseJobType.propose_downstream
+        Enum(SyncReleaseJobType),
+        default=SyncReleaseJobType.propose_downstream,
     )
 
     runs = relationship("PipelineModel", back_populates="sync_release_run")
     sync_release_targets = relationship(
-        "SyncReleaseTargetModel", back_populates="sync_release"
+        "SyncReleaseTargetModel",
+        back_populates="sync_release",
     )
 
 

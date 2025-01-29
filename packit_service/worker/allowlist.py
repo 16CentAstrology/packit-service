@@ -2,49 +2,39 @@
 # SPDX-License-Identifier: MIT
 
 import logging
-from typing import Any, Iterable, Optional, Union, Callable, List, Tuple, Dict, Type
+from collections.abc import Iterable
+from typing import Any, Callable, Optional, Union
 from urllib.parse import urlparse
 
 from fasjson_client import Client
 from fasjson_client.errors import APIError
-
 from ogr.abstract import GitProject
 from packit.api import PackitAPI
 from packit.config.job_config import JobConfig, JobType
-from packit.exceptions import PackitException, PackitCommandFailedError
+from packit.exceptions import PackitCommandFailedError, PackitException
+
 from packit_service.config import ServiceConfig
 from packit_service.constants import (
+    DENIED_MSG,
+    DOCS_APPROVAL_URL,
     FASJSON_URL,
     NAMESPACE_NOT_ALLOWED_MARKDOWN_DESCRIPTION,
     NAMESPACE_NOT_ALLOWED_MARKDOWN_ISSUE_INSTRUCTIONS,
     NOTIFICATION_REPO,
-    DOCS_APPROVAL_URL,
-    DENIED_MSG,
 )
+from packit_service.events import (
+    abstract,
+    anitya,
+    copr,
+    github,
+    gitlab,
+    koji,
+    openscanhub,
+    pagure,
+    testing_farm,
+)
+from packit_service.events.event_data import EventData
 from packit_service.models import AllowlistModel, AllowlistStatus
-from packit_service.worker.events import (
-    EventData,
-    AbstractCoprBuildEvent,
-    InstallationEvent,
-    IssueCommentEvent,
-    IssueCommentGitlabEvent,
-    KojiTaskEvent,
-    MergeRequestCommentGitlabEvent,
-    MergeRequestGitlabEvent,
-    PullRequestCommentGithubEvent,
-    PullRequestCommentPagureEvent,
-    PullRequestGithubEvent,
-    PullRequestPagureEvent,
-    PushGitHubEvent,
-    PushGitlabEvent,
-    PushPagureEvent,
-    ReleaseEvent,
-    TestingFarmResultsEvent,
-    CheckRerunEvent,
-)
-from packit_service.worker.events.gitlab import ReleaseGitlabEvent
-from packit_service.worker.events.koji import KojiBuildEvent
-from packit_service.worker.events.new_hotness import NewHotnessUpdateEvent
 from packit_service.worker.helpers.build import CoprBuildJobHelper
 from packit_service.worker.helpers.testing_farm import TestingFarmJobHelper
 from packit_service.worker.reporting import BaseCommitStatus
@@ -52,16 +42,16 @@ from packit_service.worker.reporting import BaseCommitStatus
 logger = logging.getLogger(__name__)
 
 UncheckedEvent = Union[
-    PushPagureEvent,
-    PullRequestPagureEvent,
-    PullRequestCommentPagureEvent,
-    AbstractCoprBuildEvent,
-    TestingFarmResultsEvent,
-    InstallationEvent,
-    KojiTaskEvent,
-    KojiBuildEvent,
-    CheckRerunEvent,
-    NewHotnessUpdateEvent,
+    anitya.NewHotness,
+    copr.CoprBuild,
+    github.check.Rerun,
+    github.installation.Installation,
+    koji.result.Task,
+    koji.result.Build,
+    pagure.pr.Comment,
+    pagure.pr.Action,
+    pagure.push.Commit,
+    testing_farm.Result,
 ]
 
 
@@ -95,7 +85,8 @@ class Allowlist:
         try:
             logger.debug("Initialising Kerberos ticket so that we can use fasjson API.")
             PackitAPI(
-                config=self.service_config, package_config=None
+                config=self.service_config,
+                package_config=None,
             ).init_kerberos_ticket()
         except PackitCommandFailedError as ex:
             msg = f"Kerberos authentication error: {ex.stderr_output}"
@@ -123,7 +114,7 @@ class Allowlist:
 
         logger.info(
             f"Going to check match for Github username from FAS account {fas_account} and"
-            f" Github account {sender_login}."
+            f" Github account {sender_login}.",
         )
         client = Client(FASJSON_URL)
         try:
@@ -141,7 +132,7 @@ class Allowlist:
         github_username = user_info.get("github_username")
         if github_username:
             logger.debug(
-                f"github_username from FAS account {fas_account}: {github_username}"
+                f"github_username from FAS account {fas_account}: {github_username}",
             )
             return github_username == sender_login
 
@@ -158,7 +149,8 @@ class Allowlist:
                 `github.com/namespace/repository.git`.
         """
         AllowlistModel.add_namespace(
-            namespace=namespace, status=AllowlistStatus.approved_manually.value
+            namespace=namespace,
+            status=AllowlistStatus.approved_manually.value,
         )
 
         logger.info(f"Account {namespace!r} approved successfully.")
@@ -261,13 +253,11 @@ class Allowlist:
         return True
 
     @staticmethod
-    def get_namespaces_by_status(status: AllowlistStatus) -> List[str]:
-        return [
-            account.namespace for account in AllowlistModel.get_by_status(status.value)
-        ]
+    def get_namespaces_by_status(status: AllowlistStatus) -> list[str]:
+        return [account.namespace for account in AllowlistModel.get_by_status(status.value)]
 
     @staticmethod
-    def waiting_namespaces() -> List[str]:
+    def waiting_namespaces() -> list[str]:
         """
         Get namespaces waiting for approval.
 
@@ -277,7 +267,7 @@ class Allowlist:
         return Allowlist.get_namespaces_by_status(AllowlistStatus.waiting)
 
     @staticmethod
-    def denied_namespaces() -> List[str]:
+    def denied_namespaces() -> list[str]:
         """
         Get denied namespace.
 
@@ -298,7 +288,7 @@ class Allowlist:
 
     def _check_release_push_event(
         self,
-        event: Union[ReleaseEvent, PushGitHubEvent, PushGitlabEvent],
+        event: Union[github.release.Release, github.push.Commit, gitlab.push.Commit],
         project: GitProject,
         job_configs: Iterable[JobConfig],
     ) -> bool:
@@ -307,22 +297,27 @@ class Allowlist:
         if not project_url:
             raise KeyError(f"Failed to get namespace from {type(event)!r}")
         if self.is_namespace_or_parent_denied(project_url):
-            logger.info("Refusing release event on denied repo namespace.")
+            msg = f"{project_url} or parent namespaces denied!"
+            project.commit_comment(event.commit_sha, msg)
             return False
 
         if self.is_namespace_or_parent_approved(project_url):
             return True
 
-        logger.info("Refusing release event on not allowlisted repo namespace.")
+        msg = (
+            f"Project {project_url} is not on our allowlist! "
+            "See https://packit.dev/docs/guide/#2-approval"
+        )
+        project.commit_comment(event.commit_sha, msg)
         return False
 
     def _check_pr_event(
         self,
         event: Union[
-            PullRequestGithubEvent,
-            PullRequestCommentGithubEvent,
-            MergeRequestGitlabEvent,
-            MergeRequestCommentGitlabEvent,
+            github.pr.Action,
+            github.pr.Comment,
+            gitlab.mr.Action,
+            gitlab.mr.Comment,
         ],
         project: GitProject,
         job_configs: Iterable[JobConfig],
@@ -343,8 +338,7 @@ class Allowlist:
         else:
             namespace_approved = self.is_namespace_or_parent_approved(project_url)
             user_approved = (
-                project.can_merge_pr(actor_name)
-                or project.get_pr(event.pr_id).author == actor_name
+                project.can_merge_pr(actor_name) or project.get_pr(event.pr_id).author == actor_name
             )
             # TODO: clear failing check when present
             if namespace_approved and user_approved:
@@ -358,14 +352,13 @@ class Allowlist:
                 else f"Account {actor_name} has no write access nor is author of PR!"
             )
             short_msg = (
-                f"{project_url} not allowed!"
-                if not namespace_approved
-                else "User cannot trigger!"
+                f"{project_url} not allowed!" if not namespace_approved else "User cannot trigger!"
             )
 
         logger.debug(msg)
         if isinstance(
-            event, (PullRequestCommentGithubEvent, MergeRequestCommentGitlabEvent)
+            event,
+            (github.pr.Comment, gitlab.mr.Comment),
         ):
             project.get_pr(event.pr_id).comment(msg)
         else:
@@ -379,10 +372,15 @@ class Allowlist:
         return False
 
     def _check_pr_report_status(
-        self, job_configs, event, project, user_or_project_denied, short_msg
+        self,
+        job_configs,
+        event,
+        project,
+        user_or_project_denied,
+        short_msg,
     ):
         for job_config in job_configs:
-            job_helper_kls: Type[Union[TestingFarmJobHelper, CoprBuildJobHelper]]
+            job_helper_kls: type[Union[TestingFarmJobHelper, CoprBuildJobHelper]]
             if job_config.type == JobType.tests:
                 job_helper_kls = TestingFarmJobHelper
             else:
@@ -391,7 +389,7 @@ class Allowlist:
             job_helper = job_helper_kls(
                 service_config=self.service_config,
                 package_config=event.get_packages_config().get_package_config_for(
-                    job_config
+                    job_config,
                 ),
                 project=project,
                 metadata=EventData.from_event_dict(event.get_dict()),
@@ -407,11 +405,13 @@ class Allowlist:
                 issue_url = self.get_approval_issue(namespace=project.namespace)
                 url = issue_url or DOCS_APPROVAL_URL
                 markdown_content = NAMESPACE_NOT_ALLOWED_MARKDOWN_DESCRIPTION.format(
-                    instructions=NAMESPACE_NOT_ALLOWED_MARKDOWN_ISSUE_INSTRUCTIONS.format(
-                        issue_url=issue_url
-                    )
-                    if issue_url
-                    else ""
+                    instructions=(
+                        NAMESPACE_NOT_ALLOWED_MARKDOWN_ISSUE_INSTRUCTIONS.format(
+                            issue_url=issue_url,
+                        )
+                        if issue_url
+                        else ""
+                    ),
                 )
             job_helper.report_status_to_configured_job(
                 description=short_msg,
@@ -422,9 +422,36 @@ class Allowlist:
 
     def _check_issue_comment_event(
         self,
-        event: Union[IssueCommentEvent, IssueCommentGitlabEvent],
+        event: Union[github.issue.Comment, gitlab.issue.Comment],
         project: GitProject,
         job_configs: Iterable[JobConfig],
+    ) -> bool:
+        return self._check_issue_and_commit_comment_event(
+            event=event,
+            project=project,
+            comment_fn=lambda msg: project.get_issue(event.issue_id).comment(msg),
+        )
+
+    def _check_commit_comment_event(
+        self,
+        event: abstract.comment.Commit,
+        project: GitProject,
+        job_configs: Iterable[JobConfig],
+    ) -> bool:
+        return self._check_issue_and_commit_comment_event(
+            event=event,
+            project=project,
+            comment_fn=lambda msg: project.commit_comment(
+                commit=event.commit_sha,
+                body=msg,
+            ),
+        )
+
+    def _check_issue_and_commit_comment_event(
+        self,
+        event: Union[abstract.comment.Commit, github.issue.Comment, gitlab.issue.Comment],
+        project: GitProject,
+        comment_fn: Callable[[str], Any],
     ) -> bool:
         actor_name = event.actor
         if not actor_name:
@@ -439,7 +466,6 @@ class Allowlist:
         else:
             namespace_approved = self.is_namespace_or_parent_approved(project_url)
             user_approved = project.can_merge_pr(actor_name)
-            # TODO: clear failing check when present
             if namespace_approved and user_approved:
                 return True
             msg = (
@@ -452,7 +478,7 @@ class Allowlist:
             )
 
         logger.debug(msg)
-        project.get_issue(event.issue_id).comment(msg)
+        comment_fn(msg)
         return False
 
     def check_and_report(
@@ -468,42 +494,49 @@ class Allowlist:
         :param job_configs: iterable of jobconfigs - so we know how to update status of the PR
         :return:
         """
-        CALLBACKS: Dict[
-            Union[type, Tuple[Union[type, Tuple[Any, ...]], ...]], Callable
+        CALLBACKS: dict[
+            Union[type, tuple[Union[type, tuple[Any, ...]], ...]],
+            Callable,
         ] = {
             (  # events that are not checked against allowlist
-                PushPagureEvent,
-                PullRequestPagureEvent,
-                PullRequestCommentPagureEvent,
-                AbstractCoprBuildEvent,
-                TestingFarmResultsEvent,
-                InstallationEvent,
-                KojiTaskEvent,
-                KojiBuildEvent,
-                CheckRerunEvent,
-                NewHotnessUpdateEvent,
+                pagure.push.Commit,
+                pagure.pr.Action,
+                pagure.pr.Comment,
+                copr.CoprBuild,
+                testing_farm.Result,
+                github.installation.Installation,
+                koji.result.Task,
+                koji.result.Build,
+                koji.tag.Build,
+                github.check.Rerun,
+                anitya.NewHotness,
+                openscanhub.task.Started,
+                openscanhub.task.Finished,
             ): self._check_unchecked_event,
             (
-                ReleaseEvent,
-                ReleaseGitlabEvent,
-                PushGitHubEvent,
-                PushGitlabEvent,
+                github.release.Release,
+                gitlab.release.Release,
+                github.push.Commit,
+                gitlab.push.Commit,
             ): self._check_release_push_event,
             (
-                PullRequestGithubEvent,
-                PullRequestCommentGithubEvent,
-                MergeRequestGitlabEvent,
-                MergeRequestCommentGitlabEvent,
+                github.pr.Action,
+                github.pr.Comment,
+                gitlab.mr.Action,
+                gitlab.mr.Comment,
             ): self._check_pr_event,
             (
-                IssueCommentEvent,
-                IssueCommentGitlabEvent,
+                github.issue.Comment,
+                gitlab.issue.Comment,
             ): self._check_issue_comment_event,
+            (abstract.comment.Commit,): self._check_commit_comment_event,
         }
 
         # Administrators
         user_login = getattr(  # some old events with user_login can still be there
-            event, "user_login", None
+            event,
+            "user_login",
+            None,
         ) or getattr(event, "actor", None)
 
         if user_login and user_login in self.service_config.admins:
@@ -515,12 +548,12 @@ class Allowlist:
                 return callback(event, project, job_configs)
 
         msg = f"Failed to validate account: Unrecognized event type {type(event)!r}."
-        logger.error(msg)
+        logger.debug(msg)
         raise PackitException(msg)
 
     def get_approval_issue(self, namespace) -> Optional[str]:
         for issue in self.service_config.get_project(
-            url=NOTIFICATION_REPO
+            url=NOTIFICATION_REPO,
         ).get_issue_list(author=self.service_config.get_github_account_name()):
             if issue.title.strip().endswith(f" {namespace} needs to be approved."):
                 return issue.url
